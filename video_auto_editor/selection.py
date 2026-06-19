@@ -41,7 +41,7 @@ def select_live_clips(candidates, max_clips=None, config=None):
         return []
 
     config = config or CONFIG
-    max_clips = int(max_clips if max_clips is not None else config["max_clips"])
+    max_clips = resolve_live_max_clips(max_clips, config)
     if max_clips <= 0:
         return []
 
@@ -58,6 +58,16 @@ def select_live_clips(candidates, max_clips=None, config=None):
             break
 
     return sorted(selected, key=lambda candidate: (candidate.start_time, candidate.end_time, candidate.index))
+
+
+def resolve_live_max_clips(max_clips=None, config=None):
+    """解析 live 最大导出数量，区分用户显式上限和临时保护上限。"""
+    config = config or CONFIG
+    if max_clips is not None:
+        return int(max_clips)
+    if config.get("max_clips_user_provided"):
+        return int(config["max_clips"])
+    return int(config.get("temporary_protective_max_clips", config["max_clips"]))
 
 
 def _live_score_key(candidate):

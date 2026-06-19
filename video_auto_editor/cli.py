@@ -197,7 +197,7 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
     print(f"   Marked {sum(1 for candidate in candidates if candidate.is_duplicate)} duplicate candidates")
 
     print("\n🏆 Step 6: Selecting live clips...")
-    selected = select_live_clips(candidates, config["max_clips"], config)
+    selected = select_live_clips(candidates, None, config)
     if not selected:
         print("   ⚠️  No live clips selected")
     else:

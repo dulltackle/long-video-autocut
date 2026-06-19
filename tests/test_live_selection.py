@@ -1,6 +1,6 @@
 from video_auto_editor.config import CONFIG
 from video_auto_editor.models import ClipCandidate
-from video_auto_editor.selection import select_live_clips
+from video_auto_editor.selection import resolve_live_max_clips, select_live_clips
 
 
 def live_config(**overrides):
@@ -62,3 +62,14 @@ def test_select_live_clips_skips_duplicates_and_returns_time_order():
     selected = select_live_clips(candidates, 3, live_config())
 
     assert [candidate.index for candidate in selected] == [1, 0]
+
+
+def test_resolve_live_max_clips_uses_temporary_protective_limit_by_default():
+    assert resolve_live_max_clips(None, live_config(max_clips=100, temporary_protective_max_clips=5)) == 5
+
+
+def test_resolve_live_max_clips_uses_explicit_user_limit():
+    config = live_config(max_clips=2, max_clips_user_provided=True, temporary_protective_max_clips=5)
+
+    assert resolve_live_max_clips(None, config) == 2
+    assert resolve_live_max_clips(3, config) == 3

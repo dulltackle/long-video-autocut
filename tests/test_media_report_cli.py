@@ -178,6 +178,7 @@ def test_main_dispatches_live_subcommand(monkeypatch, tmp_path):
                 output_dir,
                 work_dir,
                 config["max_clips"],
+                config["max_clips_user_provided"],
                 config["allow_unreviewed_export"],
                 course_context.data if course_context else None,
                 dry_run,
@@ -206,7 +207,23 @@ def test_main_dispatches_live_subcommand(monkeypatch, tmp_path):
         ]
     )
 
-    assert calls == [(str(video_path), "out", "work", 2, True, {"course_title": "直播课"}, True)]
+    assert calls == [(str(video_path), "out", "work", 2, True, True, {"course_title": "直播课"}, True)]
+
+
+def test_main_uses_protective_live_max_clips_when_unspecified(monkeypatch, tmp_path):
+    calls = []
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("not real video", encoding="utf-8")
+
+    def fake_process_live(video_path_arg, output_dir, work_dir, config=None, course_context=None, dry_run=False):
+        calls.append((config["max_clips"], config["max_clips_user_provided"]))
+        return []
+
+    monkeypatch.setattr(cli, "process_live_video", fake_process_live)
+
+    cli.main(["live", str(video_path)])
+
+    assert calls == [(5, False)]
 
 
 def test_main_rejects_invalid_context_file(tmp_path):
