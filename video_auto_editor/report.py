@@ -81,7 +81,7 @@ def generate_batch_report(output_dir, clips, kept, removed, final_path):
     return report_path
 
 
-def generate_live_report(video_name, output_dir, total_duration, silences, candidates, selected, exports, config=None):
+def generate_live_report(video_name, output_dir, total_duration, silences, candidates, selected, exports, config=None, warnings=None):
     """生成直播拆条报告。"""
     if len(selected) != len(exports):
         raise ValueError(f"selected ({len(selected)}) and exports ({len(exports)}) must have same length")
@@ -98,6 +98,11 @@ def generate_live_report(video_name, output_dir, total_duration, silences, candi
         file.write(f"# {video_name} 直播拆条报告\n\n")
         file.write("**Version**: v4.7\n")
         file.write(f"**Processed**: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
+        if warnings:
+            file.write("## Warnings\n\n")
+            for warning in warnings:
+                file.write(f"- {_escape_markdown_text(warning)}\n")
+            file.write("\n")
         file.write("## 视频信息\n\n")
         file.write(f"- Duration: {total_duration:.1f}s ({total_duration / 60:.1f}min)\n")
         file.write(f"- Silence spans: {len(silences)}\n")
@@ -137,6 +142,7 @@ def generate_live_report(video_name, output_dir, total_duration, silences, candi
             )
 
         file.write("\n## 输出文件\n\n")
+        file.write("- `plan.json`\n")
         file.write("- `metadata.json`\n")
         file.write("- `transcript.srt`\n")
         file.write("- `clips/`\n")

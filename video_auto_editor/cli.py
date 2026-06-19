@@ -12,6 +12,7 @@ from video_auto_editor.dedup import check_duplicate_content, check_duplicate_liv
 from video_auto_editor.export import export_live_clips
 from video_auto_editor.media import clip_segment, concat_videos, get_video_duration
 from video_auto_editor.models import ClipInfo
+from video_auto_editor.plan import write_plan
 from video_auto_editor.report import generate_batch_report, generate_live_report, generate_single_report
 from video_auto_editor.scoring import analyze_fluency, calculate_adjusted_score, score_segment
 from video_auto_editor.selection import select_best_segment, select_live_clips
@@ -202,6 +203,10 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
                 f"score={_live_candidate_score(candidate):.1f} title={candidate.title}"
             )
 
+    warnings = _build_live_warnings(config)
+    plan_path = write_plan(video_path, output_dir, course_context, candidates, selected, warnings)
+    print(f"   📄 Plan: {plan_path}")
+
     print("\n✂️  Step 7: Exporting live clips...")
     exports = export_live_clips(video_path, selected, transcript_result.chunks, output_dir, config)
     if exports is None:
@@ -211,7 +216,15 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
     print(f"   📄 Metadata: {os.path.join(output_dir, 'metadata.json')}")
 
     report_path = generate_live_report(
-        video_name, output_dir, total_duration, silences, candidates, selected, exports, config
+        video_name,
+        output_dir,
+        total_duration,
+        silences,
+        candidates,
+        selected,
+        exports,
+        config,
+        warnings=warnings,
     )
     print(f"   📄 Report: {report_path}")
 
@@ -295,6 +308,12 @@ def _can_remove_work_dir(work_dir, output_dir):
 
 def _live_candidate_score(candidate):
     return candidate.adjusted_score if candidate.adjusted_score is not None else candidate.base_score
+
+
+def _build_live_warnings(config):
+    return [
+        "未接入主题评审，plan.json status 固定为 unreviewed，不代表发布就绪短视频。",
+    ]
 
 
 def _add_common_output_args(parser):

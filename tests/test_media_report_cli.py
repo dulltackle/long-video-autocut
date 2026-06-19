@@ -343,6 +343,7 @@ def test_process_live_video_exports_transcript_srt(monkeypatch, tmp_path):
         "直播文本\n\n"
     )
     assert (output_dir / "拆条报告.md").exists()
+    assert (output_dir / "plan.json").exists()
 
 
 def test_process_live_video_logs_generated_candidates(monkeypatch, tmp_path, capsys):
