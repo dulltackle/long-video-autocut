@@ -5,16 +5,33 @@
 *.mkv
 output/
 video_work/
+out/
+work/
+clips/
+subtitles/
+metadata.json
+transcript.json
+transcript.srt
+拆条报告.md
+batch_report.md
+*_report.md
 
 # Python
 __pycache__/
 *.py[cod]
 *.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
+env/
 *.egg-info/
 dist/
 build/
+pip-wheel-metadata/
 
 # 系统
 .DS_Store
