@@ -170,15 +170,54 @@ def test_main_dispatches_live_subcommand(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_text("not real video", encoding="utf-8")
 
-    def fake_process_live(video_path_arg, output_dir, work_dir, config=None):
-        calls.append((video_path_arg, output_dir, work_dir, config["max_clips"]))
+    def fake_process_live(video_path_arg, output_dir, work_dir, config=None, course_context=None, dry_run=False):
+        calls.append(
+            (
+                video_path_arg,
+                output_dir,
+                work_dir,
+                config["max_clips"],
+                config["allow_unreviewed_export"],
+                course_context.data if course_context else None,
+                dry_run,
+            )
+        )
         return []
 
     monkeypatch.setattr(cli, "process_live_video", fake_process_live)
 
-    cli.main(["live", str(video_path), "--output-dir", "out", "--work-dir", "work", "--max-clips", "2"])
+    context_path = tmp_path / "context.json"
+    context_path.write_text('{"course_title": "直播课"}', encoding="utf-8")
+    cli.main(
+        [
+            "live",
+            str(video_path),
+            "--output-dir",
+            "out",
+            "--work-dir",
+            "work",
+            "--max-clips",
+            "2",
+            "--context-file",
+            str(context_path),
+            "--dry-run",
+            "--allow-unreviewed-export",
+        ]
+    )
 
-    assert calls == [(str(video_path), "out", "work", 2)]
+    assert calls == [(str(video_path), "out", "work", 2, True, {"course_title": "直播课"}, True)]
+
+
+def test_main_rejects_invalid_context_file(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("not real video", encoding="utf-8")
+    context_path = tmp_path / "context.json"
+    context_path.write_text("[1, 2]", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["live", str(video_path), "--context-file", str(context_path)])
+
+    assert exc_info.value.code == 2
 
 
 def test_main_rejects_non_positive_live_max_clips(tmp_path):

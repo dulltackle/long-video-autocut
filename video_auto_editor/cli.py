@@ -7,6 +7,7 @@ import os
 import shutil
 
 from video_auto_editor.config import CONFIG
+from video_auto_editor.context import load_course_context
 from video_auto_editor.dedup import check_duplicate_content, check_duplicate_live_candidates, cross_video_dedup
 from video_auto_editor.export import export_live_clips
 from video_auto_editor.media import clip_segment, concat_videos, get_video_duration
@@ -134,7 +135,7 @@ def _find_video_files(input_dir):
     )
 
 
-def process_live_video(video_path, output_dir, work_dir, config=None):
+def process_live_video(video_path, output_dir, work_dir, config=None, course_context=None, dry_run=False):
     """直播拆条 MVP：输出多条短视频、metadata 和报告。"""
     config = config or CONFIG
     video_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -329,14 +330,18 @@ def _build_parser():
     live_parser = subparsers.add_parser("live", help="直播拆条 MVP：批量导出短视频、metadata 和报告")
     live_parser.add_argument("video_path", help="输入直播视频文件路径")
     _add_common_output_args(live_parser)
-    live_parser.add_argument("--max-clips", type=_positive_int, default=None, help="最多导出短视频数量，默认 5")
+    live_parser.add_argument("--max-clips", type=_positive_int, default=None, help="最多导出短视频数量；未传时使用临时保护上限 5")
+    live_parser.add_argument("--dry-run", action="store_true", help="只生成转写、报告和 plan.json，不导出短视频")
+    live_parser.add_argument("--context-file", help="课程上下文 JSON 文件")
+    live_parser.add_argument("--allow-unreviewed-export", action="store_true", help="允许导出未评审拆条结果")
 
     return parser
 
 
 def main(argv=None):
     """模块命令入口，要求显式指定 single 或 batch 子命令。"""
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.work_dir, exist_ok=True)
@@ -349,7 +354,22 @@ def main(argv=None):
         live_config = CONFIG.copy()
         if args.max_clips is not None:
             live_config["max_clips"] = args.max_clips
-        process_live_video(args.video_path, args.output_dir, args.work_dir, config=live_config)
+            live_config["max_clips_user_provided"] = True
+        live_config["allow_unreviewed_export"] = args.allow_unreviewed_export
+        course_context = None
+        if args.context_file:
+            try:
+                course_context = load_course_context(args.context_file)
+            except ValueError as exc:
+                parser.error(str(exc))
+        process_live_video(
+            args.video_path,
+            args.output_dir,
+            args.work_dir,
+            config=live_config,
+            course_context=course_context,
+            dry_run=args.dry_run,
+        )
         return
 
     clip = process_single_video(args.video_path, args.output_dir, args.work_dir)
