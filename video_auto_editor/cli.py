@@ -147,6 +147,10 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
     print(f"\n{'=' * 60}")
     print(f"  Video Auto Editor v4.7 - Live MVP\n  Input: {video_path}")
     print(f"{'=' * 60}\n")
+    if course_context is not None:
+        print("📚 Course context: loaded")
+    if dry_run:
+        print("🧪 Dry-run: will generate transcript, report and plan.json without exporting clips")
 
     print("📋 Step 1: Getting video info...")
     total_duration = get_video_duration(video_path)
@@ -207,13 +211,17 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
     plan_path = write_plan(video_path, output_dir, course_context, candidates, selected, warnings)
     print(f"   📄 Plan: {plan_path}")
 
-    print("\n✂️  Step 7: Exporting live clips...")
-    exports = export_live_clips(video_path, selected, transcript_result.chunks, output_dir, config)
-    if exports is None:
-        print("   ❌ Failed to export live clips")
-        return None
-    print(f"   ✅ Exported {len(exports)} clips")
-    print(f"   📄 Metadata: {os.path.join(output_dir, 'metadata.json')}")
+    exports = []
+    if dry_run:
+        print("\n✂️  Step 7: Dry-run skips live clip export")
+    else:
+        print("\n✂️  Step 7: Exporting live clips...")
+        exports = export_live_clips(video_path, selected, transcript_result.chunks, output_dir, config)
+        if exports is None:
+            print("   ❌ Failed to export live clips")
+            return None
+        print(f"   ✅ Exported {len(exports)} clips")
+        print(f"   📄 Metadata: {os.path.join(output_dir, 'metadata.json')}")
 
     report_path = generate_live_report(
         video_name,
@@ -224,6 +232,7 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
         selected,
         exports,
         config,
+        dry_run=dry_run,
         warnings=warnings,
     )
     print(f"   📄 Report: {report_path}")
@@ -311,9 +320,17 @@ def _live_candidate_score(candidate):
 
 
 def _build_live_warnings(config):
-    return [
+    warnings = [
         "未接入主题评审，plan.json status 固定为 unreviewed，不代表发布就绪短视频。",
     ]
+    if not config.get("max_clips_user_provided", False):
+        warnings.append(
+            f"未显式传入 --max-clips，当前使用临时保护上限 "
+            f"{config.get('temporary_protective_max_clips', config['max_clips'])}。"
+        )
+    if not config.get("allow_unreviewed_export", False):
+        warnings.append("未显式允许未评审导出；当前为兼容既有 live 行为仍保留导出能力。")
+    return warnings
 
 
 def _add_common_output_args(parser):

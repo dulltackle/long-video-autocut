@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -344,6 +345,55 @@ def test_process_live_video_exports_transcript_srt(monkeypatch, tmp_path):
     )
     assert (output_dir / "拆条报告.md").exists()
     assert (output_dir / "plan.json").exists()
+
+
+def test_process_live_video_dry_run_writes_plan_and_skips_exports(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    output_dir = tmp_path / "out"
+    work_dir = tmp_path / "work"
+    chunks = [TranscriptChunk(10, 70, "直播文本。")]
+    candidates = [ClipCandidate(0, 10, 70, 60, "直播文本。", base_score=90)]
+
+    monkeypatch.setattr(cli, "get_video_duration", lambda video_path_arg: 120.0)
+    monkeypatch.setattr(cli, "detect_silence", lambda video_path_arg, config=None: [])
+    monkeypatch.setattr(
+        cli,
+        "transcribe_video",
+        lambda *args, **kwargs: VideoTranscriptionResult(success=True, chunks=chunks, cache_path="cache.json"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "generate_clip_candidates",
+        lambda chunks_arg, silences, total_duration, config=None: candidates,
+    )
+
+    def fail_export(*args, **kwargs):
+        raise AssertionError("dry-run should not export clips")
+
+    monkeypatch.setattr(cli, "export_live_clips", fail_export)
+
+    result = cli.process_live_video(
+        str(video_path),
+        str(output_dir),
+        str(work_dir),
+        config=cli.CONFIG.copy(),
+        dry_run=True,
+    )
+
+    assert result == []
+    assert (output_dir / "transcript.srt").exists()
+    assert (output_dir / "plan.json").exists()
+    assert (output_dir / "拆条报告.md").exists()
+    assert not (output_dir / "metadata.json").exists()
+    assert not list((output_dir / "clips").glob("*.mp4")) if (output_dir / "clips").exists() else True
+    assert not list((output_dir / "subtitles").glob("*.srt")) if (output_dir / "subtitles").exists() else True
+    report = (output_dir / "拆条报告.md").read_text(encoding="utf-8")
+    assert "Dry-run：本报告是未评审拆条方案，不代表发布就绪短视频。" in report
+    plan = json.loads((output_dir / "plan.json").read_text(encoding="utf-8"))
+    assert plan["status"] == "unreviewed"
+    assert plan["selected"][0]["index"] == 0
+    assert any("临时保护上限" in warning for warning in plan["warnings"])
 
 
 def test_process_live_video_logs_generated_candidates(monkeypatch, tmp_path, capsys):

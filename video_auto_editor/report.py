@@ -81,9 +81,20 @@ def generate_batch_report(output_dir, clips, kept, removed, final_path):
     return report_path
 
 
-def generate_live_report(video_name, output_dir, total_duration, silences, candidates, selected, exports, config=None, warnings=None):
+def generate_live_report(
+    video_name,
+    output_dir,
+    total_duration,
+    silences,
+    candidates,
+    selected,
+    exports,
+    config=None,
+    dry_run=False,
+    warnings=None,
+):
     """生成直播拆条报告。"""
-    if len(selected) != len(exports):
+    if not dry_run and len(selected) != len(exports):
         raise ValueError(f"selected ({len(selected)}) and exports ({len(exports)}) must have same length")
 
     report_name = (config or {}).get("live_report_name", "拆条报告.md")
@@ -98,6 +109,8 @@ def generate_live_report(video_name, output_dir, total_duration, silences, candi
         file.write(f"# {video_name} 直播拆条报告\n\n")
         file.write("**Version**: v4.7\n")
         file.write(f"**Processed**: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
+        if dry_run:
+            file.write("> Dry-run：本报告是未评审拆条方案，不代表发布就绪短视频。\n\n")
         if warnings:
             file.write("## Warnings\n\n")
             for warning in warnings:
@@ -114,7 +127,7 @@ def generate_live_report(video_name, output_dir, total_duration, silences, candi
         file.write("|---|-------|------------|----------|-------|--------|\n")
         for candidate in selected:
             export = export_by_index.get(candidate.index)
-            output_path = export.output_path if export else ""
+            output_path = export.output_path if export else "(dry-run)"
             file.write(
                 f"| {candidate.index} | {_escape_markdown_cell(candidate.title)} | "
                 f"{candidate.start_time:.1f}-{candidate.end_time:.1f}s | {candidate.duration:.1f}s | "
@@ -143,11 +156,12 @@ def generate_live_report(video_name, output_dir, total_duration, silences, candi
 
         file.write("\n## 输出文件\n\n")
         file.write("- `plan.json`\n")
-        file.write("- `metadata.json`\n")
         file.write("- `transcript.srt`\n")
-        file.write("- `clips/`\n")
-        if (config or {}).get("export_subtitles", True):
-            file.write("- `subtitles/`\n")
+        if not dry_run:
+            file.write("- `metadata.json`\n")
+            file.write("- `clips/`\n")
+            if (config or {}).get("export_subtitles", True):
+                file.write("- `subtitles/`\n")
     return report_path
 
 
