@@ -466,7 +466,7 @@ def test_process_live_video_returns_none_on_transcription_failure(monkeypatch, t
     assert cli.process_live_video(str(video_path), str(tmp_path / "out"), str(tmp_path / "work")) is None
 
 
-def test_process_live_video_returns_none_when_default_asr_unavailable(monkeypatch, tmp_path):
+def test_process_live_video_returns_none_when_default_asr_unavailable(monkeypatch, tmp_path, capsys):
     monkeypatch.delenv("STEPFUN_API_KEY", raising=False)
     video_path = tmp_path / "live.mp4"
     video_path.write_text("video", encoding="utf-8")
@@ -487,6 +487,7 @@ def test_process_live_video_returns_none_when_default_asr_unavailable(monkeypatc
     assert result is None
     assert not (output_dir / "plan.json").exists()
     assert not (output_dir / "transcript.srt").exists()
+    assert "ASR provider stepaudio unavailable" in capsys.readouterr().out
 
 
 def test_process_live_video_returns_none_on_silence_detection_failure(monkeypatch, tmp_path):

@@ -106,6 +106,7 @@ def test_default_asr_config_uses_stepaudio():
     assert CONFIG["asr_model"] == "stepaudio-2.5-asr"
     assert CONFIG["asr_timeout"] == 120
     assert CONFIG["asr_language"] == "zh"
+    assert CONFIG["asr_max_upload_bytes"] == 200 * 1024 * 1024
     assert CONFIG["stepfun_api_key_env"] == "STEPFUN_API_KEY"
     assert CONFIG["stepfun_base_url_env"] == "STEPFUN_BASE_URL"
 
@@ -148,6 +149,7 @@ def test_create_stepaudio_transcriber_reads_base_url_from_env(monkeypatch):
         model="custom-asr",
         language="en",
         timeout=30,
+        max_upload_bytes=200 * 1024 * 1024,
     )
 
 
@@ -597,6 +599,56 @@ def test_stepaudio_transcribe_video_converts_success_response(tmp_path):
     assert b'name="language"\r\n\r\nzh' in body
     assert b'name="file"; filename="live.mp4"' in body
     assert b"video" in body
+
+
+def test_stepaudio_transcribe_video_rejects_oversized_file_without_request(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("oversized file should not be uploaded")
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", max_upload_bytes=3),
+        request_func=fail_if_called,
+    )
+
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+
+    assert result.success is False
+    assert result.chunks == []
+    assert result.error == "StepAudio source video is too large for single-request upload: 5 bytes > 3 bytes"
+
+
+def test_stepaudio_multipart_sanitizes_filename(tmp_path):
+    video_path = tmp_path / 'bad"name\n.mp4'
+    video_path.write_bytes(b"video")
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"segments": [{"start": 0, "end": 1, "text": "ok"}]}'
+
+    def fake_request(request, timeout):
+        captured["body"] = request.data
+        return FakeResponse()
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key"),
+        request_func=fake_request,
+    )
+
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+
+    assert result.success is True
+    assert b'filename="bad_name_.mp4"' in captured["body"]
+    assert b'filename="bad"name' not in captured["body"]
 
 
 def test_stepaudio_transcribe_video_supports_nested_segments(tmp_path):

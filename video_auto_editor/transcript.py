@@ -37,6 +37,7 @@ class StepAudioConfig:
     model: str = "stepaudio-2.5-asr"
     language: str = "zh"
     timeout: int = 120
+    max_upload_bytes: int = 200 * 1024 * 1024
 
 
 @dataclass
@@ -279,6 +280,26 @@ class StepAudioTranscriber:
             )
 
         try:
+            video_size = os.path.getsize(video_path)
+        except OSError as exc:
+            return VideoTranscriptionResult(
+                success=False,
+                chunks=[],
+                transcript_path=transcript_path,
+                error=f"StepAudio cannot read source video: {exc}",
+            )
+        if video_size > self.config.max_upload_bytes:
+            return VideoTranscriptionResult(
+                success=False,
+                chunks=[],
+                transcript_path=transcript_path,
+                error=(
+                    f"StepAudio source video is too large for single-request upload: "
+                    f"{video_size} bytes > {self.config.max_upload_bytes} bytes"
+                ),
+            )
+
+        try:
             request = _build_stepaudio_request(video_path, self.config)
             with self.request_func(request, timeout=self.config.timeout) as response:
                 response_body = response.read().decode("utf-8")
@@ -352,6 +373,7 @@ def create_stepaudio_transcriber(config=None):
             model=_config_get(config, "asr_model"),
             language=_config_get(config, "asr_language"),
             timeout=_config_get(config, "asr_timeout"),
+            max_upload_bytes=int(_config_get(config, "asr_max_upload_bytes")),
         )
     )
 
@@ -603,7 +625,7 @@ def _build_stepaudio_request(video_path, config):
 
 
 def _encode_stepaudio_multipart(video_path, config, boundary):
-    file_name = os.path.basename(video_path)
+    file_name = _sanitize_multipart_filename(os.path.basename(video_path))
     with open(video_path, "rb") as video_file:
         file_content = video_file.read()
 
@@ -634,6 +656,10 @@ def _encode_stepaudio_multipart(video_path, config, boundary):
 
 def _join_url(base_url, path):
     return f"{str(base_url).rstrip('/')}/{path.lstrip('/')}"
+
+
+def _sanitize_multipart_filename(file_name):
+    return re.sub(r'[\r\n"\\]', "_", str(file_name)) or "upload.bin"
 
 
 def _read_http_error(exc):

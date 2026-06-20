@@ -32,6 +32,7 @@ CONFIG = {
     "asr_model": "stepaudio-2.5-asr",
     "asr_timeout": 120,
     "asr_language": "zh",
+    "asr_max_upload_bytes": 200 * 1024 * 1024,
     "stepfun_api_key_env": "STEPFUN_API_KEY",
     "stepfun_base_url_env": "STEPFUN_BASE_URL",
     "stepfun_base_url": "https://api.stepfun.com/v1",
