@@ -11,6 +11,8 @@ from video_auto_editor.transcript import (
     VideoTranscriptionResult,
     WhisperConfig,
     WhisperTranscriber,
+    create_transcriber,
+    create_whisper_transcriber,
 )
 
 
@@ -53,6 +55,43 @@ def test_is_available_returns_false_when_python_executable_missing(monkeypatch):
     monkeypatch.setattr(transcript.subprocess, "run", fail_if_called)
 
     assert WhisperTranscriber().is_available() is False
+
+
+def test_create_transcriber_creates_whisper_provider_from_config():
+    transcriber = create_transcriber(
+        {
+            "asr_provider": "whisper",
+            "whisper_model": "tiny",
+            "whisper_language": "en",
+            "whisper_timeout": 30,
+            "whisper_output_format": "txt",
+            "whisper_sample_rate": 8000,
+            "whisper_channels": 2,
+        }
+    )
+
+    assert isinstance(transcriber, WhisperTranscriber)
+    assert transcriber.config == WhisperConfig(
+        model="tiny",
+        language="en",
+        timeout=30,
+        output_format="txt",
+        sample_rate=8000,
+        channels=2,
+    )
+
+
+def test_create_transcriber_rejects_unknown_provider():
+    with pytest.raises(ValueError, match="Unknown ASR provider: unknown"):
+        create_transcriber({"asr_provider": "unknown"})
+
+
+def test_create_whisper_transcriber_keeps_compatibility_entrypoint():
+    transcriber = create_whisper_transcriber({"whisper_model": "base"})
+
+    assert isinstance(transcriber, WhisperTranscriber)
+    assert transcriber.config.model == "base"
+    assert transcriber.config.language == "zh"
 
 
 def test_transcribe_segment_rejects_invalid_segment_index(monkeypatch, tmp_path):

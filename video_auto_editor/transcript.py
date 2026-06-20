@@ -7,7 +7,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Protocol
 
 from video_auto_editor.config import CONFIG
 from video_auto_editor.models import TranscriptChunk
@@ -46,6 +46,18 @@ class VideoTranscriptionResult:
     transcript_path: str = ""
     from_cache: bool = False
     error: str = ""
+
+
+class VideoTranscriber(Protocol):
+    """整视频 ASR provider 最小契约。"""
+
+    def is_available(self):
+        """检查 provider 当前是否可用。"""
+        ...
+
+    def transcribe_video(self, video_path, work_dir):
+        """将整条视频转写为带时间戳的字幕片段。"""
+        ...
 
 
 class WhisperTranscriber:
@@ -228,17 +240,26 @@ class WhisperTranscriber:
         return VideoTranscriptionResult(success=True, chunks=chunks, transcript_path=transcript_path)
 
 
+def create_transcriber(config=None):
+    """根据配置创建整视频 ASR provider。"""
+    config = config or CONFIG
+    provider = str(_config_get(config, "asr_provider", "whisper")).strip().lower()
+    if provider == "whisper":
+        return create_whisper_transcriber(config)
+    raise ValueError(f"Unknown ASR provider: {provider}")
+
+
 def create_whisper_transcriber(config=None):
     """从配置创建 Whisper 转写器。"""
     config = config or CONFIG
     return WhisperTranscriber(
         WhisperConfig(
-            model=config["whisper_model"],
-            language=config["whisper_language"],
-            timeout=config["whisper_timeout"],
-            output_format=config["whisper_output_format"],
-            sample_rate=config["whisper_sample_rate"],
-            channels=config["whisper_channels"],
+            model=_config_get(config, "whisper_model"),
+            language=_config_get(config, "whisper_language"),
+            timeout=_config_get(config, "whisper_timeout"),
+            output_format=_config_get(config, "whisper_output_format"),
+            sample_rate=_config_get(config, "whisper_sample_rate"),
+            channels=_config_get(config, "whisper_channels"),
         )
     )
 
@@ -417,3 +438,11 @@ def _ensure_parent_dir(path):
 
 def _normalize_subtitle_text(text):
     return re.sub(r"\s+", " ", str(text).strip())
+
+
+def _config_get(config, key, default=None):
+    if key in config:
+        return config[key]
+    if key in CONFIG:
+        return CONFIG[key]
+    return default
