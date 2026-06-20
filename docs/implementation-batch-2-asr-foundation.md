@@ -289,3 +289,91 @@ pytest
 - `live --dry-run` 有最小端到端测试闭环，能稳定生成 `transcript.srt`、`plan.json` 和 `拆条报告.md`。
 - dry-run 端到端测试不依赖真实外部服务、网络或真实视频处理。
 - 全量测试通过。
+
+## 第二批完成后的运行说明
+
+### 支持的 ASR provider
+
+第二批完成后，整视频转写入口通过统一 provider factory 创建语音识别 provider：
+
+- 默认 provider：`stepaudio`
+- 默认模型：`stepaudio-2.5-asr`
+- 可选 provider：`whisper`
+
+`single` 场景的候选片段转写仍保留现有 Whisper 行为；`live` 场景只依赖整视频 `transcribe_video()` 入口，不直接认识具体 provider。
+
+### 默认 StepAudio
+
+本地运行默认 StepAudio 时，需要先提供 StepFun API Key：
+
+```bash
+export STEPFUN_API_KEY=sk-...
+video-auto-editor live path/to/live.mp4 --output-dir out/live --work-dir work/live
+```
+
+如需覆盖 StepFun base URL：
+
+```bash
+export STEPFUN_BASE_URL=https://api.stepfun.com/v1
+```
+
+缺少 `STEPFUN_API_KEY` 时，`live` 会在语音识别阶段中止，不写出 `plan.json`，也不会生成误导性的拆条方案。
+
+### 显式 Whisper
+
+第二批保留 Whisper provider，供本地兼容和回退使用。当前 CLI 参数层尚未暴露 `--asr-provider`，调用方可在 Python 编排层显式传入配置：
+
+```python
+from video_auto_editor.cli import process_live_video
+from video_auto_editor.config import CONFIG
+
+config = CONFIG.copy()
+config["asr_provider"] = "whisper"
+process_live_video(
+    "path/to/live.mp4",
+    "out/live",
+    "work/live",
+    config=config,
+)
+```
+
+### dry-run 产物检查
+
+dry-run 可用于检查最小拆条方案，不裁剪视频：
+
+```bash
+export STEPFUN_API_KEY=sk-...
+video-auto-editor live path/to/live.mp4 --output-dir out/live --work-dir work/live --dry-run
+```
+
+预期产物：
+
+- `out/live/transcript.srt`
+- `out/live/plan.json`，其中 `status=unreviewed`，`candidates` 和 `selected` 非空时表示基础候选链路已跑通。
+- `out/live/拆条报告.md`，包含 dry-run 未评审提示。
+
+dry-run 不应生成：
+
+- `out/live/metadata.json`
+- `out/live/clips/*.mp4`
+- 单条短视频字幕文件
+
+### 第三批边界
+
+第二批没有实现长音频分片能力。以下能力必须留到第三批统一处理：
+
+- 从原视频提取音频并切分为连续识别分片。
+- 分片级缓存。
+- StepAudio 请求重试。
+- 分片时间戳按偏移合并为整场转写文本。
+
+### 第二批实际提交点
+
+第二批按小任务拆成独立提交，避免把 provider 抽象、StepAudio 实现、live 接入和端到端测试混成一个大提交：
+
+- `refactor: 抽象 ASR provider 创建入口`
+- `feat: 增加 ASR provider 通用配置`
+- `feat: 增加 StepAudio ASR provider`
+- `refactor: live 流程接入统一 ASR provider`
+- `test: 补充 live dry-run ASR 闭环测试`
+- `docs: 补充第二批 ASR 抽象执行方案`

@@ -24,6 +24,13 @@
 - 将语音识别配置从 Whisper 专用字段演进为 provider 配置。
 - ASR 不可用或识别失败时直接中止。
 
+第二批执行完成后，CLI 底座支持的语音识别 provider 为：
+
+- 默认：`stepaudio`，模型为 `stepaudio-2.5-asr`，API Key 从 `STEPFUN_API_KEY` 读取，base URL 可通过 `STEPFUN_BASE_URL` 覆盖。
+- 可选：`whisper`，保留现有 Whisper CLI 转写能力，主要用于本地兼容和回退。
+
+第二批只实现整视频 provider 抽象和最小 `live --dry-run` 闭环；长音频分片、分片级缓存、请求重试和分片时间戳偏移合并统一留到第三批。
+
 ### 3. StepAudio 分片识别
 
 目标：让几小时直播课可以稳定识别，并且识别结果具备可缓存、可重试、可合并的时间戳。
