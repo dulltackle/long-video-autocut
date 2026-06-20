@@ -466,6 +466,29 @@ def test_process_live_video_returns_none_on_transcription_failure(monkeypatch, t
     assert cli.process_live_video(str(video_path), str(tmp_path / "out"), str(tmp_path / "work")) is None
 
 
+def test_process_live_video_returns_none_when_default_asr_unavailable(monkeypatch, tmp_path):
+    monkeypatch.delenv("STEPFUN_API_KEY", raising=False)
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    output_dir = tmp_path / "out"
+    work_dir = tmp_path / "work"
+
+    monkeypatch.setattr(cli, "get_video_duration", lambda video_path_arg: 120.0)
+    monkeypatch.setattr(cli, "detect_silence", lambda video_path_arg, config=None: [])
+
+    result = cli.process_live_video(
+        str(video_path),
+        str(output_dir),
+        str(work_dir),
+        config=cli.CONFIG.copy(),
+        dry_run=True,
+    )
+
+    assert result is None
+    assert not (output_dir / "plan.json").exists()
+    assert not (output_dir / "transcript.srt").exists()
+
+
 def test_process_live_video_returns_none_on_silence_detection_failure(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_text("video", encoding="utf-8")

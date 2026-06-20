@@ -413,13 +413,22 @@ def transcribe_video(video_path, work_dir, transcriber=None, config=None):
             from_cache=True,
         )
 
-    transcriber = transcriber or create_whisper_transcriber(config)
+    try:
+        transcriber = transcriber or create_transcriber(config)
+    except ValueError as exc:
+        return VideoTranscriptionResult(
+            success=False,
+            chunks=[],
+            cache_path=cache_path,
+            error=f"ASR provider configuration error: {exc}",
+        )
+
     if not transcriber.is_available():
         return VideoTranscriptionResult(
             success=False,
             chunks=[],
             cache_path=cache_path,
-            error="Whisper not installed or unavailable",
+            error=f"ASR provider {_transcriber_name(transcriber)} unavailable",
         )
 
     result = transcriber.transcribe_video(video_path, work_dir)
@@ -632,6 +641,14 @@ def _read_http_error(exc):
         return exc.read().decode("utf-8").strip()
     except Exception:
         return str(exc)
+
+
+def _transcriber_name(transcriber):
+    if isinstance(transcriber, StepAudioTranscriber):
+        return "stepaudio"
+    if isinstance(transcriber, WhisperTranscriber):
+        return "whisper"
+    return transcriber.__class__.__name__
 
 
 def _config_get(config, key, default=None):

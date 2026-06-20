@@ -343,6 +343,84 @@ def test_transcribe_video_uses_valid_cache_without_calling_whisper(tmp_path):
     )
 
 
+def test_transcribe_video_uses_valid_cache_without_creating_provider(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    cache_path = tmp_path / "work" / "transcript.json"
+    chunks = [TranscriptChunk(1.0, 3.5, "缓存文本")]
+    transcript.save_transcript_cache(str(video_path), chunks, str(cache_path))
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("should not create ASR provider when cache is valid")
+
+    monkeypatch.setattr(transcript, "create_transcriber", fail_if_called)
+
+    result = transcript.transcribe_video(str(video_path), str(cache_path.parent), config={"asr_provider": "unknown"})
+
+    assert result.success is True
+    assert result.from_cache is True
+    assert result.chunks == chunks
+
+
+def test_transcribe_video_creates_configured_provider(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    calls = []
+
+    class FakeTranscriber:
+        def is_available(self):
+            return True
+
+        def transcribe_video(self, video_path_arg, work_dir):
+            return VideoTranscriptionResult(success=True, chunks=[TranscriptChunk(2, 4, "新转写")])
+
+    def fake_create(config):
+        calls.append(config)
+        return FakeTranscriber()
+
+    monkeypatch.setattr(transcript, "create_transcriber", fake_create)
+
+    result = transcript.transcribe_video(
+        str(video_path),
+        str(tmp_path / "work"),
+        config={"asr_provider": "fake"},
+    )
+
+    assert result.success is True
+    assert result.chunks == [TranscriptChunk(2, 4, "新转写")]
+    assert calls == [{"asr_provider": "fake"}]
+
+
+def test_transcribe_video_reports_provider_unavailable(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+
+    result = transcript.transcribe_video(
+        str(video_path),
+        str(tmp_path / "work"),
+        config={"asr_provider": "stepaudio", "stepfun_api_key": ""},
+    )
+
+    assert result.success is False
+    assert result.chunks == []
+    assert result.error == "ASR provider stepaudio unavailable"
+
+
+def test_transcribe_video_reports_provider_configuration_error(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+
+    result = transcript.transcribe_video(
+        str(video_path),
+        str(tmp_path / "work"),
+        config={"asr_provider": "unknown"},
+    )
+
+    assert result.success is False
+    assert result.chunks == []
+    assert result.error == "ASR provider configuration error: Unknown ASR provider: unknown"
+
+
 def test_transcribe_video_rebuilds_stale_cache(tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_text("old", encoding="utf-8")

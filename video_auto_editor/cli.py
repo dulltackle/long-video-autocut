@@ -173,7 +173,7 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
         print(f"   ❌ {transcript_result.error}")
         return None
 
-    source = "cache" if transcript_result.from_cache else "whisper"
+    source = "cache" if transcript_result.from_cache else config.get("asr_provider", "asr")
     print(f"   ✅ Loaded {len(transcript_result.chunks)} transcript chunks from {source}")
     print(f"   📄 Transcript cache: {transcript_result.cache_path}")
 
