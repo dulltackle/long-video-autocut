@@ -11,12 +11,13 @@ def write_json(path, payload):
 
 
 def test_load_course_context_accepts_known_and_unknown_fields(tmp_path):
+    unknown_value = {"enabled": True}
     path = write_json(
         tmp_path / "context.json",
         {
             "course_title": "直播课",
             "priority_topics": ["剪辑", "发布"],
-            "unknown_future_field": {"enabled": True},
+            "unknown_future_field": unknown_value,
         },
     )
 
@@ -30,6 +31,21 @@ def test_load_course_context_accepts_known_and_unknown_fields(tmp_path):
         "list_counts": {"priority_topics": 2},
         "unknown_fields": ["unknown_future_field"],
     }
+
+    unknown_value["enabled"] = False
+    assert context.data["unknown_future_field"] == {"enabled": True}
+
+
+def test_course_context_data_returns_copy(tmp_path):
+    path = write_json(tmp_path / "context.json", {"course_title": "直播课"})
+    context = load_course_context(path)
+
+    data = context.data
+    data["course_title"] = "已篡改"
+    data["new_field"] = "绕过校验"
+
+    assert context.data == {"course_title": "直播课"}
+    assert context.summary()["known_fields"] == ["course_title"]
 
 
 def test_load_course_context_rejects_non_object_json(tmp_path):

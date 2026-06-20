@@ -120,7 +120,11 @@ def generate_live_report(
         file.write(f"- Duration: {total_duration:.1f}s ({total_duration / 60:.1f}min)\n")
         file.write(f"- Silence spans: {len(silences)}\n")
         file.write(f"- Candidates: {len(candidates)}\n")
-        file.write(f"- Exported clips: {len(exports)}\n\n")
+        if dry_run:
+            file.write(f"- Selected clips: {len(selected)}\n")
+            file.write("- Exported clips: 0 (dry-run)\n\n")
+        else:
+            file.write(f"- Exported clips: {len(exports)}\n\n")
 
         file.write("## 入选片段\n\n")
         file.write("| # | Title | Time Range | Duration | Score | Output |\n")

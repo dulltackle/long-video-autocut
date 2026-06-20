@@ -24,7 +24,6 @@ CONFIG = {
     "context_expand_after": 8,
     "max_clips": 5,
     "temporary_protective_max_clips": 5,
-    "max_clips_user_provided": False,
     "allow_unreviewed_export": False,
     "min_clip_gap_seconds": 5,
     "export_subtitles": True,

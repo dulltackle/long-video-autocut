@@ -178,7 +178,7 @@ def test_main_dispatches_live_subcommand(monkeypatch, tmp_path):
                 output_dir,
                 work_dir,
                 config["max_clips"],
-                config["max_clips_user_provided"],
+                config.get("max_clips_user_provided", False),
                 config["allow_unreviewed_export"],
                 course_context.data if course_context else None,
                 dry_run,
@@ -216,7 +216,7 @@ def test_main_uses_protective_live_max_clips_when_unspecified(monkeypatch, tmp_p
     video_path.write_text("not real video", encoding="utf-8")
 
     def fake_process_live(video_path_arg, output_dir, work_dir, config=None, course_context=None, dry_run=False):
-        calls.append((config["max_clips"], config["max_clips_user_provided"]))
+        calls.append((config["max_clips"], "max_clips_user_provided" in config))
         return []
 
     monkeypatch.setattr(cli, "process_live_video", fake_process_live)
@@ -407,6 +407,8 @@ def test_process_live_video_dry_run_writes_plan_and_skips_exports(monkeypatch, t
     assert not list((output_dir / "subtitles").glob("*.srt")) if (output_dir / "subtitles").exists() else True
     report = (output_dir / "拆条报告.md").read_text(encoding="utf-8")
     assert "Dry-run：本报告是未评审拆条方案，不代表发布就绪短视频。" in report
+    assert "- Selected clips: 1" in report
+    assert "- Exported clips: 0 (dry-run)" in report
     plan = json.loads((output_dir / "plan.json").read_text(encoding="utf-8"))
     assert plan["status"] == "unreviewed"
     assert plan["selected"][0]["index"] == 0
