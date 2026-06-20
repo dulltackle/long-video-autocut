@@ -246,6 +246,10 @@ def create_transcriber(config=None):
     provider = str(_config_get(config, "asr_provider", "whisper")).strip().lower()
     if provider == "whisper":
         return create_whisper_transcriber(config)
+    if provider == "stepaudio":
+        if not _resolve_stepfun_api_key(config):
+            raise ValueError("StepAudio ASR provider requires STEPFUN_API_KEY")
+        raise ValueError("StepAudio ASR provider is not implemented yet")
     raise ValueError(f"Unknown ASR provider: {provider}")
 
 
@@ -446,3 +450,19 @@ def _config_get(config, key, default=None):
     if key in CONFIG:
         return CONFIG[key]
     return default
+
+
+def _resolve_stepfun_api_key(config):
+    api_key = _config_get(config, "stepfun_api_key", None)
+    if api_key:
+        return api_key
+    env_name = _config_get(config, "stepfun_api_key_env", "STEPFUN_API_KEY")
+    return os.environ.get(env_name, "")
+
+
+def _resolve_stepfun_base_url(config):
+    base_url = _config_get(config, "stepfun_base_url", None)
+    if base_url:
+        return base_url
+    env_name = _config_get(config, "stepfun_base_url_env", "STEPFUN_BASE_URL")
+    return os.environ.get(env_name, "")

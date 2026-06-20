@@ -6,6 +6,7 @@ import pytest
 
 from video_auto_editor.models import TranscriptChunk
 from video_auto_editor import transcript
+from video_auto_editor.config import CONFIG
 from video_auto_editor.transcript import (
     TranscriptionResult,
     VideoTranscriptionResult,
@@ -92,6 +93,29 @@ def test_create_whisper_transcriber_keeps_compatibility_entrypoint():
     assert isinstance(transcriber, WhisperTranscriber)
     assert transcriber.config.model == "base"
     assert transcriber.config.language == "zh"
+
+
+def test_default_asr_config_uses_stepaudio():
+    assert CONFIG["asr_provider"] == "stepaudio"
+    assert CONFIG["asr_model"] == "stepaudio-2.5-asr"
+    assert CONFIG["asr_timeout"] == 120
+    assert CONFIG["asr_language"] == "zh"
+    assert CONFIG["stepfun_api_key_env"] == "STEPFUN_API_KEY"
+    assert CONFIG["stepfun_base_url_env"] == "STEPFUN_BASE_URL"
+
+
+def test_create_transcriber_reports_missing_stepaudio_api_key(monkeypatch):
+    monkeypatch.delenv("STEPFUN_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="StepAudio ASR provider requires STEPFUN_API_KEY"):
+        create_transcriber({"asr_provider": "stepaudio"})
+
+
+def test_create_transcriber_reads_stepaudio_api_key_without_request(monkeypatch):
+    monkeypatch.setenv("STEPFUN_API_KEY", "test-key")
+
+    with pytest.raises(ValueError, match="StepAudio ASR provider is not implemented yet"):
+        create_transcriber({"asr_provider": "stepaudio"})
 
 
 def test_transcribe_segment_rejects_invalid_segment_index(monkeypatch, tmp_path):
