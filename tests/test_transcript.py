@@ -1,4 +1,7 @@
+import io
+import json
 import subprocess
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,10 +11,13 @@ from video_auto_editor.models import TranscriptChunk
 from video_auto_editor import transcript
 from video_auto_editor.config import CONFIG
 from video_auto_editor.transcript import (
+    StepAudioConfig,
+    StepAudioTranscriber,
     TranscriptionResult,
     VideoTranscriptionResult,
     WhisperConfig,
     WhisperTranscriber,
+    create_stepaudio_transcriber,
     create_transcriber,
     create_whisper_transcriber,
 )
@@ -104,18 +110,45 @@ def test_default_asr_config_uses_stepaudio():
     assert CONFIG["stepfun_base_url_env"] == "STEPFUN_BASE_URL"
 
 
-def test_create_transcriber_reports_missing_stepaudio_api_key(monkeypatch):
+def test_create_transcriber_creates_stepaudio_provider_without_request(monkeypatch):
     monkeypatch.delenv("STEPFUN_API_KEY", raising=False)
 
-    with pytest.raises(ValueError, match="StepAudio ASR provider requires STEPFUN_API_KEY"):
-        create_transcriber({"asr_provider": "stepaudio"})
+    transcriber = create_transcriber({"asr_provider": "stepaudio"})
+
+    assert isinstance(transcriber, StepAudioTranscriber)
+    assert transcriber.is_available() is False
 
 
 def test_create_transcriber_reads_stepaudio_api_key_without_request(monkeypatch):
     monkeypatch.setenv("STEPFUN_API_KEY", "test-key")
 
-    with pytest.raises(ValueError, match="StepAudio ASR provider is not implemented yet"):
-        create_transcriber({"asr_provider": "stepaudio"})
+    transcriber = create_transcriber({"asr_provider": "stepaudio"})
+
+    assert isinstance(transcriber, StepAudioTranscriber)
+    assert transcriber.is_available() is True
+    assert transcriber.config.api_key == "test-key"
+
+
+def test_create_stepaudio_transcriber_reads_base_url_from_env(monkeypatch):
+    monkeypatch.setenv("STEPFUN_API_KEY", "test-key")
+    monkeypatch.setenv("STEPFUN_BASE_URL", "https://example.test/v1")
+
+    transcriber = create_stepaudio_transcriber(
+        {
+            "stepfun_base_url": "",
+            "asr_model": "custom-asr",
+            "asr_language": "en",
+            "asr_timeout": 30,
+        }
+    )
+
+    assert transcriber.config == StepAudioConfig(
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        model="custom-asr",
+        language="en",
+        timeout=30,
+    )
 
 
 def test_transcribe_segment_rejects_invalid_segment_index(monkeypatch, tmp_path):
@@ -419,6 +452,175 @@ def test_whisper_transcribe_video_omits_text_without_timestamps(monkeypatch, tmp
 
     assert result.success is True
     assert result.chunks == []
+
+
+def test_stepaudio_is_unavailable_and_transcribe_fails_without_api_key(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+
+    transcriber = StepAudioTranscriber(StepAudioConfig(api_key=""))
+
+    assert transcriber.is_available() is False
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+    assert result == VideoTranscriptionResult(
+        success=False,
+        chunks=[],
+        transcript_path=str(tmp_path / "live.stepaudio.json"),
+        error="StepAudio API key missing",
+    )
+
+
+def test_stepaudio_transcribe_video_converts_success_response(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return (
+                '{"segments": ['
+                '{"start": 1.25, "end": 2.5, "text": " 第一段 "},'
+                '{"start": 3, "end": 4, "text": ""}'
+                "]}"
+            ).encode("utf-8")
+
+    def fake_request(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(
+            api_key="test-key",
+            base_url="https://example.test/v1/",
+            model="stepaudio-2.5-asr",
+            language="zh",
+            timeout=30,
+        ),
+        request_func=fake_request,
+    )
+
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+
+    assert result.success is True
+    assert result.chunks == [TranscriptChunk(1.25, 2.5, "第一段")]
+    assert result.transcript_path == str(tmp_path / "live.stepaudio.json")
+    assert json.loads((tmp_path / "live.stepaudio.json").read_text(encoding="utf-8"))["segments"][0]["text"] == " 第一段 "
+    assert captured["timeout"] == 30
+    assert captured["request"].full_url == "https://example.test/v1/audio/transcriptions"
+    body = captured["request"].data
+    assert b'name="model"\r\n\r\nstepaudio-2.5-asr' in body
+    assert b'name="language"\r\n\r\nzh' in body
+    assert b'name="file"; filename="live.mp4"' in body
+    assert b"video" in body
+
+
+def test_stepaudio_transcribe_video_supports_nested_segments(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return '{"data": {"segments": [{"start": 10, "end": 12, "text": "嵌套片段"}]}}'.encode("utf-8")
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key"),
+        request_func=lambda *args, **kwargs: FakeResponse(),
+    )
+
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+
+    assert result.success is True
+    assert result.chunks == [TranscriptChunk(10, 12, "嵌套片段")]
+
+
+def test_stepaudio_transcribe_video_returns_http_error(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+
+    def raise_http_error(*args, **kwargs):
+        raise urllib.error.HTTPError(
+            "https://example.test/v1/audio/transcriptions",
+            500,
+            "server error",
+            {},
+            io.BytesIO(b"failed"),
+        )
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", base_url="https://example.test/v1"),
+        request_func=raise_http_error,
+    )
+
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+
+    assert result.success is False
+    assert result.chunks == []
+    assert result.error == "StepAudio request failed: HTTP 500: failed"
+
+
+def test_stepaudio_transcribe_video_returns_invalid_json_error(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b"{bad json"
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key"),
+        request_func=lambda *args, **kwargs: FakeResponse(),
+    )
+
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+
+    assert result.success is False
+    assert result.chunks == []
+    assert "StepAudio response is not valid JSON" in result.error
+
+
+def test_stepaudio_transcribe_video_returns_missing_timestamp_error(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"text": "no timestamps"}'
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key"),
+        request_func=lambda *args, **kwargs: FakeResponse(),
+    )
+
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+
+    assert result.success is False
+    assert result.chunks == []
+    assert result.error == "StepAudio response missing timestamped segments"
 
 
 def test_export_srt_writes_timestamped_subtitles(tmp_path):

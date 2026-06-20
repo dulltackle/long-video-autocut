@@ -5,6 +5,9 @@ import os
 import re
 import subprocess
 import sys
+import uuid
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Protocol
@@ -23,6 +26,17 @@ class WhisperConfig:
     output_format: str = "txt"
     sample_rate: int = 16000
     channels: int = 1
+
+
+@dataclass
+class StepAudioConfig:
+    """StepAudio 整视频转写配置。"""
+
+    api_key: str = ""
+    base_url: str = "https://api.stepfun.com/v1"
+    model: str = "stepaudio-2.5-asr"
+    language: str = "zh"
+    timeout: int = 120
 
 
 @dataclass
@@ -240,6 +254,83 @@ class WhisperTranscriber:
         return VideoTranscriptionResult(success=True, chunks=chunks, transcript_path=transcript_path)
 
 
+class StepAudioTranscriber:
+    """基于 StepAudio API 的整视频转写器。"""
+
+    def __init__(self, config=None, request_func=None):
+        self.config = config or StepAudioConfig()
+        self.request_func = request_func or urllib.request.urlopen
+
+    def is_available(self):
+        """只检查必要配置，不发起网络请求。"""
+        return bool(self.config.api_key)
+
+    def transcribe_video(self, video_path, work_dir):
+        """调用 StepAudio 对整条视频转写，并返回带时间戳 chunks。"""
+        os.makedirs(work_dir, exist_ok=True)
+        transcript_path = os.path.join(work_dir, f"{Path(video_path).stem}.stepaudio.json")
+
+        if not self.config.api_key:
+            return VideoTranscriptionResult(
+                success=False,
+                chunks=[],
+                transcript_path=transcript_path,
+                error="StepAudio API key missing",
+            )
+
+        try:
+            request = _build_stepaudio_request(video_path, self.config)
+            with self.request_func(request, timeout=self.config.timeout) as response:
+                response_body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            return VideoTranscriptionResult(
+                success=False,
+                chunks=[],
+                transcript_path=transcript_path,
+                error=f"StepAudio request failed: HTTP {exc.code}: {_read_http_error(exc)}",
+            )
+        except (OSError, urllib.error.URLError) as exc:
+            return VideoTranscriptionResult(
+                success=False,
+                chunks=[],
+                transcript_path=transcript_path,
+                error=f"StepAudio request failed: {exc}",
+            )
+
+        try:
+            payload = json.loads(response_body)
+        except json.JSONDecodeError as exc:
+            return VideoTranscriptionResult(
+                success=False,
+                chunks=[],
+                transcript_path=transcript_path,
+                error=f"StepAudio response is not valid JSON: {exc}",
+            )
+
+        try:
+            chunks = _parse_stepaudio_payload(payload)
+        except ValueError as exc:
+            return VideoTranscriptionResult(
+                success=False,
+                chunks=[],
+                transcript_path=transcript_path,
+                error=str(exc),
+            )
+
+        if not chunks:
+            return VideoTranscriptionResult(
+                success=False,
+                chunks=[],
+                transcript_path=transcript_path,
+                error="StepAudio response missing timestamped segments",
+            )
+
+        with open(transcript_path, "w", encoding="utf-8") as transcript_file:
+            json.dump(payload, transcript_file, ensure_ascii=False, indent=2)
+
+        return VideoTranscriptionResult(success=True, chunks=chunks, transcript_path=transcript_path)
+
+
 def create_transcriber(config=None):
     """根据配置创建整视频 ASR provider。"""
     config = config or CONFIG
@@ -247,10 +338,22 @@ def create_transcriber(config=None):
     if provider == "whisper":
         return create_whisper_transcriber(config)
     if provider == "stepaudio":
-        if not _resolve_stepfun_api_key(config):
-            raise ValueError("StepAudio ASR provider requires STEPFUN_API_KEY")
-        raise ValueError("StepAudio ASR provider is not implemented yet")
+        return create_stepaudio_transcriber(config)
     raise ValueError(f"Unknown ASR provider: {provider}")
+
+
+def create_stepaudio_transcriber(config=None):
+    """从配置创建 StepAudio 转写器。"""
+    config = config or CONFIG
+    return StepAudioTranscriber(
+        StepAudioConfig(
+            api_key=_resolve_stepfun_api_key(config),
+            base_url=_resolve_stepfun_base_url(config),
+            model=_config_get(config, "asr_model"),
+            language=_config_get(config, "asr_language"),
+            timeout=_config_get(config, "asr_timeout"),
+        )
+    )
 
 
 def create_whisper_transcriber(config=None):
@@ -403,6 +506,37 @@ def _parse_whisper_json(transcript_path):
     return []
 
 
+def _parse_stepaudio_payload(payload):
+    segments = _extract_stepaudio_segments(payload)
+    chunks = []
+    for segment in segments:
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        chunks.append(_chunk_from_dict(segment))
+    return chunks
+
+
+def _extract_stepaudio_segments(payload):
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        raise ValueError("StepAudio response is not a JSON object")
+
+    for key in ("segments", "chunks"):
+        if isinstance(payload.get(key), list):
+            return payload[key]
+
+    for key in ("data", "result"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            for nested_key in ("segments", "chunks"):
+                if isinstance(nested.get(nested_key), list):
+                    return nested[nested_key]
+
+    raise ValueError("StepAudio response missing timestamped segments")
+
+
 def _chunk_from_dict(item):
     try:
         return TranscriptChunk(
@@ -442,6 +576,62 @@ def _ensure_parent_dir(path):
 
 def _normalize_subtitle_text(text):
     return re.sub(r"\s+", " ", str(text).strip())
+
+
+def _build_stepaudio_request(video_path, config):
+    boundary = f"----video-auto-editor-{uuid.uuid4().hex}"
+    body = _encode_stepaudio_multipart(video_path, config, boundary)
+    url = _join_url(config.base_url, "audio/transcriptions")
+    return urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {config.api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+
+
+def _encode_stepaudio_multipart(video_path, config, boundary):
+    file_name = os.path.basename(video_path)
+    with open(video_path, "rb") as video_file:
+        file_content = video_file.read()
+
+    fields = [
+        ("model", config.model),
+        ("language", config.language),
+        ("response_format", "verbose_json"),
+    ]
+    body = bytearray()
+    for name, value in fields:
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+
+    body.extend(f"--{boundary}\r\n".encode("utf-8"))
+    body.extend(
+        (
+            f'Content-Disposition: form-data; name="file"; filename="{file_name}"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).encode("utf-8")
+    )
+    body.extend(file_content)
+    body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+    return bytes(body)
+
+
+def _join_url(base_url, path):
+    return f"{str(base_url).rstrip('/')}/{path.lstrip('/')}"
+
+
+def _read_http_error(exc):
+    try:
+        return exc.read().decode("utf-8").strip()
+    except Exception:
+        return str(exc)
 
 
 def _config_get(config, key, default=None):

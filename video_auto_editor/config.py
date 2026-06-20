@@ -34,7 +34,7 @@ CONFIG = {
     "asr_language": "zh",
     "stepfun_api_key_env": "STEPFUN_API_KEY",
     "stepfun_base_url_env": "STEPFUN_BASE_URL",
-    "stepfun_base_url": "",
+    "stepfun_base_url": "https://api.stepfun.com/v1",
     "whisper_model": "small",
     "whisper_language": "zh",
     "whisper_timeout": 120,
