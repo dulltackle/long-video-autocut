@@ -6,7 +6,15 @@ from types import SimpleNamespace
 import pytest
 
 from video_auto_editor import cli, media
-from video_auto_editor.models import ClipCandidate, ClipInfo, LiveClipInfo, Segment, TopicReviewResult, TranscriptChunk
+from video_auto_editor.models import (
+    ClipCandidate,
+    ClipInfo,
+    LiveClipInfo,
+    LiveExportDecision,
+    Segment,
+    TopicReviewResult,
+    TranscriptChunk,
+)
 from video_auto_editor.report import generate_batch_report, generate_live_report, generate_single_report
 from video_auto_editor.review import TopicReviewProviderResult
 from video_auto_editor.transcript import VideoTranscriptionResult
@@ -169,6 +177,79 @@ def test_generate_live_report_does_not_render_none_review_reason(tmp_path):
     content = Path(report_path).read_text(encoding="utf-8")
     assert "None" not in content
     assert "| candidate_0 | 主题 | yes | 8 | 7 | 90 | publish_ready | no |  |" in content
+
+
+def test_generate_live_report_lists_exports_rejections_human_review_series_and_deliverables(tmp_path):
+    (tmp_path / "plan.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "transcript.srt").write_text("", encoding="utf-8")
+    (tmp_path / "metadata.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "clips").mkdir()
+    (tmp_path / "subtitles").mkdir()
+    selected = ClipCandidate(0, 12, 68, 56, "入选文本", title="入选标题", base_score=90, adjusted_score=95)
+    selected.export_selection = LiveExportDecision(
+        candidate_index=0,
+        selected_for_export=True,
+        decision="export",
+        reason="publish_ready",
+        review_status="reviewed",
+        publish_ready_score=92,
+        export_rank=1,
+        original_start=10,
+        original_end=70,
+        final_start=12,
+        final_end=68,
+        topic_name="主题 A",
+        series_key="topic-a",
+    )
+    rejected = ClipCandidate(1, 80, 140, 60, "未导出文本", title="未导出标题", base_score=88, adjusted_score=90)
+    rejected.export_selection = LiveExportDecision(
+        candidate_index=1,
+        selected_for_export=False,
+        decision="skip",
+        reason="boundary_fix_needs_human_review",
+        review_status="reviewed",
+        publish_ready_score=89,
+        topic_name="主题 A",
+        needs_human_review=True,
+        boundary_fix_suggestion="建议补足收尾。",
+        series_key="topic-a",
+    )
+    export_info = LiveClipInfo(
+        1,
+        "入选标题",
+        12,
+        68,
+        56,
+        95,
+        "入选文本",
+        str(tmp_path / "clips" / "001_入选标题.mp4"),
+        str(tmp_path / "subtitles" / "001_入选标题.srt"),
+    )
+
+    report_path = generate_live_report(
+        "live",
+        str(tmp_path),
+        total_duration=200,
+        silences=[],
+        candidates=[selected, rejected],
+        selected=[selected],
+        exports=[export_info],
+        config={"export_subtitles": True},
+    )
+
+    content = Path(report_path).read_text(encoding="utf-8")
+    assert "Reviewed 非 dry-run 交付包" in content
+    assert "## 导出清单" in content
+    assert "| 0 | 入选标题 | 主题 A | 92 | 12.0-68.0s | `clips/001_入选标题.mp4` | `subtitles/001_入选标题.srt` |" in content
+    assert "## 未导出候选" in content
+    assert "boundary_fix_needs_human_review" in content
+    assert "建议补足收尾。" in content
+    assert "## 人工复核" in content
+    assert "| candidate_1 | 主题 A | boundary_fix_needs_human_review | 建议补足收尾。 |" in content
+    assert "## 同主题系列" in content
+    assert "| topic-a | 主题 A | candidate_0 |" in content
+    assert "## 标准交付物" in content
+    assert "| `metadata.json` | yes |" in content
 
 
 def test_main_dispatches_batch_subcommand(monkeypatch, tmp_path):
