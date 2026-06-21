@@ -105,6 +105,15 @@
 
 第六批完成后，面向用户的直播拆条协作由薄调度器 skill 编排：先做环境预检（CLI、`ffmpeg`、`ffprobe`、`STEPFUN_API_KEY`、ASR 与评审配置），再收集课程上下文并生成合法 JSON，调用 `video-auto-editor live ...`，最后读取 `plan.json`、`metadata.json` 和 `拆条报告.md` 解释导出清单、未导出原因、人工复核项、边界补救建议和同主题系列，并在失败或降级时给出可执行修复建议与二次运行命令。重活仍全部由 CLI 完成，skill 不直接剪视频、不绕过 CLI 写产物、不承载候选算法。
 
+第六批落地入口（均为可测试单元，不依赖真实外部服务）：
+
+- `.claude/skills/live-autocut/SKILL.md`：薄调度器 skill，编排预检→上下文→调用→解释→诊断五步，并明确职责边界。
+- `video_auto_editor/preflight.py`：`run_preflight(probe, config)` 通过可注入的 `EnvironmentProbe` 检查 CLI、`ffmpeg`、`ffprobe`、`STEPFUN_API_KEY`、ASR provider 与主题评审配置，输出结构化检查项与整体 `ready`；评审关闭/缺 Key 为 `warn` 降级，缺 ffmpeg/Key 为 `error`。
+- `video_auto_editor/context.py`：`build_course_context` / `write_course_context` 把课程信息规整为符合 `CourseContext` 契约的合法 JSON，未知字段收集到 `unknown_fields` 而不写入交付 JSON，类型非法时报错。
+- `video_auto_editor/orchestration.py`：`interpret_output_dir` / `interpret_artifacts` 只读 `plan.json`、`metadata.json` 解释运行模式、导出清单、未导出原因、人工复核项、同主题系列与 warnings；`diagnose_run` 基于退出码、warnings 与缺失产物区分 ASR 失败、评审降级、无发布就绪候选、缺上下文，并附可复制的二次运行命令。
+
+第六批不实现发布平台上传与草稿、封面生成、标题 A/B 测试、社媒/定时发布、跨场次系列化运营与素材库，这些留到后续阶段。
+
 详细任务、验收标准与提交点见 [第六批：skill 调度器与最小协作闭环](./implementation-batch-6-skill-orchestrator.md)。第六批要求每完成一个小任务并通过对应验证后立即进行一次 git commit。
 
 ## 分批执行文档
