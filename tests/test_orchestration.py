@@ -190,3 +190,73 @@ def test_no_none_rendered_for_missing_fields():
     assert export["title"] == ""
     assert export["topic_name"] == ""
     assert export["series_key"] == ""
+
+
+from video_auto_editor.orchestration import diagnose_run
+
+
+def test_diagnose_asr_failure_is_abort():
+    diagnoses = diagnose_run(exit_code=1, has_transcript=False)
+
+    assert len(diagnoses) == 1
+    diag = diagnoses[0]
+    assert diag["category"] == "asr_failed"
+    assert diag["severity"] == "abort"
+    assert "STEPFUN_API_KEY" in diag["rerun_command"]
+
+
+def test_diagnose_review_missing_key_is_degraded():
+    plan = {
+        "status": "unreviewed",
+        "export_count": 0,
+        "context": {"loaded": True},
+        "warnings": ["主题评审不可用：缺少 API Key，未发起评审请求。"],
+    }
+    diagnoses = diagnose_run(exit_code=0, has_transcript=True, plan=plan)
+
+    review = next(d for d in diagnoses if d["category"] == "review_degraded")
+    assert review["severity"] == "degraded"
+    assert "STEPFUN_API_KEY" in review["rerun_command"]
+    assert "--allow-unreviewed-export" in review["compatibility_command"]
+
+
+def test_diagnose_no_publish_ready_is_info_not_failure():
+    plan = {
+        "status": "reviewed",
+        "export_count": 0,
+        "context": {"loaded": True},
+        "warnings": [],
+    }
+    diagnoses = diagnose_run(exit_code=0, has_transcript=True, plan=plan)
+
+    categories = {d["category"] for d in diagnoses}
+    assert "no_publish_ready" in categories
+    no_ready = next(d for d in diagnoses if d["category"] == "no_publish_ready")
+    assert no_ready["severity"] == "info"
+    assert "--dry-run" in no_ready["rerun_command"]
+
+
+def test_diagnose_missing_context_hint():
+    plan = {
+        "status": "reviewed",
+        "export_count": 1,
+        "exports": [{}],
+        "context": {"loaded": False},
+        "warnings": [],
+    }
+    diagnoses = diagnose_run(exit_code=0, has_transcript=True, plan=plan)
+
+    assert any(d["category"] == "missing_context" for d in diagnoses)
+
+
+def test_diagnose_review_disabled_suggests_compatibility():
+    plan = {
+        "status": "unreviewed",
+        "export_count": 0,
+        "context": {"loaded": True},
+        "warnings": ["主题评审已关闭，plan.json status 为 unreviewed。"],
+    }
+    diagnoses = diagnose_run(exit_code=0, has_transcript=True, plan=plan)
+
+    review = next(d for d in diagnoses if d["category"] == "review_degraded")
+    assert "--allow-unreviewed-export" in review["rerun_command"]

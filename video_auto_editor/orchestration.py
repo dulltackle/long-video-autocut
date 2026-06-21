@@ -215,6 +215,119 @@ def _interpret_warnings(plan):
     return [{"message": str(message)} for message in plan.get("warnings", [])]
 
 
+def diagnose_run(
+    exit_code=0,
+    has_transcript=True,
+    plan=None,
+    warnings=None,
+    video_path="<video>",
+    output_dir="out/live",
+    work_dir="work/live",
+    context_file="out/live/course-context.json",
+):
+    """基于退出码、warnings 与缺失产物给出结构化失败诊断与二次运行建议。
+
+    诊断只解释既有信号，不臆造未在产物或退出码中体现的失败原因。
+    """
+    plan = plan or {}
+    warnings = list(warnings if warnings is not None else plan.get("warnings", []))
+    base_cmd = _base_command(video_path, output_dir, work_dir, context_file)
+
+    diagnoses = []
+
+    # 1. ASR 失败：进程异常退出且没有产出 transcript.srt，属于中止类失败。
+    if exit_code != 0 and not has_transcript:
+        diagnoses.append(
+            {
+                "category": "asr_failed",
+                "severity": "abort",
+                "detail": "未生成 transcript.srt，ASR 不可用或识别失败，处理已中止。",
+                "hint": "确认已设置 STEPFUN_API_KEY 且网络可达；或将 ASR provider 切换为本地 whisper 后重跑。",
+                "rerun_command": f"export STEPFUN_API_KEY=sk-...\n{base_cmd}",
+            }
+        )
+        return diagnoses
+
+    status = plan.get("status")
+    export_count = plan.get("export_count", len(plan.get("exports", [])))
+
+    # 2. 评审降级：评审关闭、不可用或缺少 API Key，输出未评审方案。
+    if status == "unreviewed":
+        diagnoses.append(_review_degraded_diagnosis(warnings, base_cmd, video_path, output_dir, work_dir, context_file))
+
+    # 3. 评审成功但无发布就绪候选：正常结束、导出为空，而非失败。
+    elif status == "reviewed" and export_count == 0:
+        diagnoses.append(
+            {
+                "category": "no_publish_ready",
+                "severity": "info",
+                "detail": "评审完成但没有发布就绪候选，正常结束、导出为空，并非失败。",
+                "hint": "可降低发布就绪阈值或补充更优质的直播素材；如需先看完整方案，加 --dry-run 复跑。",
+                "rerun_command": f"{base_cmd} --dry-run",
+            }
+        )
+
+    # 4. 缺少课程上下文：评审质量下降提示（仅提示，不视为失败）。
+    if not _context_loaded(plan):
+        diagnoses.append(
+            {
+                "category": "missing_context",
+                "severity": "info",
+                "detail": "未提供课程上下文，主题评审缺少课程信息，可能影响标题与主题判定质量。",
+                "hint": "整理课程标题、讲师、重点主题等信息生成 --context-file 后重跑，可提升评审质量。",
+                "rerun_command": base_cmd,
+            }
+        )
+
+    return diagnoses
+
+
+def _review_degraded_diagnosis(warnings, base_cmd, video_path, output_dir, work_dir, context_file):
+    joined = " ".join(str(message) for message in warnings)
+    if "缺少 API Key" in joined:
+        detail = "主题评审因缺少 API Key 不可用，已输出未评审方案，默认不导出。"
+        hint = "设置 STEPFUN_API_KEY 后重跑以启用评审；或显式允许未评审兼容导出。"
+        rerun = f"export STEPFUN_API_KEY=sk-...\n{base_cmd}"
+    elif "已关闭" in joined:
+        detail = "主题评审已关闭，已输出未评审方案，默认不导出。"
+        hint = "启用 topic_review_enabled 并配置评审模型；或显式允许未评审兼容导出。"
+        rerun = _command_with_flag(video_path, output_dir, work_dir, context_file, "--allow-unreviewed-export")
+    elif "评审失败" in joined or "配置错误" in joined:
+        detail = "主题评审请求失败或配置错误，已降级输出未评审方案。"
+        hint = "检查评审模型配置与网络后重跑；或显式允许未评审兼容导出。"
+        rerun = f"{base_cmd}"
+    else:
+        detail = "评审未生效，已输出未评审方案，默认不导出。"
+        hint = "确认评审已启用且凭据齐备后重跑；或显式允许未评审兼容导出。"
+        rerun = f"{base_cmd}"
+    return {
+        "category": "review_degraded",
+        "severity": "degraded",
+        "detail": detail,
+        "hint": hint,
+        "rerun_command": rerun,
+        "compatibility_command": _command_with_flag(
+            video_path, output_dir, work_dir, context_file, "--allow-unreviewed-export"
+        ),
+    }
+
+
+def _context_loaded(plan):
+    context = plan.get("context") or {}
+    return bool(context.get("loaded"))
+
+
+def _base_command(video_path, output_dir, work_dir, context_file):
+    return (
+        f"video-auto-editor live {video_path} "
+        f"--output-dir {output_dir} --work-dir {work_dir} --context-file {context_file}"
+    )
+
+
+def _command_with_flag(video_path, output_dir, work_dir, context_file, flag):
+    return f"{_base_command(video_path, output_dir, work_dir, context_file)} {flag}"
+
+
 def _read_json(path):
     if not os.path.exists(path):
         return None
