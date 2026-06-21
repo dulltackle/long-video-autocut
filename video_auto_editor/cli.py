@@ -16,7 +16,7 @@ from video_auto_editor.plan import write_plan
 from video_auto_editor.report import generate_batch_report, generate_live_report, generate_single_report
 from video_auto_editor.review import build_topic_review_batches, create_topic_reviewer
 from video_auto_editor.scoring import analyze_fluency, calculate_adjusted_score, score_segment
-from video_auto_editor.selection import select_best_segment, select_live_clips
+from video_auto_editor.selection import select_best_segment, select_live_exports
 from video_auto_editor.silence import detect_silence, identify_segments
 from video_auto_editor.transcript import export_srt, transcribe_candidates, transcribe_video
 from video_auto_editor.topic import enrich_clip_candidates, generate_clip_candidates
@@ -197,23 +197,23 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
     candidates = check_duplicate_live_candidates(candidates, config)
     print(f"   Marked {sum(1 for candidate in candidates if candidate.is_duplicate)} duplicate candidates")
 
-    print("\n🏆 Step 6: Selecting live clips...")
-    selected = select_live_clips(candidates, None, config)
+    print("\n🧠 Step 6: Reviewing clip topics...")
+    review_status, review_provider, review_warnings = _review_live_candidates(candidates, course_context, config)
+    if review_status == "reviewed":
+        print(f"   ✅ Reviewed {len(candidates)} candidates")
+    else:
+        print("   ⚠️  Topic review unavailable; writing unreviewed plan")
+
+    print("\n🏆 Step 7: Selecting live exports...")
+    selected, _ = select_live_exports(candidates, None, config, review_status=review_status)
     if not selected:
-        print("   ⚠️  No live clips selected")
+        print("   ⚠️  No live clips selected for export")
     else:
         for candidate in selected:
             print(
                 f"   ✅ candidate_{candidate.index}: {candidate.start_time:.1f}-{candidate.end_time:.1f}s "
                 f"score={_live_candidate_score(candidate):.1f} title={candidate.title}"
             )
-
-    print("\n🧠 Step 7: Reviewing clip topics...")
-    review_status, review_provider, review_warnings = _review_live_candidates(candidates, course_context, config)
-    if review_status == "reviewed":
-        print(f"   ✅ Reviewed {len(candidates)} candidates")
-    else:
-        print("   ⚠️  Topic review unavailable; continuing with unreviewed plan")
 
     warnings = _build_live_warnings(config, review_warnings)
     plan_path = write_plan(
@@ -231,6 +231,8 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
     exports = []
     if dry_run:
         print("\n✂️  Step 8: Dry-run skips live clip export")
+    elif not selected:
+        print("\n✂️  Step 8: No selected live clips; skipping export")
     else:
         print("\n✂️  Step 8: Exporting live clips...")
         exports = export_live_clips(video_path, selected, transcript_result.chunks, output_dir, config)
@@ -382,13 +384,6 @@ def _topic_reviewer_info(reviewer):
 
 def _build_live_warnings(config, review_warnings=None):
     warnings = list(review_warnings or [])
-    if not config.get("max_clips_user_provided", False):
-        warnings.append(
-            f"未显式传入 --max-clips，当前使用临时保护上限 "
-            f"{config.get('temporary_protective_max_clips', config['max_clips'])}。"
-        )
-    if not config.get("allow_unreviewed_export", False):
-        warnings.append("未显式允许未评审导出；当前为兼容既有 live 行为仍保留导出能力。")
     return warnings
 
 

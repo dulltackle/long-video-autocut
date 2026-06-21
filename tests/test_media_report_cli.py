@@ -386,7 +386,12 @@ def test_process_live_video_exports_transcript_srt(monkeypatch, tmp_path):
         ],
     )
 
-    result = cli.process_live_video(str(video_path), str(output_dir), str(work_dir))
+    result = cli.process_live_video(
+        str(video_path),
+        str(output_dir),
+        str(work_dir),
+        config={**cli.CONFIG, "allow_unreviewed_export": True},
+    )
 
     assert len(result) == 1
     assert (output_dir / "transcript.srt").read_text(encoding="utf-8") == (
@@ -441,12 +446,52 @@ def test_process_live_video_dry_run_writes_plan_and_skips_exports(monkeypatch, t
     assert not list((output_dir / "subtitles").glob("*.srt")) if (output_dir / "subtitles").exists() else True
     report = (output_dir / "拆条报告.md").read_text(encoding="utf-8")
     assert "Dry-run：本报告是未评审拆条方案，不代表发布就绪短视频。" in report
-    assert "- Selected clips: 1" in report
+    assert "- Selected clips: 0" in report
     assert "- Exported clips: 0 (dry-run)" in report
     plan = json.loads((output_dir / "plan.json").read_text(encoding="utf-8"))
     assert plan["status"] == "unreviewed"
-    assert plan["selected"][0]["index"] == 0
-    assert any("临时保护上限" in warning for warning in plan["warnings"])
+    assert plan["selected"] == []
+    assert any("主题评审不可用" in warning for warning in plan["warnings"])
+
+
+def test_process_live_video_skips_export_when_review_unavailable_by_default(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    output_dir = tmp_path / "out"
+    work_dir = tmp_path / "work"
+    chunks = [TranscriptChunk(10, 70, "直播文本。")]
+    candidates = [ClipCandidate(0, 10, 70, 60, "直播文本。", base_score=90)]
+
+    monkeypatch.setattr(cli, "get_video_duration", lambda video_path_arg: 120.0)
+    monkeypatch.setattr(cli, "detect_silence", lambda video_path_arg, config=None: [])
+    monkeypatch.setattr(
+        cli,
+        "transcribe_video",
+        lambda *args, **kwargs: VideoTranscriptionResult(success=True, chunks=chunks, cache_path="cache.json"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "generate_clip_candidates",
+        lambda chunks_arg, silences, total_duration, config=None: candidates,
+    )
+
+    def fail_export(*args, **kwargs):
+        raise AssertionError("unreviewed export must require explicit allow_unreviewed_export")
+
+    monkeypatch.setattr(cli, "export_live_clips", fail_export)
+
+    result = cli.process_live_video(
+        str(video_path),
+        str(output_dir),
+        str(work_dir),
+        config=cli.CONFIG.copy(),
+        dry_run=False,
+    )
+
+    assert result == []
+    assert not (output_dir / "metadata.json").exists()
+    plan = json.loads((output_dir / "plan.json").read_text(encoding="utf-8"))
+    assert plan["selected"] == []
 
 
 def test_process_live_video_writes_reviewed_plan_and_report(monkeypatch, tmp_path):
@@ -568,7 +613,7 @@ def test_process_live_video_keeps_unreviewed_plan_on_review_failure(monkeypatch,
     assert result == []
     plan = json.loads((output_dir / "plan.json").read_text(encoding="utf-8"))
     assert plan["status"] == "unreviewed"
-    assert "review" not in plan["selected"][0]
+    assert plan["selected"] == []
     assert any("主题评审失败：模型响应缺少字段" in warning for warning in plan["warnings"])
     report = (output_dir / "拆条报告.md").read_text(encoding="utf-8")
     assert "主题评审失败：模型响应缺少字段" in report
@@ -634,7 +679,12 @@ def test_process_live_video_logs_generated_candidates(monkeypatch, tmp_path, cap
         ],
     )
 
-    cli.process_live_video(str(video_path), str(tmp_path / "out"), str(tmp_path / "work"))
+    cli.process_live_video(
+        str(video_path),
+        str(tmp_path / "out"),
+        str(tmp_path / "work"),
+        config={**cli.CONFIG, "allow_unreviewed_export": True},
+    )
 
     assert calls["args"] == (chunks, silences, 120.0)
     output = capsys.readouterr().out
