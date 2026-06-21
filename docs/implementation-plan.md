@@ -65,6 +65,8 @@
 - 输出结构化评审结果：主题名、主题完整度、学习价值、传播价值、发布就绪评分、导出建议、标题、摘要、关键词、人工复核、淘汰原因、边界补救建议。
 - LLM 不可用时默认不导出，只输出未评审方案和报告。
 
+详细任务、验收标准与提交点见 [第四批：主题评审与最小 reviewed dry-run 闭环](./implementation-batch-4-topic-review.md)。第四批要求每完成一个小任务并通过对应验证后立即进行一次 git commit。
+
 ### 5. 导出选择与标准交付物
 
 目标：基于主题评审结果导出全部发布就绪短视频，并增强机器可读和人工可读交付物。
@@ -96,7 +98,8 @@
 - [第一批：CLI 打包与配置层](./implementation-batch-1-cli-foundation.md)
 - [第二批：ASR 抽象与最小 live dry-run 闭环](./implementation-batch-2-asr-foundation.md)
 - [第三批：StepAudio 分片识别与缓存闭环](./implementation-batch-3-stepaudio-sharding.md)
+- [第四批：主题评审与最小 reviewed dry-run 闭环](./implementation-batch-4-topic-review.md)
 
 ## 提交节奏
 
-每一批都应拆成多个小提交，按“独立可测试能力”提交，而不是等整批完成后一次性提交。第一批的具体提交点见 [第一批执行方案](./implementation-batch-1-cli-foundation.md#建议提交点)，第二批的具体提交点见 [第二批执行方案](./implementation-batch-2-asr-foundation.md)，第三批的具体提交点见 [第三批执行方案](./implementation-batch-3-stepaudio-sharding.md)。第三批执行时，每完成一个小任务并通过对应验证命令后，必须立即进行一次 git commit。
+每一批都应拆成多个小提交，按“独立可测试能力”提交，而不是等整批完成后一次性提交。第一批的具体提交点见 [第一批执行方案](./implementation-batch-1-cli-foundation.md#建议提交点)，第二批的具体提交点见 [第二批执行方案](./implementation-batch-2-asr-foundation.md)，第三批的具体提交点见 [第三批执行方案](./implementation-batch-3-stepaudio-sharding.md)，第四批的具体提交点见 [第四批执行方案](./implementation-batch-4-topic-review.md)。第三批和第四批执行时，每完成一个小任务并通过对应验证命令后，必须立即进行一次 git commit。
