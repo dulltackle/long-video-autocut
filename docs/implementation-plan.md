@@ -43,6 +43,15 @@
 - 将分片时间戳按偏移合并成整场转写文本。
 - 默认开启处理缓存，缓存键包含影响结果的输入摘要。
 
+第三批完成后，默认 `stepaudio` provider 的直播课转写流程为：先通过 FFmpeg 提取统一格式音频，再按 `asr_shard_seconds` 生成连续识别分片，逐片调用 stepaudio-2.5-asr，并把分片内时间戳加上全局分片起点后合并为整场转写文本。
+
+处理缓存分为两层：
+
+- `transcript.json`：整场转写缓存，命中时直接跳过 provider 创建、音频提取和 StepAudio 请求。
+- `asr_shard_cache/shard_*.json`：分片缓存，整体缓存缺失时复用签名匹配的已识别分片。
+
+缓存签名覆盖源视频摘要、provider、模型、语言、分片起止时间、音频采样率、声道数和音频格式；修改影响结果的配置会使相关缓存失效。
+
 详细任务、验收标准与提交点见 [第三批：StepAudio 分片识别与缓存闭环](./implementation-batch-3-stepaudio-sharding.md)。第三批要求每完成一个小任务并通过对应验证后立即进行一次 git commit。
 
 ### 4. 主题评审

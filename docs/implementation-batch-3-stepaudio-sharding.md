@@ -386,6 +386,16 @@ export STEPFUN_API_KEY=sk-...
 video-auto-editor live path/to/live.mp4 --output-dir out/live --work-dir work/live --dry-run
 ```
 
+处理流程：
+
+1. 使用 `ffprobe` 读取源视频时长。
+2. 使用 `ffmpeg` 提取统一音频，默认参数为 `16000 Hz`、`1` 声道、`wav`。
+3. 按 `asr_shard_seconds` 生成连续识别分片，默认每片 `600` 秒，末片不超过总时长。
+4. 使用 `ffmpeg` 为每个识别分片切出独立音频文件。
+5. 逐片请求 stepaudio-2.5-asr；网络错误、超时、HTTP 429 和 HTTP 5xx 使用有限重试。
+6. 将每个分片返回的本地时间戳加上分片全局起点，丢弃空文本，按时间升序合并为整场转写文本。
+7. 写出 `transcript.srt`，再继续候选生成、去重、基础选择、`plan.json` 和 `拆条报告.md`。
+
 预期产物：
 
 - `out/live/transcript.srt`
@@ -403,9 +413,46 @@ dry-run 不应生成：
 第三批完成后，live ASR 缓存应分两层：
 
 - `transcript.json`：整场转写缓存，命中时直接跳过 provider。
-- 分片缓存：整体缓存缺失时，复用已成功识别且签名匹配的分片。
+- `asr_shard_cache/shard_*.json`：分片缓存，整体缓存缺失时，复用已成功识别且签名匹配的分片。
 
-缓存签名必须覆盖会影响结果的输入和配置，避免换模型、换语言或调整分片音频参数后误用旧结果。
+整体缓存优先级高于分片缓存；命中 `transcript.json` 时不会创建 provider、不会检查 StepAudio 可用性，也不会重新执行音频提取。整体缓存缺失时，CLI 仍会重新准备分片音频，但已命中的分片缓存不会再次请求 StepAudio。
+
+分片缓存签名覆盖：
+
+- 源视频摘要。
+- provider。
+- ASR 模型。
+- 语言。
+- 分片起止时间。
+- 音频采样率。
+- 声道数。
+- 音频格式。
+
+缓存损坏或签名不匹配时，只重新识别对应分片。修改模型、语言、分片边界或音频参数后，相关缓存会失效，避免误用旧结果。
+
+### 本地 dry-run 检查
+
+本地验证第三批闭环时，优先运行：
+
+```bash
+pytest tests/test_live_dry_run_e2e.py
+pytest tests/test_transcript.py
+pytest
+```
+
+真实视频 dry-run 可使用：
+
+```bash
+export STEPFUN_API_KEY=sk-...
+video-auto-editor live path/to/live.mp4 --output-dir out/live --work-dir work/live --dry-run
+```
+
+检查点：
+
+- `out/live/transcript.srt` 存在，并包含跨分片合并后的全局时间戳。
+- `out/live/plan.json` 存在，且 `status` 为 `unreviewed`。
+- `out/live/拆条报告.md` 存在，并包含 dry-run 未评审提示。
+- dry-run 不生成 `metadata.json`、`clips/*.mp4` 和单条短视频字幕文件。
 
 ### 第四批边界
 
