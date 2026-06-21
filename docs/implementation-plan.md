@@ -103,6 +103,10 @@
 - 根据失败原因提示修复或二次运行。
 - 不直接剪视频，不绕过 CLI 写产物，不承载候选算法。
 
+第六批完成后，面向用户的直播拆条协作由薄调度器 skill 编排：先做环境预检（CLI、`ffmpeg`、`ffprobe`、`STEPFUN_API_KEY`、ASR 与评审配置），再收集课程上下文并生成合法 JSON，调用 `video-auto-editor live ...`，最后读取 `plan.json`、`metadata.json` 和 `拆条报告.md` 解释导出清单、未导出原因、人工复核项、边界补救建议和同主题系列，并在失败或降级时给出可执行修复建议与二次运行命令。重活仍全部由 CLI 完成，skill 不直接剪视频、不绕过 CLI 写产物、不承载候选算法。
+
+详细任务、验收标准与提交点见 [第六批：skill 调度器与最小协作闭环](./implementation-batch-6-skill-orchestrator.md)。第六批要求每完成一个小任务并通过对应验证后立即进行一次 git commit。
+
 ## 分批执行文档
 
 - [第一批：CLI 打包与配置层](./implementation-batch-1-cli-foundation.md)
@@ -110,7 +114,8 @@
 - [第三批：StepAudio 分片识别与缓存闭环](./implementation-batch-3-stepaudio-sharding.md)
 - [第四批：主题评审与最小 reviewed dry-run 闭环](./implementation-batch-4-topic-review.md)
 - [第五批：导出选择与标准交付物闭环](./implementation-batch-5-export-deliverables.md)
+- [第六批：skill 调度器与最小协作闭环](./implementation-batch-6-skill-orchestrator.md)
 
 ## 提交节奏
 
-每一批都应拆成多个小提交，按“独立可测试能力”提交，而不是等整批完成后一次性提交。第一批的具体提交点见 [第一批执行方案](./implementation-batch-1-cli-foundation.md#建议提交点)，第二批的具体提交点见 [第二批执行方案](./implementation-batch-2-asr-foundation.md)，第三批的具体提交点见 [第三批执行方案](./implementation-batch-3-stepaudio-sharding.md)，第四批的具体提交点见 [第四批执行方案](./implementation-batch-4-topic-review.md)，第五批的具体提交点见 [第五批执行方案](./implementation-batch-5-export-deliverables.md)。第三批、第四批和第五批执行时，每完成一个小任务并通过对应验证命令后，必须立即进行一次 git commit。
+每一批都应拆成多个小提交，按“独立可测试能力”提交，而不是等整批完成后一次性提交。第一批的具体提交点见 [第一批执行方案](./implementation-batch-1-cli-foundation.md#建议提交点)，第二批的具体提交点见 [第二批执行方案](./implementation-batch-2-asr-foundation.md)，第三批的具体提交点见 [第三批执行方案](./implementation-batch-3-stepaudio-sharding.md)，第四批的具体提交点见 [第四批执行方案](./implementation-batch-4-topic-review.md)，第五批的具体提交点见 [第五批执行方案](./implementation-batch-5-export-deliverables.md)。第三批、第四批、第五批和第六批执行时，每完成一个小任务并通过对应验证命令后，必须立即进行一次 git commit。
