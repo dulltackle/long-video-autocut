@@ -1,9 +1,12 @@
 """候选片段选择策略。"""
 
 import hashlib
+import logging
 
 from video_auto_editor.config import CONFIG
 from video_auto_editor.models import LiveExportDecision
+
+logger = logging.getLogger(__name__)
 
 
 def _fluency_rate(seg):
@@ -186,6 +189,12 @@ def _apply_final_boundary(candidate):
     final_start = float(review.boundary_fix_start)
     final_end = float(review.boundary_fix_end)
     if final_start < 0 or final_end <= final_start:
+        logger.warning(
+            "忽略候选 %s 的非法边界修复：boundary_fix_start=%s, boundary_fix_end=%s",
+            candidate.index,
+            review.boundary_fix_start,
+            review.boundary_fix_end,
+        )
         return
     candidate.start_time = final_start
     candidate.end_time = final_end
