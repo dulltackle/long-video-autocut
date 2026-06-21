@@ -802,22 +802,23 @@ def test_stepaudio_transcribe_video_converts_success_response(monkeypatch, tmp_p
     assert result.success is True
     assert result.chunks == [TranscriptChunk(1.25, 2.5, "第一段")]
     assert result.transcript_path == str(tmp_path / "live.stepaudio.json")
-    assert json.loads((tmp_path / "live.stepaudio.json").read_text(encoding="utf-8"))["segments"][0]["text"] == " 第一段 "
+    assert json.loads((tmp_path / "live.stepaudio.json").read_text(encoding="utf-8"))["chunks"][0]["text"] == "第一段"
     assert captured["timeout"] == 30
     assert captured["request"].full_url == "https://example.test/v1/audio/transcriptions"
     body = captured["request"].data
     assert b'name="model"\r\n\r\nstepaudio-2.5-asr' in body
     assert b'name="language"\r\n\r\nzh' in body
-    assert b'name="file"; filename="live.mp4"' in body
-    assert b"video" in body
+    assert b'name="file"; filename="shard_0000.wav"' in body
+    assert b"audio" in body
 
 
-def test_stepaudio_transcribe_video_rejects_oversized_file_without_request(tmp_path):
+def test_stepaudio_transcribe_video_rejects_oversized_shard_without_request(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_bytes(b"video")
+    install_stepaudio_media_success(monkeypatch, duration="10.0")
 
     def fail_if_called(*args, **kwargs):
-        raise AssertionError("oversized file should not be uploaded")
+        raise AssertionError("oversized shard should not be uploaded")
 
     transcriber = StepAudioTranscriber(
         StepAudioConfig(api_key="test-key", max_upload_bytes=3),
@@ -828,7 +829,24 @@ def test_stepaudio_transcribe_video_rejects_oversized_file_without_request(tmp_p
 
     assert result.success is False
     assert result.chunks == []
-    assert result.error == "StepAudio source video is too large for single-request upload: 5 bytes > 3 bytes"
+    assert result.error == "StepAudio shard 0 audio is too large for upload: 5 bytes > 3 bytes"
+
+
+def test_stepaudio_audio_shard_reports_missing_file_without_request(tmp_path):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("missing shard should not be uploaded")
+
+    missing_path = tmp_path / "missing.wav"
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key"),
+        request_func=fail_if_called,
+    )
+
+    result = transcriber.transcribe_audio_shard(str(missing_path), shard_index=3)
+
+    assert result.success is False
+    assert result.chunks == []
+    assert result.error == f"StepAudio shard 3 audio file missing: {missing_path}"
 
 
 def test_prepare_stepaudio_audio_shards_extracts_and_cuts_contiguous_plan(monkeypatch, tmp_path):
@@ -935,11 +953,10 @@ def test_stepaudio_transcribe_video_reports_shard_cut_failure(monkeypatch, tmp_p
     assert result.error == "StepAudio shard 0 audio cut failed: cut failed"
 
 
-def test_stepaudio_multipart_sanitizes_filename(monkeypatch, tmp_path):
-    video_path = tmp_path / 'bad"name\n.mp4'
-    video_path.write_bytes(b"video")
+def test_stepaudio_multipart_sanitizes_filename(tmp_path):
+    audio_path = tmp_path / 'bad"name\n.wav'
+    audio_path.write_bytes(b"audio")
     captured = {}
-    install_stepaudio_media_success(monkeypatch)
 
     class FakeResponse:
         def __enter__(self):
@@ -960,10 +977,10 @@ def test_stepaudio_multipart_sanitizes_filename(monkeypatch, tmp_path):
         request_func=fake_request,
     )
 
-    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+    result = transcriber.transcribe_audio_shard(str(audio_path))
 
     assert result.success is True
-    assert b'filename="bad_name_.mp4"' in captured["body"]
+    assert b'filename="bad_name_.wav"' in captured["body"]
     assert b'filename="bad"name' not in captured["body"]
 
 

@@ -296,47 +296,92 @@ class StepAudioTranscriber:
                 error="StepAudio API key missing",
             )
 
-        try:
-            video_size = os.path.getsize(video_path)
-        except OSError as exc:
-            return VideoTranscriptionResult(
-                success=False,
-                chunks=[],
-                transcript_path=transcript_path,
-                error=f"StepAudio cannot read source video: {exc}",
-            )
-        if video_size > self.config.max_upload_bytes:
-            return VideoTranscriptionResult(
-                success=False,
-                chunks=[],
-                transcript_path=transcript_path,
-                error=(
-                    f"StepAudio source video is too large for single-request upload: "
-                    f"{video_size} bytes > {self.config.max_upload_bytes} bytes"
-                ),
-            )
-
         shard_result = prepare_stepaudio_audio_shards(video_path, work_dir, self.config)
         if isinstance(shard_result, VideoTranscriptionResult):
             shard_result.transcript_path = transcript_path
             return shard_result
 
+        chunks = []
+        for shard in shard_result:
+            result = self.transcribe_audio_shard(shard.audio_path, shard.index)
+            if not result.success:
+                result.transcript_path = transcript_path
+                return result
+            chunks.extend(result.chunks)
+
+        with open(transcript_path, "w", encoding="utf-8") as transcript_file:
+            json.dump(
+                {
+                    "shards": [
+                        {
+                            "index": shard.index,
+                            "start": shard.start,
+                            "end": shard.end,
+                            "audio_path": shard.audio_path,
+                        }
+                        for shard in shard_result
+                    ],
+                    "chunks": [
+                        {"start": chunk.start, "end": chunk.end, "text": chunk.text}
+                        for chunk in chunks
+                    ],
+                },
+                transcript_file,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        return VideoTranscriptionResult(success=True, chunks=chunks, transcript_path=transcript_path)
+
+    def transcribe_audio_shard(self, audio_path, shard_index=None):
+        """请求 StepAudio 识别单个音频分片，返回分片内时间戳。"""
+        shard_label = f"shard {shard_index}" if shard_index is not None else "shard"
+        if not self.config.api_key:
+            return VideoTranscriptionResult(
+                success=False,
+                chunks=[],
+                error="StepAudio API key missing",
+            )
+
+        if not os.path.exists(audio_path):
+            return VideoTranscriptionResult(
+                success=False,
+                chunks=[],
+                error=f"StepAudio {shard_label} audio file missing: {audio_path}",
+            )
+
         try:
-            request = _build_stepaudio_request(video_path, self.config)
+            audio_size = os.path.getsize(audio_path)
+        except OSError as exc:
+            return VideoTranscriptionResult(
+                success=False,
+                chunks=[],
+                error=f"StepAudio cannot read {shard_label} audio file: {exc}",
+            )
+        if audio_size > self.config.max_upload_bytes:
+            return VideoTranscriptionResult(
+                success=False,
+                chunks=[],
+                error=(
+                    f"StepAudio {shard_label} audio is too large for upload: "
+                    f"{audio_size} bytes > {self.config.max_upload_bytes} bytes"
+                ),
+            )
+
+        try:
+            request = _build_stepaudio_request(audio_path, self.config)
             with self.request_func(request, timeout=self.config.timeout) as response:
                 response_body = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             return VideoTranscriptionResult(
                 success=False,
                 chunks=[],
-                transcript_path=transcript_path,
                 error=f"StepAudio request failed: HTTP {exc.code}: {_read_http_error(exc)}",
             )
         except (OSError, urllib.error.URLError) as exc:
             return VideoTranscriptionResult(
                 success=False,
                 chunks=[],
-                transcript_path=transcript_path,
                 error=f"StepAudio request failed: {exc}",
             )
 
@@ -346,7 +391,6 @@ class StepAudioTranscriber:
             return VideoTranscriptionResult(
                 success=False,
                 chunks=[],
-                transcript_path=transcript_path,
                 error=f"StepAudio response is not valid JSON: {exc}",
             )
 
@@ -356,7 +400,6 @@ class StepAudioTranscriber:
             return VideoTranscriptionResult(
                 success=False,
                 chunks=[],
-                transcript_path=transcript_path,
                 error=str(exc),
             )
 
@@ -364,14 +407,10 @@ class StepAudioTranscriber:
             return VideoTranscriptionResult(
                 success=False,
                 chunks=[],
-                transcript_path=transcript_path,
                 error="StepAudio response missing timestamped segments",
             )
 
-        with open(transcript_path, "w", encoding="utf-8") as transcript_file:
-            json.dump(payload, transcript_file, ensure_ascii=False, indent=2)
-
-        return VideoTranscriptionResult(success=True, chunks=chunks, transcript_path=transcript_path)
+        return VideoTranscriptionResult(success=True, chunks=chunks)
 
 
 def create_transcriber(config=None):
