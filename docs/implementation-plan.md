@@ -63,7 +63,11 @@
 - 新增 StepFun Chat 评审 provider，并保留 OpenAI-compatible 配置能力。
 - 按相邻候选批次提交候选片段和课程上下文。
 - 输出结构化评审结果：主题名、主题完整度、学习价值、传播价值、发布就绪评分、导出建议、标题、摘要、关键词、人工复核、淘汰原因、边界补救建议。
-- LLM 不可用时默认不导出，只输出未评审方案和报告。
+- 评审模型关闭、不可用或失败时输出未评审方案、诊断 warning 和报告，不伪造发布就绪结论；完整导出选择重写留到第五批。
+
+第四批完成后，`live --dry-run` 默认会在候选生成、去重和基础选择后尝试主题评审。评审成功时，`plan.json.status` 为 `reviewed`，候选项包含机器可读的 `review` 字段，`拆条报告.md` 会展示主题评审结果。评审失败、关闭或缺少 API Key 时，CLI 继续写出 `transcript.srt`、未评审 `plan.json` 和报告，并在 `warnings` 中记录原因。
+
+主题评审默认 provider 为 `stepfun_chat`，使用 OpenAI-compatible Chat Completions 请求形态。关键配置项包括 `topic_review_enabled`、`topic_review_provider`、`topic_review_model`、`topic_review_batch_size`、`topic_review_api_key_env`、`topic_review_base_url_env`、`topic_review_base_url` 和 `topic_review_publish_ready_threshold`。
 
 详细任务、验收标准与提交点见 [第四批：主题评审与最小 reviewed dry-run 闭环](./implementation-batch-4-topic-review.md)。第四批要求每完成一个小任务并通过对应验证后立即进行一次 git commit。
 

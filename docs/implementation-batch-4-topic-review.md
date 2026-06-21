@@ -369,6 +369,17 @@ pytest
 
 ## 第四批完成后的运行说明
 
+### 已落地行为
+
+第四批完成后，CLI 底座新增以下主题评审能力：
+
+- `ClipCandidate.review` 保存结构化 `TopicReviewResult`，避免在流程中传递松散 dict。
+- `plan.json` 顶层 `status` 可为 `unreviewed` 或 `reviewed`；评审成功时候选项写入 `review` 字段，并写入 `review_provider` 元信息。
+- `video_auto_editor.review` 提供相邻候选批次构造、主题评审 provider 抽象和 `StepFunChatReviewer`。
+- `live` 流程在候选生成、去重和基础选择后调用主题评审；评审成功时写回候选标题、摘要和关键词。
+- `拆条报告.md` 在评审成功时展示主题评审表；评审关闭、不可用或失败时展示 warning，并保持未评审方案语义。
+- `live --dry-run` reviewed 端到端测试覆盖 fake StepAudio 分片、fake 主题评审、`transcript.srt`、`plan.json` 和 `拆条报告.md`。
+
 ### 默认主题评审
 
 第四批完成后，默认 `live` dry-run 会在候选生成后尝试调用 StepFun Chat 进行主题评审：
@@ -377,6 +388,31 @@ pytest
 export STEPFUN_API_KEY=sk-...
 video-auto-editor live path/to/live.mp4 --output-dir out/live --work-dir work/live --dry-run
 ```
+
+默认配置：
+
+- `topic_review_enabled=True`
+- `topic_review_provider=stepfun_chat`
+- `topic_review_model=step-2-mini`
+- `topic_review_batch_size=3`
+- `topic_review_api_key_env=STEPFUN_API_KEY`
+- `topic_review_base_url_env=STEPFUN_BASE_URL`
+- `topic_review_base_url=https://api.stepfun.com/v1`
+- `topic_review_publish_ready_threshold=80`
+
+OpenAI-compatible 预留配置方式：
+
+```python
+config = {
+    **CONFIG,
+    "topic_review_provider": "openai_compatible",
+    "topic_review_model": "your-chat-model",
+    "topic_review_api_key_env": "OPENAI_API_KEY",
+    "topic_review_base_url": "https://api.example.com/v1",
+}
+```
+
+`topic_review_base_url` 为空时会读取 `topic_review_base_url_env` 指向的环境变量；未配置环境变量时使用默认 StepFun base URL。评审配置不进入 ASR 缓存签名，修改评审模型不会导致 `transcript.json` 或分片识别缓存失效。
 
 处理流程：
 
@@ -406,6 +442,8 @@ video-auto-editor live path/to/live.mp4 --output-dir out/live --work-dir work/li
 - `plan.json` 顶层 `status` 为 `unreviewed`。
 - `warnings` 中包含评审不可用或失败原因。
 - 报告继续输出基础候选方案，但不声明短视频发布就绪。
+- ASR 成功时仍会写出 `transcript.srt`、基础候选和报告。
+- ASR 失败时仍直接中止，不进入主题评审。
 
 dry-run 不应生成：
 
