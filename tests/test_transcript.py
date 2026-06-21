@@ -107,6 +107,12 @@ def test_default_asr_config_uses_stepaudio():
     assert CONFIG["asr_timeout"] == 120
     assert CONFIG["asr_language"] == "zh"
     assert CONFIG["asr_max_upload_bytes"] == 200 * 1024 * 1024
+    assert CONFIG["asr_shard_seconds"] == 600
+    assert CONFIG["asr_audio_sample_rate"] == 16000
+    assert CONFIG["asr_audio_channels"] == 1
+    assert CONFIG["asr_audio_format"] == "wav"
+    assert CONFIG["asr_retry_attempts"] == 3
+    assert CONFIG["asr_retry_backoff_seconds"] == 1.0
     assert CONFIG["stepfun_api_key_env"] == "STEPFUN_API_KEY"
     assert CONFIG["stepfun_base_url_env"] == "STEPFUN_BASE_URL"
 
@@ -150,6 +156,12 @@ def test_create_stepaudio_transcriber_reads_base_url_from_env(monkeypatch):
         language="en",
         timeout=30,
         max_upload_bytes=200 * 1024 * 1024,
+        shard_seconds=600,
+        audio_sample_rate=16000,
+        audio_channels=1,
+        audio_format="wav",
+        retry_attempts=3,
+        retry_backoff_seconds=1.0,
     )
 
 
@@ -387,6 +399,50 @@ def test_save_transcript_cache_writes_asr_signature(tmp_path):
     assert transcript.load_transcript_cache(str(video_path), str(cache_path), config=config) == [
         TranscriptChunk(1.0, 3.5, "缓存文本")
     ]
+
+
+def test_stepaudio_cache_signature_includes_sharding_audio_config(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    cache_path = tmp_path / "work" / "transcript.json"
+    config = {
+        "asr_provider": "stepaudio",
+        "asr_model": "custom-asr",
+        "asr_language": "en",
+        "asr_shard_seconds": 120,
+        "asr_audio_sample_rate": 8000,
+        "asr_audio_channels": 2,
+        "asr_audio_format": "mp3",
+    }
+
+    transcript.save_transcript_cache(
+        str(video_path),
+        [TranscriptChunk(1.0, 3.5, "缓存文本")],
+        str(cache_path),
+        config=config,
+    )
+
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload["asr"] == {
+        "provider": "stepaudio",
+        "model": "custom-asr",
+        "language": "en",
+        "shard_seconds": 120,
+        "audio_sample_rate": 8000,
+        "audio_channels": 2,
+        "audio_format": "mp3",
+    }
+    assert transcript.load_transcript_cache(str(video_path), str(cache_path), config=config) == [
+        TranscriptChunk(1.0, 3.5, "缓存文本")
+    ]
+    assert (
+        transcript.load_transcript_cache(
+            str(video_path),
+            str(cache_path),
+            config={**config, "asr_audio_sample_rate": 16000},
+        )
+        is None
+    )
 
 
 def test_transcribe_video_rebuilds_cache_when_provider_signature_changes(tmp_path):

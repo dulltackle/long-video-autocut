@@ -38,6 +38,12 @@ class StepAudioConfig:
     language: str = "zh"
     timeout: int = 120
     max_upload_bytes: int = 200 * 1024 * 1024
+    shard_seconds: int = 600
+    audio_sample_rate: int = 16000
+    audio_channels: int = 1
+    audio_format: str = "wav"
+    retry_attempts: int = 3
+    retry_backoff_seconds: float = 1.0
 
 
 @dataclass
@@ -374,6 +380,12 @@ def create_stepaudio_transcriber(config=None):
             language=_config_get(config, "asr_language"),
             timeout=_config_get(config, "asr_timeout"),
             max_upload_bytes=int(_config_get(config, "asr_max_upload_bytes")),
+            shard_seconds=int(_config_get(config, "asr_shard_seconds")),
+            audio_sample_rate=int(_config_get(config, "asr_audio_sample_rate")),
+            audio_channels=int(_config_get(config, "asr_audio_channels")),
+            audio_format=str(_config_get(config, "asr_audio_format")),
+            retry_attempts=int(_config_get(config, "asr_retry_attempts")),
+            retry_backoff_seconds=float(_config_get(config, "asr_retry_backoff_seconds")),
         )
     )
 
@@ -601,6 +613,10 @@ def _asr_cache_signature(config=None):
     if provider == "stepaudio":
         signature["model"] = str(_config_get(config, "asr_model", ""))
         signature["language"] = str(_config_get(config, "asr_language", ""))
+        signature["shard_seconds"] = int(_config_get(config, "asr_shard_seconds", 0))
+        signature["audio_sample_rate"] = int(_config_get(config, "asr_audio_sample_rate", 0))
+        signature["audio_channels"] = int(_config_get(config, "asr_audio_channels", 0))
+        signature["audio_format"] = str(_config_get(config, "asr_audio_format", ""))
     elif provider == "whisper":
         signature["model"] = str(_config_get(config, "whisper_model", ""))
         signature["language"] = str(_config_get(config, "whisper_language", ""))
