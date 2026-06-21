@@ -1,9 +1,10 @@
 import json
-from pathlib import Path
 
 from video_auto_editor import cli, transcript
-from video_auto_editor.models import TranscriptChunk
-from video_auto_editor.transcript import VideoTranscriptionResult
+
+
+def completed(returncode=0, stderr="", stdout=""):
+    return type("Completed", (), {"returncode": returncode, "stderr": stderr, "stdout": stdout})()
 
 
 def test_live_dry_run_generates_plan_report_and_transcript_without_exports(monkeypatch, tmp_path):
@@ -11,25 +12,60 @@ def test_live_dry_run_generates_plan_report_and_transcript_without_exports(monke
     video_path.write_text("fake video", encoding="utf-8")
     output_dir = tmp_path / "out"
     work_dir = tmp_path / "work"
-    chunks = [
-        TranscriptChunk(0, 40, "第一段内容，介绍核心概念。"),
-        TranscriptChunk(40, 90, "第二段内容，展开案例并自然结束。"),
-        TranscriptChunk(90, 118, "第三段内容，补充注意事项。"),
+    http_calls = []
+    http_responses = [
+        '{"segments": [{"start": 0, "end": 40, "text": "第一段内容，介绍核心概念。"}]}',
+        '{"segments": [{"start": 0, "end": 50, "text": "第二段内容，展开案例并自然结束。"}]}',
     ]
 
-    class FakeASRProvider:
-        def is_available(self):
-            return True
+    class FakeResponse:
+        def __init__(self, body):
+            self.body = body
 
-        def transcribe_video(self, video_path_arg, work_dir_arg):
-            assert video_path_arg == str(video_path)
-            assert work_dir_arg == str(work_dir / "live")
-            return VideoTranscriptionResult(success=True, chunks=chunks, transcript_path=str(work_dir / "live" / "fake.json"))
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return self.body.encode("utf-8")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "ffprobe":
+            return completed(0, stdout='{"format": {"duration": "120.0"}}')
+        if cmd[0] == "ffmpeg":
+            (tmp_path / "commands.log").write_text("ffmpeg called", encoding="utf-8")
+            output_path = cmd[-1]
+            from pathlib import Path
+
+            Path(output_path).write_bytes(b"audio")
+            return completed(0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    def fake_request(request, timeout):
+        http_calls.append(request)
+        return FakeResponse(http_responses[len(http_calls) - 1])
 
     monkeypatch.setattr(cli, "get_video_duration", lambda video_path_arg: 120.0)
     monkeypatch.setattr(cli, "detect_silence", lambda video_path_arg, config=None: [])
-    monkeypatch.setattr(transcript, "create_transcriber", lambda config=None: FakeASRProvider())
+    monkeypatch.setattr(transcript.subprocess, "run", fake_run)
+    monkeypatch.setattr(transcript.urllib.request, "urlopen", fake_request)
+    monkeypatch.setenv("STEPFUN_API_KEY", "test-key")
+    monkeypatch.setitem(cli.CONFIG, "asr_shard_seconds", 60)
+    monkeypatch.setitem(cli.CONFIG, "asr_retry_backoff_seconds", 0)
 
+    cli.main(
+        [
+            "live",
+            str(video_path),
+            "--output-dir",
+            str(output_dir),
+            "--work-dir",
+            str(work_dir),
+            "--dry-run",
+        ]
+    )
     cli.main(
         [
             "live",
@@ -47,8 +83,11 @@ def test_live_dry_run_generates_plan_report_and_transcript_without_exports(monke
     report_path = output_dir / "拆条报告.md"
 
     assert srt_path.exists()
-    assert "第一段内容，介绍核心概念。" in srt_path.read_text(encoding="utf-8")
-    assert "00:00:40,000 --> 00:01:30,000" in srt_path.read_text(encoding="utf-8")
+    srt = srt_path.read_text(encoding="utf-8")
+    assert "第一段内容，介绍核心概念。" in srt
+    assert "第二段内容，展开案例并自然结束。" in srt
+    assert "00:01:00,000 --> 00:01:50,000" in srt
+    assert len(http_calls) == 2
 
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     assert plan["status"] == "unreviewed"
