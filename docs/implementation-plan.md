@@ -43,6 +43,8 @@
 - 将分片时间戳按偏移合并成整场转写文本。
 - 默认开启处理缓存，缓存键包含影响结果的输入摘要。
 
+详细任务、验收标准与提交点见 [第三批：StepAudio 分片识别与缓存闭环](./implementation-batch-3-stepaudio-sharding.md)。第三批要求每完成一个小任务并通过对应验证后立即进行一次 git commit。
+
 ### 4. 主题评审
 
 目标：使用评审模型对相邻候选批次进行结构化主题评审，为发布就绪短视频提供判断依据。
@@ -84,7 +86,8 @@
 
 - [第一批：CLI 打包与配置层](./implementation-batch-1-cli-foundation.md)
 - [第二批：ASR 抽象与最小 live dry-run 闭环](./implementation-batch-2-asr-foundation.md)
+- [第三批：StepAudio 分片识别与缓存闭环](./implementation-batch-3-stepaudio-sharding.md)
 
 ## 提交节奏
 
-每一批都应拆成多个小提交，按“独立可测试能力”提交，而不是等整批完成后一次性提交。第一批的具体提交点见 [第一批执行方案](./implementation-batch-1-cli-foundation.md#建议提交点)，第二批的具体提交点见 [第二批执行方案](./implementation-batch-2-asr-foundation.md)。
+每一批都应拆成多个小提交，按“独立可测试能力”提交，而不是等整批完成后一次性提交。第一批的具体提交点见 [第一批执行方案](./implementation-batch-1-cli-foundation.md#建议提交点)，第二批的具体提交点见 [第二批执行方案](./implementation-batch-2-asr-foundation.md)，第三批的具体提交点见 [第三批执行方案](./implementation-batch-3-stepaudio-sharding.md)。第三批执行时，每完成一个小任务并通过对应验证命令后，必须立即进行一次 git commit。
