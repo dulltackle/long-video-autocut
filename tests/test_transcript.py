@@ -324,7 +324,7 @@ def test_transcribe_candidates_continues_after_single_segment_failure():
     assert candidates[1].transcript == "第二段"
 
 
-def test_transcribe_video_uses_valid_cache_without_calling_whisper(tmp_path):
+def test_transcribe_video_uses_valid_cache_without_calling_asr(tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_text("video", encoding="utf-8")
     cache_path = tmp_path / "work" / "transcript.json"
@@ -350,18 +350,158 @@ def test_transcribe_video_uses_valid_cache_without_creating_provider(monkeypatch
     video_path.write_text("video", encoding="utf-8")
     cache_path = tmp_path / "work" / "transcript.json"
     chunks = [TranscriptChunk(1.0, 3.5, "缓存文本")]
-    transcript.save_transcript_cache(str(video_path), chunks, str(cache_path))
+    config = {"asr_provider": "unknown"}
+    transcript.save_transcript_cache(str(video_path), chunks, str(cache_path), config=config)
 
     def fail_if_called(*args, **kwargs):
         raise AssertionError("should not create ASR provider when cache is valid")
 
     monkeypatch.setattr(transcript, "create_transcriber", fail_if_called)
 
-    result = transcript.transcribe_video(str(video_path), str(cache_path.parent), config={"asr_provider": "unknown"})
+    result = transcript.transcribe_video(str(video_path), str(cache_path.parent), config=config)
 
     assert result.success is True
     assert result.from_cache is True
     assert result.chunks == chunks
+
+
+def test_save_transcript_cache_writes_asr_signature(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    cache_path = tmp_path / "work" / "transcript.json"
+    config = {
+        "asr_provider": "whisper",
+        "whisper_model": "tiny",
+        "whisper_language": "en",
+    }
+
+    transcript.save_transcript_cache(
+        str(video_path),
+        [TranscriptChunk(1.0, 3.5, "缓存文本")],
+        str(cache_path),
+        config=config,
+    )
+
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload["asr"] == {"provider": "whisper", "model": "tiny", "language": "en"}
+    assert transcript.load_transcript_cache(str(video_path), str(cache_path), config=config) == [
+        TranscriptChunk(1.0, 3.5, "缓存文本")
+    ]
+
+
+def test_transcribe_video_rebuilds_cache_when_provider_signature_changes(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    cache_path = tmp_path / "work" / "transcript.json"
+    transcript.save_transcript_cache(
+        str(video_path),
+        [TranscriptChunk(0, 1, "Whisper 缓存")],
+        str(cache_path),
+        config={"asr_provider": "whisper"},
+    )
+
+    class FakeTranscriber:
+        def is_available(self):
+            return True
+
+        def transcribe_video(self, video_path_arg, work_dir):
+            return VideoTranscriptionResult(success=True, chunks=[TranscriptChunk(2, 4, "StepAudio 转写")])
+
+    result = transcript.transcribe_video(
+        str(video_path),
+        str(cache_path.parent),
+        FakeTranscriber(),
+        config={"asr_provider": "stepaudio"},
+    )
+
+    assert result.success is True
+    assert result.from_cache is False
+    assert result.chunks == [TranscriptChunk(2, 4, "StepAudio 转写")]
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload["asr"]["provider"] == "stepaudio"
+
+
+def test_transcribe_video_rebuilds_cache_when_asr_model_changes(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    cache_path = tmp_path / "work" / "transcript.json"
+    transcript.save_transcript_cache(
+        str(video_path),
+        [TranscriptChunk(0, 1, "旧模型缓存")],
+        str(cache_path),
+        config={"asr_provider": "stepaudio", "asr_model": "old-asr"},
+    )
+
+    class FakeTranscriber:
+        def is_available(self):
+            return True
+
+        def transcribe_video(self, video_path_arg, work_dir):
+            return VideoTranscriptionResult(success=True, chunks=[TranscriptChunk(2, 4, "新模型转写")])
+
+    result = transcript.transcribe_video(
+        str(video_path),
+        str(cache_path.parent),
+        FakeTranscriber(),
+        config={"asr_provider": "stepaudio", "asr_model": "new-asr"},
+    )
+
+    assert result.success is True
+    assert result.from_cache is False
+    assert result.chunks == [TranscriptChunk(2, 4, "新模型转写")]
+
+
+def test_transcribe_video_rebuilds_cache_when_asr_language_changes(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    cache_path = tmp_path / "work" / "transcript.json"
+    transcript.save_transcript_cache(
+        str(video_path),
+        [TranscriptChunk(0, 1, "中文缓存")],
+        str(cache_path),
+        config={"asr_provider": "stepaudio", "asr_language": "zh"},
+    )
+
+    class FakeTranscriber:
+        def is_available(self):
+            return True
+
+        def transcribe_video(self, video_path_arg, work_dir):
+            return VideoTranscriptionResult(success=True, chunks=[TranscriptChunk(2, 4, "English transcript")])
+
+    result = transcript.transcribe_video(
+        str(video_path),
+        str(cache_path.parent),
+        FakeTranscriber(),
+        config={"asr_provider": "stepaudio", "asr_language": "en"},
+    )
+
+    assert result.success is True
+    assert result.from_cache is False
+    assert result.chunks == [TranscriptChunk(2, 4, "English transcript")]
+
+
+def test_load_transcript_cache_rejects_legacy_cache_without_asr_signature(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    cache_path = tmp_path / "work" / "transcript.json"
+    cache_path.parent.mkdir()
+    cache_path.write_text(
+        json.dumps(
+            {
+                "source": {
+                    "path": str(video_path.resolve()),
+                    "size": video_path.stat().st_size,
+                    "mtime_ns": video_path.stat().st_mtime_ns,
+                },
+                "chunks": [{"start": 1, "end": 2, "text": "旧缓存"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    assert transcript.load_transcript_cache(str(video_path), str(cache_path)) is None
 
 
 def test_transcribe_video_creates_configured_provider(monkeypatch, tmp_path):

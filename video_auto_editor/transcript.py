@@ -426,7 +426,7 @@ def transcribe_video(video_path, work_dir, transcriber=None, config=None):
     """整视频转写入口；缓存有效时直接复用。"""
     os.makedirs(work_dir, exist_ok=True)
     cache_path = os.path.join(work_dir, "transcript.json")
-    cached_chunks = load_transcript_cache(video_path, cache_path)
+    cached_chunks = load_transcript_cache(video_path, cache_path, config=config)
     if cached_chunks is not None:
         return VideoTranscriptionResult(
             success=True,
@@ -459,7 +459,7 @@ def transcribe_video(video_path, work_dir, transcriber=None, config=None):
         return result
 
     try:
-        save_transcript_cache(video_path, result.chunks, cache_path)
+        save_transcript_cache(video_path, result.chunks, cache_path, config=config)
     except OSError as exc:
         return VideoTranscriptionResult(
             success=False,
@@ -472,7 +472,7 @@ def transcribe_video(video_path, work_dir, transcriber=None, config=None):
     return result
 
 
-def load_transcript_cache(video_path, cache_path):
+def load_transcript_cache(video_path, cache_path, config=None):
     """缓存匹配源视频时返回 TranscriptChunk 列表，否则返回 None。"""
     if not os.path.exists(cache_path):
         return None
@@ -486,6 +486,8 @@ def load_transcript_cache(video_path, cache_path):
     source = _source_signature(video_path)
     if source is None or payload.get("source") != source:
         return None
+    if payload.get("asr") != _asr_cache_signature(config):
+        return None
 
     try:
         return [_chunk_from_dict(item) for item in payload.get("chunks", [])]
@@ -493,7 +495,7 @@ def load_transcript_cache(video_path, cache_path):
         return None
 
 
-def save_transcript_cache(video_path, chunks, cache_path):
+def save_transcript_cache(video_path, chunks, cache_path, config=None):
     """保存整视频转写缓存。"""
     _ensure_parent_dir(cache_path)
     source = _source_signature(video_path)
@@ -501,6 +503,7 @@ def save_transcript_cache(video_path, chunks, cache_path):
         raise FileNotFoundError(f"Cannot stat source video: {video_path}")
     payload = {
         "source": source,
+        "asr": _asr_cache_signature(config),
         "chunks": [
             {"start": chunk.start, "end": chunk.end, "text": chunk.text}
             for chunk in chunks
@@ -589,6 +592,19 @@ def _source_signature(video_path):
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
     }
+
+
+def _asr_cache_signature(config=None):
+    config = config or CONFIG
+    provider = str(_config_get(config, "asr_provider", "whisper")).strip().lower()
+    signature = {"provider": provider}
+    if provider == "stepaudio":
+        signature["model"] = str(_config_get(config, "asr_model", ""))
+        signature["language"] = str(_config_get(config, "asr_language", ""))
+    elif provider == "whisper":
+        signature["model"] = str(_config_get(config, "whisper_model", ""))
+        signature["language"] = str(_config_get(config, "whisper_language", ""))
+    return signature
 
 
 def _format_srt_time(seconds):
