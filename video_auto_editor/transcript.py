@@ -69,6 +69,17 @@ class VideoTranscriptionResult:
     error: str = ""
 
 
+@dataclass
+class AudioShard:
+    """StepAudio 单个音频分片计划。"""
+
+    index: int
+    start: float
+    end: float
+    audio_path: str
+    cache_path: str
+
+
 class VideoTranscriber(Protocol):
     """整视频 ASR provider 最小契约。"""
 
@@ -305,6 +316,11 @@ class StepAudioTranscriber:
                 ),
             )
 
+        shard_result = prepare_stepaudio_audio_shards(video_path, work_dir, self.config)
+        if isinstance(shard_result, VideoTranscriptionResult):
+            shard_result.transcript_path = transcript_path
+            return shard_result
+
         try:
             request = _build_stepaudio_request(video_path, self.config)
             with self.request_func(request, timeout=self.config.timeout) as response:
@@ -525,6 +541,83 @@ def save_transcript_cache(video_path, chunks, cache_path, config=None):
         json.dump(payload, cache_file, ensure_ascii=False, indent=2)
 
 
+def prepare_stepaudio_audio_shards(video_path, work_dir, config):
+    """提取统一音频并生成连续 StepAudio 分片。"""
+    duration = _probe_media_duration(video_path)
+    if duration is None or duration <= 0:
+        return VideoTranscriptionResult(
+            success=False,
+            chunks=[],
+            error="StepAudio cannot determine source media duration",
+        )
+
+    audio_dir = os.path.join(work_dir, "asr_audio")
+    shard_dir = os.path.join(work_dir, "asr_shards")
+    cache_dir = os.path.join(work_dir, "asr_shard_cache")
+    os.makedirs(audio_dir, exist_ok=True)
+    os.makedirs(shard_dir, exist_ok=True)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    audio_format = _sanitize_audio_format(config.audio_format)
+    source_audio_path = os.path.join(audio_dir, f"{Path(video_path).stem}.{audio_format}")
+    extract_result = subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", video_path,
+            "-vn",
+            "-ar", str(config.audio_sample_rate),
+            "-ac", str(config.audio_channels),
+            "-f", audio_format,
+            source_audio_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if extract_result.returncode != 0:
+        return VideoTranscriptionResult(
+            success=False,
+            chunks=[],
+            error=f"StepAudio audio extraction failed: {extract_result.stderr.strip()}",
+        )
+    if not os.path.exists(source_audio_path):
+        return VideoTranscriptionResult(
+            success=False,
+            chunks=[],
+            error="StepAudio audio extraction did not create output file",
+        )
+
+    shards = _build_audio_shard_plan(duration, work_dir, config)
+    for shard in shards:
+        cut_result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", _format_ffmpeg_seconds(shard.start),
+                "-to", _format_ffmpeg_seconds(shard.end),
+                "-i", source_audio_path,
+                "-vn",
+                "-ar", str(config.audio_sample_rate),
+                "-ac", str(config.audio_channels),
+                "-f", audio_format,
+                shard.audio_path,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if cut_result.returncode != 0:
+            return VideoTranscriptionResult(
+                success=False,
+                chunks=[],
+                error=f"StepAudio shard {shard.index} audio cut failed: {cut_result.stderr.strip()}",
+            )
+        if not os.path.exists(shard.audio_path):
+            return VideoTranscriptionResult(
+                success=False,
+                chunks=[],
+                error=f"StepAudio shard {shard.index} audio cut did not create output file",
+            )
+
+    return shards
+
+
 def export_srt(chunks, output_path):
     """导出 SRT 字幕文件。"""
     _ensure_parent_dir(output_path)
@@ -561,6 +654,46 @@ def _parse_stepaudio_payload(payload):
             continue
         chunks.append(_chunk_from_dict(segment))
     return chunks
+
+
+def _probe_media_duration(video_path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_path],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return float(json.loads(result.stdout)["format"]["duration"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _build_audio_shard_plan(duration, work_dir, config):
+    shard_seconds = max(float(config.shard_seconds), 0.001)
+    audio_format = _sanitize_audio_format(config.audio_format)
+    shard_dir = os.path.join(work_dir, "asr_shards")
+    cache_dir = os.path.join(work_dir, "asr_shard_cache")
+    shards = []
+    start = 0.0
+    index = 0
+    while start < duration:
+        end = min(duration, start + shard_seconds)
+        if end <= start:
+            break
+        shards.append(
+            AudioShard(
+                index=index,
+                start=start,
+                end=end,
+                audio_path=os.path.join(shard_dir, f"shard_{index:04d}.{audio_format}"),
+                cache_path=os.path.join(cache_dir, f"shard_{index:04d}.json"),
+            )
+        )
+        index += 1
+        start = end
+    return shards
 
 
 def _extract_stepaudio_segments(payload):
@@ -692,6 +825,15 @@ def _join_url(base_url, path):
 
 def _sanitize_multipart_filename(file_name):
     return re.sub(r'[\r\n"\\]', "_", str(file_name)) or "upload.bin"
+
+
+def _sanitize_audio_format(audio_format):
+    sanitized = re.sub(r"[^A-Za-z0-9]", "", str(audio_format).lower())
+    return sanitized or "wav"
+
+
+def _format_ffmpeg_seconds(seconds):
+    return f"{float(seconds):.6f}".rstrip("0").rstrip(".")
 
 
 def _read_http_error(exc):

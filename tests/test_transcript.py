@@ -11,6 +11,7 @@ from video_auto_editor.models import TranscriptChunk
 from video_auto_editor import transcript
 from video_auto_editor.config import CONFIG
 from video_auto_editor.transcript import (
+    AudioShard,
     StepAudioConfig,
     StepAudioTranscriber,
     TranscriptionResult,
@@ -20,11 +21,24 @@ from video_auto_editor.transcript import (
     create_stepaudio_transcriber,
     create_transcriber,
     create_whisper_transcriber,
+    prepare_stepaudio_audio_shards,
 )
 
 
-def completed(returncode=0, stderr=""):
-    return SimpleNamespace(returncode=returncode, stderr=stderr)
+def completed(returncode=0, stderr="", stdout=""):
+    return SimpleNamespace(returncode=returncode, stderr=stderr, stdout=stdout)
+
+
+def install_stepaudio_media_success(monkeypatch, duration="125.0"):
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "ffprobe":
+            return completed(0, stdout=json.dumps({"format": {"duration": duration}}))
+        if cmd[0] == "ffmpeg":
+            Path(cmd[-1]).write_bytes(b"audio")
+            return completed(0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(transcript.subprocess, "run", fake_run)
 
 
 def test_is_available_returns_true_when_whisper_help_succeeds(monkeypatch):
@@ -746,10 +760,11 @@ def test_stepaudio_is_unavailable_and_transcribe_fails_without_api_key(tmp_path)
     )
 
 
-def test_stepaudio_transcribe_video_converts_success_response(tmp_path):
+def test_stepaudio_transcribe_video_converts_success_response(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_bytes(b"video")
     captured = {}
+    install_stepaudio_media_success(monkeypatch)
 
     class FakeResponse:
         def __enter__(self):
@@ -816,10 +831,115 @@ def test_stepaudio_transcribe_video_rejects_oversized_file_without_request(tmp_p
     assert result.error == "StepAudio source video is too large for single-request upload: 5 bytes > 3 bytes"
 
 
-def test_stepaudio_multipart_sanitizes_filename(tmp_path):
+def test_prepare_stepaudio_audio_shards_extracts_and_cuts_contiguous_plan(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[0] == "ffprobe":
+            return completed(0, stdout='{"format": {"duration": "125.0"}}')
+        Path(cmd[-1]).write_bytes(b"audio")
+        return completed(0)
+
+    monkeypatch.setattr(transcript.subprocess, "run", fake_run)
+
+    result = prepare_stepaudio_audio_shards(
+        str(video_path),
+        str(tmp_path / "work"),
+        StepAudioConfig(shard_seconds=60, audio_sample_rate=8000, audio_channels=2, audio_format="mp3"),
+    )
+
+    assert result == [
+        AudioShard(
+            index=0,
+            start=0.0,
+            end=60.0,
+            audio_path=str(tmp_path / "work" / "asr_shards" / "shard_0000.mp3"),
+            cache_path=str(tmp_path / "work" / "asr_shard_cache" / "shard_0000.json"),
+        ),
+        AudioShard(
+            index=1,
+            start=60.0,
+            end=120.0,
+            audio_path=str(tmp_path / "work" / "asr_shards" / "shard_0001.mp3"),
+            cache_path=str(tmp_path / "work" / "asr_shard_cache" / "shard_0001.json"),
+        ),
+        AudioShard(
+            index=2,
+            start=120.0,
+            end=125.0,
+            audio_path=str(tmp_path / "work" / "asr_shards" / "shard_0002.mp3"),
+            cache_path=str(tmp_path / "work" / "asr_shard_cache" / "shard_0002.json"),
+        ),
+    ]
+    assert calls[1] == [
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-vn",
+        "-ar", "8000",
+        "-ac", "2",
+        "-f", "mp3",
+        str(tmp_path / "work" / "asr_audio" / "live.mp3"),
+    ]
+    assert calls[2] == [
+        "ffmpeg", "-y",
+        "-ss", "0",
+        "-to", "60",
+        "-i", str(tmp_path / "work" / "asr_audio" / "live.mp3"),
+        "-vn",
+        "-ar", "8000",
+        "-ac", "2",
+        "-f", "mp3",
+        str(tmp_path / "work" / "asr_shards" / "shard_0000.mp3"),
+    ]
+
+
+def test_prepare_stepaudio_audio_shards_reports_ffmpeg_extract_failure(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "ffprobe":
+            return completed(0, stdout='{"format": {"duration": "10.0"}}')
+        return completed(1, stderr="decode failed")
+
+    monkeypatch.setattr(transcript.subprocess, "run", fake_run)
+
+    result = prepare_stepaudio_audio_shards(str(video_path), str(tmp_path / "work"), StepAudioConfig())
+
+    assert result.success is False
+    assert result.error == "StepAudio audio extraction failed: decode failed"
+
+
+def test_stepaudio_transcribe_video_reports_shard_cut_failure(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[0] == "ffprobe":
+            return completed(0, stdout='{"format": {"duration": "10.0"}}')
+        if len(calls) == 2:
+            Path(cmd[-1]).write_bytes(b"audio")
+            return completed(0)
+        return completed(1, stderr="cut failed")
+
+    monkeypatch.setattr(transcript.subprocess, "run", fake_run)
+
+    transcriber = StepAudioTranscriber(StepAudioConfig(api_key="test-key", shard_seconds=5))
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+
+    assert result.success is False
+    assert result.error == "StepAudio shard 0 audio cut failed: cut failed"
+
+
+def test_stepaudio_multipart_sanitizes_filename(monkeypatch, tmp_path):
     video_path = tmp_path / 'bad"name\n.mp4'
     video_path.write_bytes(b"video")
     captured = {}
+    install_stepaudio_media_success(monkeypatch)
 
     class FakeResponse:
         def __enter__(self):
@@ -847,9 +967,10 @@ def test_stepaudio_multipart_sanitizes_filename(tmp_path):
     assert b'filename="bad"name' not in captured["body"]
 
 
-def test_stepaudio_transcribe_video_supports_nested_segments(tmp_path):
+def test_stepaudio_transcribe_video_supports_nested_segments(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_bytes(b"video")
+    install_stepaudio_media_success(monkeypatch)
 
     class FakeResponse:
         def __enter__(self):
@@ -872,9 +993,10 @@ def test_stepaudio_transcribe_video_supports_nested_segments(tmp_path):
     assert result.chunks == [TranscriptChunk(10, 12, "嵌套片段")]
 
 
-def test_stepaudio_transcribe_video_returns_http_error(tmp_path):
+def test_stepaudio_transcribe_video_returns_http_error(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_bytes(b"video")
+    install_stepaudio_media_success(monkeypatch)
 
     def raise_http_error(*args, **kwargs):
         raise urllib.error.HTTPError(
@@ -897,9 +1019,10 @@ def test_stepaudio_transcribe_video_returns_http_error(tmp_path):
     assert result.error == "StepAudio request failed: HTTP 500: failed"
 
 
-def test_stepaudio_transcribe_video_returns_invalid_json_error(tmp_path):
+def test_stepaudio_transcribe_video_returns_invalid_json_error(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_bytes(b"video")
+    install_stepaudio_media_success(monkeypatch)
 
     class FakeResponse:
         def __enter__(self):
@@ -923,9 +1046,10 @@ def test_stepaudio_transcribe_video_returns_invalid_json_error(tmp_path):
     assert "StepAudio response is not valid JSON" in result.error
 
 
-def test_stepaudio_transcribe_video_returns_missing_timestamp_error(tmp_path):
+def test_stepaudio_transcribe_video_returns_missing_timestamp_error(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_bytes(b"video")
+    install_stepaudio_media_success(monkeypatch)
 
     class FakeResponse:
         def __enter__(self):
