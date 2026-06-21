@@ -54,6 +54,7 @@ def test_live_dry_run_generates_plan_report_and_transcript_without_exports(monke
     monkeypatch.setenv("STEPFUN_API_KEY", "test-key")
     monkeypatch.setitem(cli.CONFIG, "asr_shard_seconds", 60)
     monkeypatch.setitem(cli.CONFIG, "asr_retry_backoff_seconds", 0)
+    monkeypatch.setitem(cli.CONFIG, "topic_review_enabled", False)
 
     cli.main(
         [

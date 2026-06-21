@@ -14,6 +14,7 @@ from video_auto_editor.media import clip_segment, concat_videos, get_video_durat
 from video_auto_editor.models import ClipInfo
 from video_auto_editor.plan import write_plan
 from video_auto_editor.report import generate_batch_report, generate_live_report, generate_single_report
+from video_auto_editor.review import build_topic_review_batches, create_topic_reviewer
 from video_auto_editor.scoring import analyze_fluency, calculate_adjusted_score, score_segment
 from video_auto_editor.selection import select_best_segment, select_live_clips
 from video_auto_editor.silence import detect_silence, identify_segments
@@ -207,15 +208,31 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
                 f"score={_live_candidate_score(candidate):.1f} title={candidate.title}"
             )
 
-    warnings = _build_live_warnings(config)
-    plan_path = write_plan(video_path, output_dir, course_context, candidates, selected, warnings)
+    print("\n🧠 Step 7: Reviewing clip topics...")
+    review_status, review_provider, review_warnings = _review_live_candidates(candidates, course_context, config)
+    if review_status == "reviewed":
+        print(f"   ✅ Reviewed {len(candidates)} candidates")
+    else:
+        print("   ⚠️  Topic review unavailable; continuing with unreviewed plan")
+
+    warnings = _build_live_warnings(config, review_warnings)
+    plan_path = write_plan(
+        video_path,
+        output_dir,
+        course_context,
+        candidates,
+        selected,
+        warnings,
+        status=review_status,
+        review_provider=review_provider,
+    )
     print(f"   📄 Plan: {plan_path}")
 
     exports = []
     if dry_run:
-        print("\n✂️  Step 7: Dry-run skips live clip export")
+        print("\n✂️  Step 8: Dry-run skips live clip export")
     else:
-        print("\n✂️  Step 7: Exporting live clips...")
+        print("\n✂️  Step 8: Exporting live clips...")
         exports = export_live_clips(video_path, selected, transcript_result.chunks, output_dir, config)
         if exports is None:
             print("   ❌ Failed to export live clips")
@@ -319,10 +336,48 @@ def _live_candidate_score(candidate):
     return candidate.adjusted_score if candidate.adjusted_score is not None else candidate.base_score
 
 
-def _build_live_warnings(config):
-    warnings = [
-        "未接入主题评审，plan.json status 固定为 unreviewed，不代表发布就绪短视频。",
-    ]
+def _review_live_candidates(candidates, course_context, config):
+    if not candidates:
+        return "unreviewed", {}, []
+    if not config.get("topic_review_enabled", True):
+        return "unreviewed", {}, ["主题评审已关闭，plan.json status 为 unreviewed。"]
+
+    try:
+        reviewer = create_topic_reviewer(config)
+    except ValueError as exc:
+        return "unreviewed", {}, [f"主题评审 provider 配置错误：{exc}"]
+
+    provider_info = _topic_reviewer_info(reviewer)
+    if not reviewer.is_available():
+        return "unreviewed", provider_info, ["主题评审不可用：缺少 API Key，未发起评审请求。"]
+
+    batches = build_topic_review_batches(candidates, course_context, config)
+    result = reviewer.review_batches(batches)
+    provider_info = result.provider_info or provider_info
+    if not result.success:
+        return "unreviewed", provider_info, [f"主题评审失败：{result.error}"]
+
+    for candidate in candidates:
+        review = result.reviews.get(candidate.index)
+        if review is None:
+            continue
+        candidate.review = review
+        candidate.title = review.title or candidate.title
+        candidate.summary = review.summary or candidate.summary
+        candidate.keywords = list(review.keywords) or candidate.keywords
+    return "reviewed", provider_info, []
+
+
+def _topic_reviewer_info(reviewer):
+    return {
+        "provider": getattr(reviewer, "provider_name", ""),
+        "model": getattr(reviewer, "model", ""),
+        "base_url": getattr(reviewer, "base_url", ""),
+    }
+
+
+def _build_live_warnings(config, review_warnings=None):
+    warnings = list(review_warnings or [])
     if not config.get("max_clips_user_provided", False):
         warnings.append(
             f"未显式传入 --max-clips，当前使用临时保护上限 "

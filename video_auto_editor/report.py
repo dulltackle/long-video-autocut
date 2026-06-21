@@ -109,7 +109,10 @@ def generate_live_report(
         file.write(f"# {video_name} 直播拆条报告\n\n")
         file.write("**Version**: v4.7\n")
         file.write(f"**Processed**: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
-        if dry_run:
+        reviewed = any(candidate.review is not None for candidate in candidates)
+        if dry_run and reviewed:
+            file.write("> Dry-run：本报告包含主题评审结果，但未导出短视频。\n\n")
+        elif dry_run:
             file.write("> Dry-run：本报告是未评审拆条方案，不代表发布就绪短视频。\n\n")
         if warnings:
             file.write("## Warnings\n\n")
@@ -137,6 +140,23 @@ def generate_live_report(
                 f"{candidate.start_time:.1f}-{candidate.end_time:.1f}s | {candidate.duration:.1f}s | "
                 f"{_live_candidate_score(candidate):.1f} | `{_escape_markdown_cell(output_path)}` |\n"
             )
+
+        reviewed_candidates = [candidate for candidate in candidates if candidate.review is not None]
+        if reviewed_candidates:
+            file.write("\n## 主题评审\n\n")
+            file.write("| Candidate | Topic | Complete | Learning | Share | Ready | Decision | Human Review | Reason |\n")
+            file.write("|-----------|-------|----------|----------|-------|-------|----------|--------------|--------|\n")
+            for candidate in reviewed_candidates:
+                review = candidate.review
+                reason = review.reject_reason or review.boundary_fix_suggestion
+                file.write(
+                    f"| candidate_{candidate.index} | {_escape_markdown_cell(review.topic_name)} | "
+                    f"{'yes' if review.topic_complete else 'no'} | {review.learning_value} | "
+                    f"{review.share_value} | {review.publish_ready_score} | "
+                    f"{_escape_markdown_cell(review.export_decision)} | "
+                    f"{'yes' if review.needs_human_review else 'no'} | "
+                    f"{_escape_markdown_cell(reason)} |\n"
+                )
 
         file.write("\n## 候选决策\n\n")
         file.write("| Candidate | Time Range | Duration | Score | Decision | Reason | Preview |\n")
