@@ -856,6 +856,159 @@ def test_stepaudio_transcribe_video_offsets_and_sorts_shard_chunks(monkeypatch, 
     assert len(calls) == 3
 
 
+def test_stepaudio_shard_cache_reuses_chunks_when_overall_cache_missing(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+    work_dir = tmp_path / "work"
+    install_stepaudio_media_success(monkeypatch, duration="70.0")
+    calls = []
+    responses = [
+        '{"segments": [{"start": 0, "end": 10, "text": "第一段"}]}',
+        '{"segments": [{"start": 0, "end": 20, "text": "第二段"}]}',
+        '{"segments": [{"start": 0, "end": 5, "text": "第三段"}]}',
+    ]
+
+    class FakeResponse:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return self.body.encode("utf-8")
+
+    def fake_request(request, timeout):
+        calls.append(request)
+        return FakeResponse(responses[len(calls) - 1])
+
+    config = {"asr_provider": "stepaudio", "asr_shard_seconds": 30}
+    transcriber = StepAudioTranscriber(StepAudioConfig(api_key="test-key", shard_seconds=30), request_func=fake_request)
+
+    first = transcript.transcribe_video(str(video_path), str(work_dir), transcriber, config=config)
+    assert first.success is True
+    assert first.chunks == [
+        TranscriptChunk(0, 10, "第一段"),
+        TranscriptChunk(30, 50, "第二段"),
+        TranscriptChunk(60, 65, "第三段"),
+    ]
+    assert (work_dir / "transcript.json").exists()
+    assert (work_dir / "asr_shard_cache" / "shard_0000.json").exists()
+    assert (work_dir / "asr_shard_cache" / "shard_0001.json").exists()
+    assert (work_dir / "asr_shard_cache" / "shard_0002.json").exists()
+    assert len(calls) == 3
+
+    (work_dir / "transcript.json").unlink()
+    transcriber.request_func = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("valid shard cache should avoid StepAudio request")
+    )
+
+    second = transcript.transcribe_video(str(video_path), str(work_dir), transcriber, config=config)
+
+    assert second.success is True
+    assert second.from_cache is False
+    assert second.chunks == first.chunks
+    assert len(calls) == 3
+
+
+def test_stepaudio_corrupted_shard_cache_only_retries_that_shard(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+    work_dir = tmp_path / "work"
+    install_stepaudio_media_success(monkeypatch, duration="70.0")
+    calls = []
+    responses = [
+        '{"segments": [{"start": 0, "end": 10, "text": "第一段"}]}',
+        '{"segments": [{"start": 0, "end": 20, "text": "第二段"}]}',
+        '{"segments": [{"start": 0, "end": 5, "text": "第三段"}]}',
+        '{"segments": [{"start": 1, "end": 21, "text": "第二段重识别"}]}',
+    ]
+
+    class FakeResponse:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return self.body.encode("utf-8")
+
+    def fake_request(request, timeout):
+        calls.append(request)
+        return FakeResponse(responses[len(calls) - 1])
+
+    config = {"asr_provider": "stepaudio", "asr_shard_seconds": 30}
+    transcriber = StepAudioTranscriber(StepAudioConfig(api_key="test-key", shard_seconds=30), request_func=fake_request)
+
+    first = transcript.transcribe_video(str(video_path), str(work_dir), transcriber, config=config)
+    assert first.success is True
+    (work_dir / "transcript.json").unlink()
+    (work_dir / "asr_shard_cache" / "shard_0001.json").write_text("{bad json", encoding="utf-8")
+
+    second = transcript.transcribe_video(str(video_path), str(work_dir), transcriber, config=config)
+
+    assert second.success is True
+    assert second.chunks == [
+        TranscriptChunk(0, 10, "第一段"),
+        TranscriptChunk(31, 51, "第二段重识别"),
+        TranscriptChunk(60, 65, "第三段"),
+    ]
+    assert len(calls) == 4
+
+
+def test_stepaudio_shard_cache_invalidates_when_audio_config_changes(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+    work_dir = tmp_path / "work"
+    install_stepaudio_media_success(monkeypatch, duration="10.0")
+    calls = []
+    responses = [
+        '{"segments": [{"start": 0, "end": 5, "text": "旧配置"}]}',
+        '{"segments": [{"start": 0, "end": 5, "text": "新配置"}]}',
+    ]
+
+    class FakeResponse:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return self.body.encode("utf-8")
+
+    def fake_request(request, timeout):
+        calls.append(request)
+        return FakeResponse(responses[len(calls) - 1])
+
+    old_config = {"asr_provider": "stepaudio", "asr_audio_sample_rate": 16000}
+    new_config = {"asr_provider": "stepaudio", "asr_audio_sample_rate": 8000}
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", audio_sample_rate=16000),
+        request_func=fake_request,
+    )
+    first = transcript.transcribe_video(str(video_path), str(work_dir), transcriber, config=old_config)
+    assert first.success is True
+
+    (work_dir / "transcript.json").unlink()
+    transcriber.config.audio_sample_rate = 8000
+    second = transcript.transcribe_video(str(video_path), str(work_dir), transcriber, config=new_config)
+
+    assert second.success is True
+    assert second.chunks == [TranscriptChunk(0, 5, "新配置")]
+    assert len(calls) == 2
+
+
 def test_stepaudio_transcribe_video_rejects_invalid_shard_timestamp(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_bytes(b"video")

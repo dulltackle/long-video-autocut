@@ -303,12 +303,24 @@ class StepAudioTranscriber:
 
         chunks = []
         for shard in shard_result:
-            result = self.transcribe_audio_shard(shard.audio_path, shard.index)
-            if not result.success:
-                result.transcript_path = transcript_path
-                return result
+            shard_chunks = load_stepaudio_shard_cache(video_path, shard, self.config)
+            if shard_chunks is None:
+                result = self.transcribe_audio_shard(shard.audio_path, shard.index)
+                if not result.success:
+                    result.transcript_path = transcript_path
+                    return result
+                shard_chunks = result.chunks
+                try:
+                    save_stepaudio_shard_cache(video_path, shard, shard_chunks, self.config)
+                except OSError as exc:
+                    return VideoTranscriptionResult(
+                        success=False,
+                        chunks=[],
+                        transcript_path=transcript_path,
+                        error=f"Failed to save StepAudio shard {shard.index} cache: {exc}",
+                    )
             try:
-                chunks.extend(_offset_shard_chunks(shard, result.chunks))
+                chunks.extend(_offset_shard_chunks(shard, shard_chunks))
             except ValueError as exc:
                 return VideoTranscriptionResult(
                     success=False,
@@ -590,6 +602,47 @@ def save_transcript_cache(video_path, chunks, cache_path, config=None):
         json.dump(payload, cache_file, ensure_ascii=False, indent=2)
 
 
+def load_stepaudio_shard_cache(video_path, shard, config):
+    """分片缓存匹配源视频、ASR 配置和分片边界时返回分片内 chunks。"""
+    if not os.path.exists(shard.cache_path):
+        return None
+
+    try:
+        with open(shard.cache_path, "r", encoding="utf-8") as cache_file:
+            payload = json.load(cache_file)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    source = _source_signature(video_path)
+    if source is None or payload.get("source") != source:
+        return None
+    if payload.get("asr") != _stepaudio_shard_cache_signature(config, shard):
+        return None
+
+    try:
+        return [_chunk_from_dict(item) for item in payload.get("chunks", [])]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def save_stepaudio_shard_cache(video_path, shard, chunks, config):
+    """保存 StepAudio 单分片转写缓存，chunks 使用分片内时间戳。"""
+    _ensure_parent_dir(shard.cache_path)
+    source = _source_signature(video_path)
+    if source is None:
+        raise FileNotFoundError(f"Cannot stat source video: {video_path}")
+    payload = {
+        "source": source,
+        "asr": _stepaudio_shard_cache_signature(config, shard),
+        "chunks": [
+            {"start": chunk.start, "end": chunk.end, "text": chunk.text}
+            for chunk in chunks
+        ],
+    }
+    with open(shard.cache_path, "w", encoding="utf-8") as cache_file:
+        json.dump(payload, cache_file, ensure_ascii=False, indent=2)
+
+
 def prepare_stepaudio_audio_shards(video_path, work_dir, config):
     """提取统一音频并生成连续 StepAudio 分片。"""
     duration = _probe_media_duration(video_path)
@@ -824,6 +877,19 @@ def _asr_cache_signature(config=None):
         signature["model"] = str(_config_get(config, "whisper_model", ""))
         signature["language"] = str(_config_get(config, "whisper_language", ""))
     return signature
+
+
+def _stepaudio_shard_cache_signature(config, shard):
+    return {
+        "provider": "stepaudio",
+        "model": str(config.model),
+        "language": str(config.language),
+        "shard_start": shard.start,
+        "shard_end": shard.end,
+        "audio_sample_rate": int(config.audio_sample_rate),
+        "audio_channels": int(config.audio_channels),
+        "audio_format": _sanitize_audio_format(config.audio_format),
+    }
 
 
 def _format_srt_time(seconds):
