@@ -394,6 +394,8 @@ video-auto-editor live path/to/live.mp4 --output-dir out/live --work-dir work/li
 - `needs_human_review=False`。
 - 候选不是重复片段。
 
+导出选择会写回每个候选的 `export_selection`，包含 `selected_for_export`、`reason`、`review_status`、`publish_ready_score`、`export_rank`、原候选边界、最终导出边界、`topic_name`、`series_key` 和人工复核信息。只有存在明确字段 `boundary_fix_start` 与 `boundary_fix_end` 时才会应用边界补救；只有自然语言 `boundary_fix_suggestion` 时，不猜测时间，候选会进入人工复核或未导出清单。
+
 显式限制导出数量：
 
 ```bash
@@ -414,6 +416,17 @@ video-auto-editor live path/to/live.mp4 --output-dir out/live --work-dir work/li
 - `out/live/clips/*.mp4`
 - `out/live/subtitles/*.srt`
 - `out/live/拆条报告.md`
+
+本地检查方式：
+
+```bash
+python -m json.tool out/live/plan.json >/dev/null
+python -m json.tool out/live/metadata.json >/dev/null
+find out/live/clips -type f -name '*.mp4' | sort
+find out/live/subtitles -type f -name '*.srt' | sort
+```
+
+`plan.json` 应包含 `export_mode`、`publish_ready_threshold`、`export_count`、`skipped_count`、每个候选的 `export_selection` 和计划 `exports` 清单。`metadata.json` 应包含 `generated_at`、`status`、`review_provider`、`exports`/`clips`、`not_exported` 和 `human_review`；其中 `clips` 保持旧读取方式兼容。报告应包含导出清单、未导出候选、人工复核、同主题系列和标准交付物清单。
 
 dry-run 仍只输出方案，不裁剪视频：
 

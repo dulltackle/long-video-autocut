@@ -86,6 +86,8 @@
 
 第五批完成后，`live` 非 dry-run 默认只导出主题评审判定为发布就绪的候选；`--max-clips` 仅作为用户显式上限。主题评审失败、关闭或不可用时，CLI 默认不导出短视频，只输出未评审方案和 warning；显式 `--allow-unreviewed-export` 时才允许未评审兼容导出。`plan.json`、`metadata.json` 和 `拆条报告.md` 需要共同表达导出清单、未导出原因、人工复核项、边界补救建议和同主题系列。
 
+第五批标准交付物为 `transcript.srt`、`plan.json`、非 dry-run 的 `metadata.json`、`clips/`、`subtitles/` 和 `拆条报告.md`。`plan.json` 面向机器读取拆条方案、候选评审和导出选择；`metadata.json` 面向后续自动化读取实际交付包索引；`拆条报告.md` 面向人工解释导出项、未导出项、人工复核项、边界补救建议和同主题系列。
+
 详细任务、验收标准与提交点见 [第五批：导出选择与标准交付物闭环](./implementation-batch-5-export-deliverables.md)。第五批要求每完成一个小任务并通过对应验证后立即进行一次 git commit，并必须建立 reviewed `live` 非 dry-run 最小端到端测试闭环。
 
 ### 6. skill 调度器
