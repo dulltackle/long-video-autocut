@@ -14,6 +14,24 @@ class TranscriptChunk:
 
 
 @dataclass
+class TopicReviewResult:
+    """主题评审返回的结构化结果。"""
+
+    topic_name: str
+    topic_complete: bool
+    learning_value: int
+    share_value: int
+    publish_ready_score: int
+    export_decision: str
+    title: str
+    summary: str
+    keywords: List[str] = field(default_factory=list)
+    needs_human_review: bool = False
+    reject_reason: str = ""
+    boundary_fix_suggestion: str = ""
+
+
+@dataclass
 class ClipCandidate:
     """直播拆条流程中的候选片段。"""
 
@@ -32,6 +50,7 @@ class ClipCandidate:
     keywords: List[str] = field(default_factory=list)
     is_duplicate: bool = False
     duplicate_with: List[int] = field(default_factory=list)
+    review: Optional[TopicReviewResult] = None
 
 
 @dataclass
