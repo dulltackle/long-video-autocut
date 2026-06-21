@@ -22,6 +22,7 @@ def build_plan(
         "source_video": os.path.basename(source_video),
         "status": status,
         "export_mode": export_mode,
+        "dry_run": bool(dry_run),
         "publish_ready_threshold": config.get("topic_review_publish_ready_threshold"),
         "export_count": len(selected),
         "skipped_count": max(0, len(candidates) - len(selected)),
