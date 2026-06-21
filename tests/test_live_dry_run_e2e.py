@@ -12,10 +12,27 @@ def test_live_dry_run_generates_plan_report_and_transcript_without_exports(monke
     video_path.write_text("fake video", encoding="utf-8")
     output_dir = tmp_path / "out"
     work_dir = tmp_path / "work"
-    http_calls = []
-    http_responses = [
-        '{"segments": [{"start": 0, "end": 40, "text": "第一段内容，介绍核心概念。"}]}',
-        '{"segments": [{"start": 0, "end": 50, "text": "第二段内容，展开案例并自然结束。"}]}',
+    asr_calls = []
+    review_calls = []
+    asr_responses = [
+        json.dumps(
+            {
+                "segments": [
+                    {"start": 0, "end": 30, "text": "第一段内容，介绍核心概念。"},
+                    {"start": 30, "end": 60, "text": "第二段内容，展开方法步骤。"},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            {
+                "segments": [
+                    {"start": 0, "end": 30, "text": "第三段内容，展开案例。"},
+                    {"start": 30, "end": 60, "text": "第四段内容，需要人工确认边界。"},
+                ]
+            },
+            ensure_ascii=False,
+        ),
     ]
 
     class FakeResponse:
@@ -44,8 +61,53 @@ def test_live_dry_run_generates_plan_report_and_transcript_without_exports(monke
         raise AssertionError(f"unexpected command: {cmd}")
 
     def fake_request(request, timeout):
-        http_calls.append(request)
-        return FakeResponse(http_responses[len(http_calls) - 1])
+        if request.full_url.endswith("/audio/transcriptions"):
+            asr_calls.append(request)
+            return FakeResponse(asr_responses[len(asr_calls) - 1])
+        if request.full_url.endswith("/chat/completions"):
+            body = json.loads(request.data.decode("utf-8"))
+            review_calls.append(body)
+            review_payload = {
+                "reviews": [
+                    {
+                        "candidate_id": "candidate_0",
+                        "topic_name": "核心概念",
+                        "topic_complete": True,
+                        "learning_value": 9,
+                        "share_value": 8,
+                        "publish_ready_score": 92,
+                        "export_decision": "publish_ready",
+                        "title": "核心概念的三个步骤",
+                        "summary": "介绍核心概念并展开方法步骤。",
+                        "keywords": ["核心概念", "方法"],
+                        "needs_human_review": False,
+                        "reject_reason": "",
+                        "boundary_fix_suggestion": "",
+                    },
+                    {
+                        "candidate_id": "candidate_1",
+                        "topic_name": "案例边界",
+                        "topic_complete": False,
+                        "learning_value": 7,
+                        "share_value": 6,
+                        "publish_ready_score": 64,
+                        "export_decision": "needs_review",
+                        "title": "案例边界需要复核",
+                        "summary": "案例内容可用，但结束边界需要人工确认。",
+                        "keywords": ["案例", "边界"],
+                        "needs_human_review": True,
+                        "reject_reason": "",
+                        "boundary_fix_suggestion": "建议向后补足结束句。",
+                    },
+                ]
+            }
+            return FakeResponse(
+                json.dumps(
+                    {"choices": [{"message": {"content": json.dumps(review_payload, ensure_ascii=False)}}]},
+                    ensure_ascii=False,
+                )
+            )
+        raise AssertionError(f"unexpected request: {request.full_url}")
 
     monkeypatch.setattr(cli, "get_video_duration", lambda video_path_arg: 120.0)
     monkeypatch.setattr(cli, "detect_silence", lambda video_path_arg, config=None: [])
@@ -54,7 +116,11 @@ def test_live_dry_run_generates_plan_report_and_transcript_without_exports(monke
     monkeypatch.setenv("STEPFUN_API_KEY", "test-key")
     monkeypatch.setitem(cli.CONFIG, "asr_shard_seconds", 60)
     monkeypatch.setitem(cli.CONFIG, "asr_retry_backoff_seconds", 0)
-    monkeypatch.setitem(cli.CONFIG, "topic_review_enabled", False)
+    monkeypatch.setitem(cli.CONFIG, "min_clip_duration", 30)
+    monkeypatch.setitem(cli.CONFIG, "max_clip_duration", 80)
+    monkeypatch.setitem(cli.CONFIG, "target_clip_duration", 60)
+    monkeypatch.setitem(cli.CONFIG, "topic_overlap_seconds", 0)
+    monkeypatch.setitem(cli.CONFIG, "topic_review_enabled", True)
 
     cli.main(
         [
@@ -86,17 +152,21 @@ def test_live_dry_run_generates_plan_report_and_transcript_without_exports(monke
     assert srt_path.exists()
     srt = srt_path.read_text(encoding="utf-8")
     assert "第一段内容，介绍核心概念。" in srt
-    assert "第二段内容，展开案例并自然结束。" in srt
-    assert "00:01:00,000 --> 00:01:50,000" in srt
-    assert len(http_calls) == 2
+    assert "第四段内容，需要人工确认边界。" in srt
+    assert "00:01:30,000 --> 00:02:00,000" in srt
+    assert len(asr_calls) == 2
+    assert len(review_calls) == 2
 
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    assert plan["status"] == "unreviewed"
-    assert plan["candidates"]
+    assert plan["status"] == "reviewed"
+    assert plan["candidates"][0]["review"]["topic_name"] == "核心概念"
+    assert plan["candidates"][1]["review"]["needs_human_review"] is True
     assert plan["selected"]
 
     report = report_path.read_text(encoding="utf-8")
-    assert "Dry-run：本报告是未评审拆条方案，不代表发布就绪短视频。" in report
+    assert "Dry-run：本报告包含主题评审结果，但未导出短视频。" in report
+    assert "| candidate_0 | 核心概念 | yes | 9 | 8 | 92 | publish_ready | no |  |" in report
+    assert "| candidate_1 | 案例边界 | no | 7 | 6 | 64 | needs_review | yes | 建议向后补足结束句。 |" in report
     assert "- Exported clips: 0 (dry-run)" in report
 
     assert not (output_dir / "metadata.json").exists()
