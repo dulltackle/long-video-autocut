@@ -148,7 +148,7 @@ def generate_live_report(
             file.write("|-----------|-------|----------|----------|-------|-------|----------|--------------|--------|\n")
             for candidate in reviewed_candidates:
                 review = candidate.review
-                reason = review.reject_reason or review.boundary_fix_suggestion
+                reason = review.reject_reason or review.boundary_fix_suggestion or ""
                 file.write(
                     f"| candidate_{candidate.index} | {_escape_markdown_cell(review.topic_name)} | "
                     f"{'yes' if review.topic_complete else 'no'} | {review.learning_value} | "

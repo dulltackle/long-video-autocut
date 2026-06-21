@@ -1,6 +1,8 @@
 import json
 import urllib.error
 
+import pytest
+
 from video_auto_editor import transcript
 from video_auto_editor.config import CONFIG
 from video_auto_editor.context import CourseContext
@@ -154,11 +156,16 @@ def test_build_topic_review_batches_includes_course_context_summary():
 def test_build_topic_review_batches_allows_missing_course_context_and_empty_candidates():
     assert build_topic_review_batches([], config={"topic_review_batch_size": 2}) == []
 
-    batches = build_topic_review_batches([make_candidate(0, 0)], None, {"topic_review_batch_size": 0})
+    batches = build_topic_review_batches([make_candidate(0, 0)], None, {"topic_review_batch_size": 1})
 
     assert len(batches) == 1
     assert batches[0].course_context_summary == {}
     assert batches[0].candidates[0].text == "候选0正文"
+
+
+def test_build_topic_review_batches_rejects_invalid_batch_size():
+    with pytest.raises(ValueError, match="Invalid topic_review_batch_size: 0, must be >= 1"):
+        build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 0})
 
 
 def test_stepfun_chat_reviewer_maps_success_response_to_review_result(monkeypatch):
@@ -194,6 +201,37 @@ def test_stepfun_chat_reviewer_maps_success_response_to_review_result(monkeypatc
     assert calls[0][1] == 12
     assert calls[0][0].full_url == "https://api.example/v1/chat/completions"
     assert calls[0][2]["messages"][1]["content"]
+
+
+def test_stepfun_chat_reviewer_rejects_non_https_base_url_without_request():
+    def fail_request(*args, **kwargs):
+        raise AssertionError("unsafe base_url should not make HTTP request")
+
+    reviewer = StepFunChatReviewer(
+        {"topic_review_api_key": "sk-test", "topic_review_base_url": "http://api.example/v1"},
+        request_func=fail_request,
+    )
+
+    result = reviewer.review_batches(build_topic_review_batches([make_candidate(0, 0)]))
+
+    assert result.success is False
+    assert result.error == "Topic review base_url must use HTTPS for credential safety"
+
+
+def test_stepfun_chat_reviewer_clamps_review_scores_to_expected_ranges():
+    reviewer = StepFunChatReviewer(
+        {"topic_review_api_key": "sk-test"},
+        request_func=lambda request, timeout: FakeResponse(
+            chat_response(review_content(learning_value=-3, share_value=99, publish_ready_score=120))
+        ),
+    )
+
+    result = reviewer.review_batches(build_topic_review_batches([make_candidate(0, 0)]))
+
+    assert result.success is True
+    assert result.reviews[0].learning_value == 0
+    assert result.reviews[0].share_value == 10
+    assert result.reviews[0].publish_ready_score == 100
 
 
 def test_stepfun_chat_reviewer_missing_api_key_is_unavailable_and_does_not_request(monkeypatch):
@@ -286,9 +324,5 @@ def test_stepfun_chat_reviewer_reports_unknown_candidate_id():
 
 
 def test_create_topic_reviewer_rejects_unknown_provider():
-    try:
+    with pytest.raises(ValueError, match="Unknown topic review provider: unknown"):
         create_topic_reviewer({"topic_review_provider": "unknown"})
-    except ValueError as exc:
-        assert str(exc) == "Unknown topic review provider: unknown"
-    else:
-        raise AssertionError("unknown provider should fail clearly")

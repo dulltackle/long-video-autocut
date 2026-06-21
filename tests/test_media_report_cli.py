@@ -138,6 +138,39 @@ def test_generate_live_report_rejects_selected_export_mismatch(tmp_path):
         )
 
 
+def test_generate_live_report_does_not_render_none_review_reason(tmp_path):
+    candidate = ClipCandidate(0, 0, 10, 10, "文本", title="标题", base_score=80)
+    candidate.review = TopicReviewResult(
+        topic_name="主题",
+        topic_complete=True,
+        learning_value=8,
+        share_value=7,
+        publish_ready_score=90,
+        export_decision="publish_ready",
+        title="标题",
+        summary="摘要",
+        keywords=["主题"],
+        needs_human_review=False,
+        reject_reason=None,
+        boundary_fix_suggestion=None,
+    )
+
+    report_path = generate_live_report(
+        "live",
+        str(tmp_path),
+        total_duration=10,
+        silences=[],
+        candidates=[candidate],
+        selected=[candidate],
+        exports=[],
+        dry_run=True,
+    )
+
+    content = Path(report_path).read_text(encoding="utf-8")
+    assert "None" not in content
+    assert "| candidate_0 | 主题 | yes | 8 | 7 | 90 | publish_ready | no |  |" in content
+
+
 def test_main_dispatches_batch_subcommand(monkeypatch, tmp_path):
     calls = []
 
@@ -539,6 +572,37 @@ def test_process_live_video_keeps_unreviewed_plan_on_review_failure(monkeypatch,
     assert any("主题评审失败：模型响应缺少字段" in warning for warning in plan["warnings"])
     report = (output_dir / "拆条报告.md").read_text(encoding="utf-8")
     assert "主题评审失败：模型响应缺少字段" in report
+
+
+def test_review_live_candidates_degrades_on_invalid_batch_size(monkeypatch):
+    candidate = ClipCandidate(0, 10, 70, 60, "直播文本。", base_score=90)
+
+    class FakeReviewer:
+        provider_name = "stepfun_chat"
+        model = "fake-review"
+        base_url = "https://api.example/v1"
+
+        def is_available(self):
+            return True
+
+        def review_batches(self, batches):
+            raise AssertionError("invalid batch size should stop before provider request")
+
+    monkeypatch.setattr(cli, "create_topic_reviewer", lambda config: FakeReviewer())
+
+    status, provider_info, warnings = cli._review_live_candidates(
+        [candidate],
+        None,
+        {**cli.CONFIG, "topic_review_batch_size": 0},
+    )
+
+    assert status == "unreviewed"
+    assert provider_info == {
+        "provider": "stepfun_chat",
+        "model": "fake-review",
+        "base_url": "https://api.example/v1",
+    }
+    assert warnings == ["主题评审配置错误：Invalid topic_review_batch_size: 0, must be >= 1"]
 
 
 def test_process_live_video_logs_generated_candidates(monkeypatch, tmp_path, capsys):

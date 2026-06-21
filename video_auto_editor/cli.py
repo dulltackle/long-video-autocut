@@ -351,7 +351,11 @@ def _review_live_candidates(candidates, course_context, config):
     if not reviewer.is_available():
         return "unreviewed", provider_info, ["主题评审不可用：缺少 API Key，未发起评审请求。"]
 
-    batches = build_topic_review_batches(candidates, course_context, config)
+    try:
+        batches = build_topic_review_batches(candidates, course_context, config)
+    except ValueError as exc:
+        return "unreviewed", provider_info, [f"主题评审配置错误：{exc}"]
+
     result = reviewer.review_batches(batches)
     provider_info = result.provider_info or provider_info
     if not result.success:

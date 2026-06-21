@@ -3,6 +3,7 @@
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import List, Protocol
@@ -143,6 +144,8 @@ class StepFunChatReviewer:
             request = self._build_request(batch)
             with self.request_func(request, timeout=self.timeout) as response:
                 raw_response = response.read().decode("utf-8")
+        except ValueError as exc:
+            return TopicReviewProviderResult(False, error=str(exc))
         except urllib.error.HTTPError as exc:
             return TopicReviewProviderResult(False, error=f"Topic review HTTP error: {exc.code}")
         except (urllib.error.URLError, OSError) as exc:
@@ -171,6 +174,7 @@ class StepFunChatReviewer:
         return TopicReviewProviderResult(True, reviews=reviews)
 
     def _build_request(self, batch):
+        _validate_https_base_url(self.base_url)
         endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
         body = {
             "model": self.model,
@@ -208,7 +212,7 @@ def build_topic_review_batches(candidates, course_context=None, config=None):
         return []
 
     config = config or CONFIG
-    batch_size = max(1, int(config.get("topic_review_batch_size", 1)))
+    batch_size = _topic_review_batch_size(config)
     ordered = sorted(candidates, key=lambda candidate: (candidate.start_time, candidate.end_time, candidate.index))
     context_summary = course_context.summary() if course_context is not None else {}
 
@@ -292,9 +296,9 @@ def _parse_review_payload(payload, requested_ids):
         reviews[requested_ids[candidate_id]] = TopicReviewResult(
             topic_name=str(item["topic_name"]),
             topic_complete=bool(item["topic_complete"]),
-            learning_value=int(item["learning_value"]),
-            share_value=int(item["share_value"]),
-            publish_ready_score=int(item["publish_ready_score"]),
+            learning_value=_bounded_int(item["learning_value"], "learning_value", 0, 10),
+            share_value=_bounded_int(item["share_value"], "share_value", 0, 10),
+            publish_ready_score=_bounded_int(item["publish_ready_score"], "publish_ready_score", 0, 100),
             export_decision=str(item["export_decision"]),
             title=str(item["title"]),
             summary=str(item["summary"]),
@@ -337,6 +341,31 @@ def _resolve_topic_review_base_url(config):
         return str(base_url)
     env_name = _config_get(config, "topic_review_base_url_env", "STEPFUN_BASE_URL")
     return os.environ.get(str(env_name), "https://api.stepfun.com/v1")
+
+
+def _topic_review_batch_size(config):
+    raw_value = config.get("topic_review_batch_size", 1)
+    try:
+        batch_size = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid topic_review_batch_size: {raw_value}, must be >= 1") from exc
+    if batch_size < 1:
+        raise ValueError(f"Invalid topic_review_batch_size: {batch_size}, must be >= 1")
+    return batch_size
+
+
+def _bounded_int(value, field_name, minimum, maximum):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Topic review field {field_name} must be an integer") from exc
+    return max(minimum, min(maximum, parsed))
+
+
+def _validate_https_base_url(base_url):
+    parsed = urllib.parse.urlparse(str(base_url))
+    if parsed.scheme.lower() != "https":
+        raise ValueError("Topic review base_url must use HTTPS for credential safety")
 
 
 def _config_get(config, key, default=None):
