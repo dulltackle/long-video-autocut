@@ -1,6 +1,7 @@
 """候选片段选择策略。"""
 
 from video_auto_editor.config import CONFIG
+from video_auto_editor.models import LiveExportDecision
 
 
 def _fluency_rate(seg):
@@ -42,7 +43,7 @@ def select_live_clips(candidates, max_clips=None, config=None):
 
     config = config or CONFIG
     max_clips = resolve_live_max_clips(max_clips, config)
-    if max_clips <= 0:
+    if max_clips is not None and max_clips <= 0:
         return []
 
     pool = [candidate for candidate in candidates if not candidate.is_duplicate]
@@ -54,10 +55,23 @@ def select_live_clips(candidates, max_clips=None, config=None):
         if any(_has_live_overlap(candidate, kept, config) for kept in selected):
             continue
         selected.append(candidate)
-        if len(selected) >= max_clips:
+        if max_clips is not None and len(selected) >= max_clips:
             break
 
     return sorted(selected, key=lambda candidate: (candidate.start_time, candidate.end_time, candidate.index))
+
+
+def select_live_exports(candidates, max_clips=None, config=None, review_status="unreviewed"):
+    """按导出契约返回最终导出候选和每个候选的选择结果。"""
+    config = config or CONFIG
+    if review_status == "reviewed":
+        return _select_reviewed_live_exports(candidates, max_clips, config)
+    if config.get("allow_unreviewed_export", False):
+        selected = select_live_clips(candidates, max_clips, config)
+        decisions = _build_unreviewed_decisions(candidates, selected, review_status, "legacy_score_not_selected")
+        return selected, decisions
+    decisions = _build_unreviewed_decisions(candidates, [], review_status, "unreviewed_export_not_allowed")
+    return [], decisions
 
 
 def resolve_live_max_clips(max_clips=None, config=None):
@@ -67,7 +81,113 @@ def resolve_live_max_clips(max_clips=None, config=None):
         return int(max_clips)
     if config.get("max_clips_user_provided"):
         return int(config["max_clips"])
-    return int(config.get("temporary_protective_max_clips", config["max_clips"]))
+    return None
+
+
+def _select_reviewed_live_exports(candidates, max_clips, config):
+    max_clips = resolve_live_max_clips(max_clips, config)
+    if max_clips is not None and max_clips <= 0:
+        eligible = []
+    else:
+        eligible = [
+            candidate
+            for candidate in candidates
+            if _reviewed_rejection_reason(candidate, config) is None
+        ]
+        eligible.sort(key=_reviewed_quality_key, reverse=True)
+        if max_clips is not None:
+            eligible = eligible[:max_clips]
+
+    selected = sorted(eligible, key=lambda candidate: (candidate.start_time, candidate.end_time, candidate.index))
+    selected_indexes = {candidate.index for candidate in selected}
+    rank_by_index = {candidate.index: index for index, candidate in enumerate(selected, 1)}
+    decisions = []
+    for candidate in candidates:
+        rejection_reason = _reviewed_rejection_reason(candidate, config)
+        if candidate.index in selected_indexes:
+            decision = _decision_payload(
+                candidate,
+                True,
+                "export",
+                "publish_ready",
+                "reviewed",
+                export_rank=rank_by_index[candidate.index],
+            )
+        elif rejection_reason is None:
+            decision = _decision_payload(candidate, False, "skip", "max_clips_limit", "reviewed")
+        else:
+            decision = _decision_payload(candidate, False, "skip", rejection_reason, "reviewed")
+        candidate.export_selection = decision
+        decisions.append(decision)
+    return selected, decisions
+
+
+def _build_unreviewed_decisions(candidates, selected, review_status, default_skip_reason):
+    selected_indexes = {candidate.index for candidate in selected}
+    rank_by_index = {candidate.index: index for index, candidate in enumerate(selected, 1)}
+    decisions = []
+    for candidate in candidates:
+        if candidate.index in selected_indexes:
+            decision = _decision_payload(
+                candidate,
+                True,
+                "export",
+                "legacy_score_selection",
+                review_status,
+                export_rank=rank_by_index[candidate.index],
+            )
+        elif candidate.is_duplicate:
+            decision = _decision_payload(candidate, False, "skip", "duplicate", review_status)
+        else:
+            decision = _decision_payload(candidate, False, "skip", default_skip_reason, review_status)
+        candidate.export_selection = decision
+        decisions.append(decision)
+    return decisions
+
+
+def _reviewed_rejection_reason(candidate, config):
+    review = candidate.review
+    if candidate.is_duplicate:
+        return "duplicate"
+    if review is None:
+        return "missing_review"
+    if review.needs_human_review:
+        return "needs_human_review"
+    threshold = int(config.get("topic_review_publish_ready_threshold", 80))
+    if int(review.publish_ready_score) < threshold:
+        return "publish_ready_score_below_threshold"
+    if not review.topic_complete:
+        return "topic_incomplete"
+    if review.export_decision != "publish_ready":
+        return f"review_decision_{review.export_decision or 'unknown'}"
+    return None
+
+
+def _reviewed_quality_key(candidate):
+    review = candidate.review
+    ready_score = int(review.publish_ready_score) if review is not None else -1
+    live_score = candidate.adjusted_score if candidate.adjusted_score is not None else candidate.base_score
+    return (ready_score, live_score, candidate.base_score, candidate.duration, -candidate.index)
+
+
+def _decision_payload(candidate, selected, decision, reason, review_status, export_rank=None):
+    review = candidate.review
+    return LiveExportDecision(
+        candidate_index=candidate.index,
+        selected_for_export=selected,
+        decision=decision,
+        reason=reason,
+        review_status=review_status,
+        publish_ready_score=int(review.publish_ready_score) if review is not None else None,
+        export_rank=export_rank,
+        original_start=candidate.start_time,
+        original_end=candidate.end_time,
+        final_start=candidate.start_time,
+        final_end=candidate.end_time,
+        topic_name=review.topic_name if review is not None else "",
+        needs_human_review=bool(review.needs_human_review) if review is not None else False,
+        boundary_fix_suggestion=review.boundary_fix_suggestion if review is not None else "",
+    )
 
 
 def _live_score_key(candidate):

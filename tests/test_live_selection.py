@@ -1,6 +1,6 @@
 from video_auto_editor.config import CONFIG
-from video_auto_editor.models import ClipCandidate
-from video_auto_editor.selection import resolve_live_max_clips, select_live_clips
+from video_auto_editor.models import ClipCandidate, TopicReviewResult
+from video_auto_editor.selection import resolve_live_max_clips, select_live_clips, select_live_exports
 
 
 def live_config(**overrides):
@@ -64,8 +64,8 @@ def test_select_live_clips_skips_duplicates_and_returns_time_order():
     assert [candidate.index for candidate in selected] == [1, 0]
 
 
-def test_resolve_live_max_clips_uses_temporary_protective_limit_by_default():
-    assert resolve_live_max_clips(None, live_config(max_clips=100, temporary_protective_max_clips=5)) == 5
+def test_resolve_live_max_clips_has_no_default_limit():
+    assert resolve_live_max_clips(None, live_config(max_clips=100, temporary_protective_max_clips=5)) is None
 
 
 def test_resolve_live_max_clips_uses_explicit_user_limit():
@@ -73,3 +73,137 @@ def test_resolve_live_max_clips_uses_explicit_user_limit():
 
     assert resolve_live_max_clips(None, config) == 2
     assert resolve_live_max_clips(3, config) == 3
+
+
+def review(
+    decision="publish_ready",
+    score=90,
+    complete=True,
+    human=False,
+    topic="主题",
+):
+    return TopicReviewResult(
+        topic_name=topic,
+        topic_complete=complete,
+        learning_value=8,
+        share_value=8,
+        publish_ready_score=score,
+        export_decision=decision,
+        title=f"{topic}标题",
+        summary=f"{topic}摘要",
+        keywords=[topic],
+        needs_human_review=human,
+        reject_reason="",
+        boundary_fix_suggestion="",
+    )
+
+
+def test_select_live_exports_keeps_only_publish_ready_reviewed_candidates():
+    candidates = [
+        make_candidate(0, 0, 10, adjusted=70),
+        make_candidate(1, 20, 30, adjusted=95),
+        make_candidate(2, 40, 50, adjusted=90),
+        make_candidate(3, 60, 70, adjusted=85),
+        make_candidate(4, 80, 90, adjusted=80),
+        make_candidate(5, 100, 110, adjusted=75, duplicate=True),
+    ]
+    candidates[0].review = review(score=92)
+    candidates[1].review = review(score=79)
+    candidates[2].review = review(complete=False)
+    candidates[3].review = review(human=True)
+    candidates[4].review = review(decision="reject")
+    candidates[5].review = review(score=96)
+
+    selected, decisions = select_live_exports(candidates, None, live_config(), review_status="reviewed")
+
+    assert [candidate.index for candidate in selected] == [0]
+    reasons = {decision.candidate_index: decision.reason for decision in decisions}
+    assert reasons == {
+        0: "publish_ready",
+        1: "publish_ready_score_below_threshold",
+        2: "topic_incomplete",
+        3: "needs_human_review",
+        4: "review_decision_reject",
+        5: "duplicate",
+    }
+    assert decisions[0].selected_for_export is True
+    assert decisions[0].publish_ready_score == 92
+    assert decisions[0].final_start == 0
+    assert decisions[0].final_end == 10
+
+
+def test_select_live_exports_does_not_truncate_reviewed_candidates_without_explicit_limit():
+    candidates = [make_candidate(index, index * 20, index * 20 + 10, adjusted=100 - index) for index in range(7)]
+    for candidate in candidates:
+        candidate.review = review(score=90 - candidate.index)
+
+    selected, decisions = select_live_exports(
+        candidates,
+        None,
+        live_config(temporary_protective_max_clips=2),
+        review_status="reviewed",
+    )
+
+    assert [candidate.index for candidate in selected] == list(range(7))
+    assert all(decision.selected_for_export for decision in decisions)
+
+
+def test_select_live_exports_applies_explicit_limit_by_quality_then_returns_time_order():
+    candidates = [
+        make_candidate(0, 40, 50, adjusted=70),
+        make_candidate(1, 0, 10, adjusted=99),
+        make_candidate(2, 20, 30, adjusted=80),
+    ]
+    candidates[0].review = review(score=90)
+    candidates[1].review = review(score=95)
+    candidates[2].review = review(score=93)
+
+    selected, decisions = select_live_exports(
+        candidates,
+        None,
+        live_config(max_clips=2, max_clips_user_provided=True),
+        review_status="reviewed",
+    )
+
+    assert [candidate.index for candidate in selected] == [1, 2]
+    assert {decision.candidate_index: decision.reason for decision in decisions} == {
+        0: "max_clips_limit",
+        1: "publish_ready",
+        2: "publish_ready",
+    }
+
+
+def test_select_live_exports_blocks_unreviewed_candidates_by_default():
+    selected, decisions = select_live_exports(
+        [make_candidate(0, 0, 10), make_candidate(1, 20, 30)],
+        None,
+        live_config(allow_unreviewed_export=False),
+        review_status="unreviewed",
+    )
+
+    assert selected == []
+    assert [decision.reason for decision in decisions] == [
+        "unreviewed_export_not_allowed",
+        "unreviewed_export_not_allowed",
+    ]
+
+
+def test_select_live_exports_preserves_unreviewed_compatibility_when_allowed():
+    candidates = [
+        make_candidate(0, 0, 10, adjusted=70),
+        make_candidate(1, 20, 30, adjusted=95),
+    ]
+
+    selected, decisions = select_live_exports(
+        candidates,
+        None,
+        live_config(allow_unreviewed_export=True, max_clips=1, max_clips_user_provided=True),
+        review_status="unreviewed",
+    )
+
+    assert [candidate.index for candidate in selected] == [1]
+    assert {decision.candidate_index: decision.reason for decision in decisions} == {
+        0: "legacy_score_not_selected",
+        1: "legacy_score_selection",
+    }
+    assert decisions[1].selected_for_export is True

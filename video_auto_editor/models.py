@@ -32,6 +32,28 @@ class TopicReviewResult:
 
 
 @dataclass
+class LiveExportDecision:
+    """直播候选的机器可读导出选择结果。"""
+
+    candidate_index: int
+    selected_for_export: bool
+    decision: str
+    reason: str
+    review_status: str
+    publish_ready_score: Optional[int] = None
+    export_rank: Optional[int] = None
+    original_start: float = 0.0
+    original_end: float = 0.0
+    final_start: float = 0.0
+    final_end: float = 0.0
+    topic_name: str = ""
+    needs_human_review: bool = False
+    boundary_fix_suggestion: str = ""
+    boundary_fix_applied: bool = False
+    series_key: str = ""
+
+
+@dataclass
 class ClipCandidate:
     """直播拆条流程中的候选片段。"""
 
@@ -51,6 +73,7 @@ class ClipCandidate:
     is_duplicate: bool = False
     duplicate_with: List[int] = field(default_factory=list)
     review: Optional[TopicReviewResult] = None
+    export_selection: Optional[LiveExportDecision] = None
 
 
 @dataclass
