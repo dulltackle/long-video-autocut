@@ -963,6 +963,99 @@ def test_stepaudio_corrupted_shard_cache_only_retries_that_shard(monkeypatch, tm
     assert len(calls) == 4
 
 
+def test_stepaudio_retryable_request_succeeds_and_writes_shard_cache(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+    work_dir = tmp_path / "work"
+    install_stepaudio_media_success(monkeypatch, duration="10.0")
+    calls = []
+    sleeps = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return '{"segments": [{"start": 0, "end": 5, "text": "重试成功"}]}'.encode("utf-8")
+
+    def fake_request(request, timeout):
+        calls.append(request)
+        if len(calls) == 1:
+            raise urllib.error.URLError("temporary network failure")
+        return FakeResponse()
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", retry_attempts=2, retry_backoff_seconds=0.5),
+        request_func=fake_request,
+        sleep_func=lambda seconds: sleeps.append(seconds),
+    )
+
+    result = transcript.transcribe_video(str(video_path), str(work_dir), transcriber, config={"asr_provider": "stepaudio"})
+
+    assert result.success is True
+    assert result.chunks == [TranscriptChunk(0, 5, "重试成功")]
+    assert len(calls) == 2
+    assert sleeps == [0.5]
+    assert (work_dir / "asr_shard_cache" / "shard_0000.json").exists()
+
+
+def test_stepaudio_retry_exhaustion_reports_shard_index(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+    install_stepaudio_media_success(monkeypatch, duration="10.0")
+    calls = []
+
+    def fake_request(request, timeout):
+        calls.append(request)
+        raise urllib.error.URLError("still down")
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", retry_attempts=2, retry_backoff_seconds=0),
+        request_func=fake_request,
+    )
+
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+
+    assert result.success is False
+    assert result.chunks == []
+    assert result.error == "StepAudio shard 0 request failed after 2 attempts: <urlopen error still down>"
+    assert len(calls) == 2
+
+
+def test_stepaudio_non_retryable_invalid_json_does_not_retry(tmp_path):
+    audio_path = tmp_path / "shard.wav"
+    audio_path.write_bytes(b"audio")
+    calls = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b"{bad json"
+
+    def fake_request(request, timeout):
+        calls.append(request)
+        return FakeResponse()
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", retry_attempts=3),
+        request_func=fake_request,
+    )
+
+    result = transcriber.transcribe_audio_shard(str(audio_path), shard_index=0)
+
+    assert result.success is False
+    assert "StepAudio response is not valid JSON" in result.error
+    assert len(calls) == 1
+
+
 def test_stepaudio_shard_cache_invalidates_when_audio_config_changes(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_bytes(b"video")
@@ -1249,7 +1342,7 @@ def test_stepaudio_transcribe_video_returns_http_error(monkeypatch, tmp_path):
         )
 
     transcriber = StepAudioTranscriber(
-        StepAudioConfig(api_key="test-key", base_url="https://example.test/v1"),
+        StepAudioConfig(api_key="test-key", base_url="https://example.test/v1", retry_attempts=1),
         request_func=raise_http_error,
     )
 
@@ -1257,7 +1350,7 @@ def test_stepaudio_transcribe_video_returns_http_error(monkeypatch, tmp_path):
 
     assert result.success is False
     assert result.chunks == []
-    assert result.error == "StepAudio request failed: HTTP 500: failed"
+    assert result.error == "StepAudio shard 0 request failed after 1 attempts: HTTP 500: failed"
 
 
 def test_stepaudio_transcribe_video_returns_invalid_json_error(monkeypatch, tmp_path):

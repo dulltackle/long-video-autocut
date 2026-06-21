@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import uuid
 import urllib.error
 import urllib.request
@@ -275,9 +276,10 @@ class WhisperTranscriber:
 class StepAudioTranscriber:
     """基于 StepAudio API 的整视频转写器。"""
 
-    def __init__(self, config=None, request_func=None):
+    def __init__(self, config=None, request_func=None, sleep_func=None):
         self.config = config or StepAudioConfig()
         self.request_func = request_func or urllib.request.urlopen
+        self.sleep_func = sleep_func or time.sleep
 
     def is_available(self):
         """只检查必要配置，不发起网络请求。"""
@@ -390,22 +392,38 @@ class StepAudioTranscriber:
                 ),
             )
 
-        try:
-            request = _build_stepaudio_request(audio_path, self.config)
-            with self.request_func(request, timeout=self.config.timeout) as response:
-                response_body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            return VideoTranscriptionResult(
-                success=False,
-                chunks=[],
-                error=f"StepAudio request failed: HTTP {exc.code}: {_read_http_error(exc)}",
-            )
-        except (OSError, urllib.error.URLError) as exc:
-            return VideoTranscriptionResult(
-                success=False,
-                chunks=[],
-                error=f"StepAudio request failed: {exc}",
-            )
+        response_body = None
+        attempts = max(1, int(self.config.retry_attempts))
+        for attempt_index in range(attempts):
+            try:
+                request = _build_stepaudio_request(audio_path, self.config)
+                with self.request_func(request, timeout=self.config.timeout) as response:
+                    response_body = response.read().decode("utf-8")
+                break
+            except urllib.error.HTTPError as exc:
+                reason = f"HTTP {exc.code}: {_read_http_error(exc)}"
+                if not _is_retryable_http_status(exc.code):
+                    return VideoTranscriptionResult(
+                        success=False,
+                        chunks=[],
+                        error=f"StepAudio request failed: {reason}",
+                    )
+                if attempt_index == attempts - 1:
+                    return VideoTranscriptionResult(
+                        success=False,
+                        chunks=[],
+                        error=f"StepAudio {shard_label} request failed after {attempts} attempts: {reason}",
+                    )
+                self._sleep_before_retry(attempt_index)
+            except (TimeoutError, OSError, urllib.error.URLError) as exc:
+                reason = str(exc)
+                if attempt_index == attempts - 1:
+                    return VideoTranscriptionResult(
+                        success=False,
+                        chunks=[],
+                        error=f"StepAudio {shard_label} request failed after {attempts} attempts: {reason}",
+                    )
+                self._sleep_before_retry(attempt_index)
 
         try:
             payload = json.loads(response_body)
@@ -433,6 +451,11 @@ class StepAudioTranscriber:
             )
 
         return VideoTranscriptionResult(success=True, chunks=chunks)
+
+    def _sleep_before_retry(self, attempt_index):
+        backoff = max(0.0, float(self.config.retry_backoff_seconds))
+        if backoff > 0:
+            self.sleep_func(backoff * (attempt_index + 1))
 
 
 def create_transcriber(config=None):
@@ -966,6 +989,10 @@ def _sanitize_multipart_filename(file_name):
 def _sanitize_audio_format(audio_format):
     sanitized = re.sub(r"[^A-Za-z0-9]", "", str(audio_format).lower())
     return sanitized or "wav"
+
+
+def _is_retryable_http_status(status_code):
+    return int(status_code) == 429 or int(status_code) >= 500
 
 
 def _format_ffmpeg_seconds(seconds):
