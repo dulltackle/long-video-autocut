@@ -12,11 +12,19 @@ def build_plan(
     warnings=None,
     status="unreviewed",
     review_provider=None,
+    config=None,
+    dry_run=False,
 ):
     """构造可被调度器读取的拆条方案。"""
+    config = config or {}
+    export_mode = _export_mode(status, config)
     return {
         "source_video": os.path.basename(source_video),
         "status": status,
+        "export_mode": export_mode,
+        "publish_ready_threshold": config.get("topic_review_publish_ready_threshold"),
+        "export_count": len(selected),
+        "skipped_count": max(0, len(candidates) - len(selected)),
         "context": {
             "loaded": course_context is not None,
             "summary": course_context.summary() if course_context is not None else {},
@@ -24,6 +32,7 @@ def build_plan(
         "review_provider": review_provider or {},
         "candidates": [_candidate_payload(candidate) for candidate in candidates],
         "selected": [_candidate_payload(candidate) for candidate in selected],
+        "exports": [_planned_export_payload(candidate, index, dry_run) for index, candidate in enumerate(selected, 1)],
         "warnings": list(warnings or []),
     }
 
@@ -37,6 +46,8 @@ def write_plan(
     warnings=None,
     status="unreviewed",
     review_provider=None,
+    config=None,
+    dry_run=False,
 ):
     """写出 plan.json 并返回路径。"""
     os.makedirs(output_dir, exist_ok=True)
@@ -51,6 +62,8 @@ def write_plan(
                 warnings,
                 status=status,
                 review_provider=review_provider,
+                config=config,
+                dry_run=dry_run,
             ),
             plan_file,
             ensure_ascii=False,
@@ -77,6 +90,8 @@ def _candidate_payload(candidate):
     }
     if candidate.review is not None:
         payload["review"] = _review_payload(candidate.review)
+    if candidate.export_selection is not None:
+        payload["export_selection"] = _export_selection_payload(candidate.export_selection)
     return payload
 
 
@@ -94,4 +109,55 @@ def _review_payload(review):
         "needs_human_review": review.needs_human_review,
         "reject_reason": review.reject_reason,
         "boundary_fix_suggestion": review.boundary_fix_suggestion,
+        "boundary_fix_start": review.boundary_fix_start,
+        "boundary_fix_end": review.boundary_fix_end,
     }
+
+
+def _export_mode(status, config):
+    if status == "reviewed":
+        return "reviewed_publish_ready"
+    if config.get("allow_unreviewed_export", False):
+        return "unreviewed_compatibility"
+    return "unreviewed_no_export"
+
+
+def _planned_export_payload(candidate, export_index, dry_run):
+    title = candidate.title or f"直播片段_{export_index:03d}"
+    filename_base = f"{export_index:03d}_{_safe_filename(title)}"
+    return {
+        "export_index": export_index,
+        "candidate_index": candidate.index,
+        "title": title,
+        "video_path": f"clips/{filename_base}.mp4",
+        "subtitle_path": f"subtitles/{filename_base}.srt",
+        "generated": False,
+        "dry_run": bool(dry_run),
+    }
+
+
+def _export_selection_payload(selection):
+    return {
+        "candidate_index": selection.candidate_index,
+        "selected_for_export": selection.selected_for_export,
+        "decision": selection.decision,
+        "reason": selection.reason,
+        "review_status": selection.review_status,
+        "publish_ready_score": selection.publish_ready_score,
+        "export_rank": selection.export_rank,
+        "original_start": selection.original_start,
+        "original_end": selection.original_end,
+        "final_start": selection.final_start,
+        "final_end": selection.final_end,
+        "topic_name": selection.topic_name,
+        "needs_human_review": selection.needs_human_review,
+        "boundary_fix_suggestion": selection.boundary_fix_suggestion,
+        "boundary_fix_applied": selection.boundary_fix_applied,
+        "series_key": selection.series_key,
+    }
+
+
+def _safe_filename(value):
+    safe = "".join("_" if char in '\\/:*?"<>|' else char for char in str(value))
+    safe = "_".join(safe.split()).strip("._ ")
+    return (safe or "直播片段")[:48]

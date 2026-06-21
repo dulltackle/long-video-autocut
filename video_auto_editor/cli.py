@@ -225,6 +225,8 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
         warnings,
         status=review_status,
         review_provider=review_provider,
+        config=config,
+        dry_run=dry_run,
     )
     print(f"   📄 Plan: {plan_path}")
 
@@ -235,7 +237,16 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
         print("\n✂️  Step 8: No selected live clips; skipping export")
     else:
         print("\n✂️  Step 8: Exporting live clips...")
-        exports = export_live_clips(video_path, selected, transcript_result.chunks, output_dir, config)
+        exports = export_live_clips(
+            video_path,
+            selected,
+            transcript_result.chunks,
+            output_dir,
+            config,
+            candidates=candidates,
+            review_status=review_status,
+            review_provider=review_provider,
+        )
         if exports is None:
             print("   ❌ Failed to export live clips")
             return None

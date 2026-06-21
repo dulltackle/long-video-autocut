@@ -1,7 +1,8 @@
 import json
 
 from video_auto_editor.context import CourseContext
-from video_auto_editor.models import ClipCandidate, TopicReviewResult
+from video_auto_editor.config import CONFIG
+from video_auto_editor.models import ClipCandidate, LiveExportDecision, TopicReviewResult
 from video_auto_editor.plan import build_plan, write_plan
 
 
@@ -28,6 +29,9 @@ def test_build_plan_contains_unreviewed_status_and_context_summary():
 
     assert payload["source_video"] == "live.mp4"
     assert payload["status"] == "unreviewed"
+    assert payload["export_mode"] == "unreviewed_no_export"
+    assert payload["export_count"] == 1
+    assert payload["skipped_count"] == 0
     assert payload["context"]["loaded"] is True
     assert payload["context"]["summary"]["known_fields"] == ["course_title", "priority_topics"]
     assert payload["candidates"][0]["score"] == 93
@@ -90,5 +94,52 @@ def test_build_plan_writes_structured_review_payload():
         "needs_human_review": False,
         "reject_reason": "",
         "boundary_fix_suggestion": "",
+        "boundary_fix_start": None,
+        "boundary_fix_end": None,
     }
     assert payload["selected"][0]["review"] == review
+
+
+def test_build_plan_writes_export_selection_and_exports():
+    candidate = make_candidate()
+    candidate.export_selection = LiveExportDecision(
+        candidate_index=0,
+        selected_for_export=True,
+        decision="export",
+        reason="publish_ready",
+        review_status="reviewed",
+        publish_ready_score=91,
+        export_rank=1,
+        original_start=10,
+        original_end=70,
+        final_start=12,
+        final_end=68,
+        topic_name="剪辑方法",
+        series_key="topic-123",
+    )
+
+    payload = build_plan(
+        "live.mp4",
+        None,
+        [candidate],
+        [candidate],
+        status="reviewed",
+        config={**CONFIG, "topic_review_publish_ready_threshold": 85},
+        dry_run=True,
+    )
+
+    assert payload["export_mode"] == "reviewed_publish_ready"
+    assert payload["publish_ready_threshold"] == 85
+    assert payload["candidates"][0]["export_selection"]["reason"] == "publish_ready"
+    assert payload["candidates"][0]["export_selection"]["final_start"] == 12
+    assert payload["exports"] == [
+        {
+            "export_index": 1,
+            "candidate_index": 0,
+            "title": "候选标题",
+            "video_path": "clips/001_候选标题.mp4",
+            "subtitle_path": "subtitles/001_候选标题.srt",
+            "generated": False,
+            "dry_run": True,
+        }
+    ]

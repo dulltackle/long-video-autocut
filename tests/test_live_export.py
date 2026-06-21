@@ -64,10 +64,14 @@ def test_export_live_clips_writes_safe_paths_metadata_and_shifted_srt(monkeypatc
 
     metadata = json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["source_video"] == "live.mp4"
+    assert metadata["generated_at"]
+    assert metadata["status"] == "reviewed"
+    assert metadata["export_count"] == 1
     assert metadata["clips"][0]["output_path"] == "clips/001_坏_标题_A.mp4"
     assert metadata["clips"][0]["subtitle_path"] == "subtitles/001_坏_标题_A.srt"
     assert metadata["clips"][0]["score"] == 93
     assert metadata["clips"][0]["keywords"] == ["直播", "文本"]
+    assert metadata["exports"] == metadata["clips"]
 
     assert (tmp_path / "subtitles" / "001_坏_标题_A.srt").read_text(encoding="utf-8") == (
         "1\n"
@@ -120,6 +124,62 @@ def test_export_live_clips_carries_selection_boundary_and_series(monkeypatch, tm
     assert result[0].final_end == 22
     assert result[0].boundary_fix_applied is True
     assert result[0].series_key == "topic-abc"
+
+    metadata = json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["clips"][0]["topic_name"] == "主题 A"
+    assert metadata["clips"][0]["original_start"] == 10
+    assert metadata["clips"][0]["final_start"] == 12
+    assert metadata["clips"][0]["series_key"] == "topic-abc"
+
+
+def test_export_live_clips_writes_not_exported_and_human_review_summary(monkeypatch, tmp_path):
+    def fake_clip(video_path, candidate, output_path, config=None):
+        Path(output_path).write_text("clip", encoding="utf-8")
+        return True
+
+    selected = make_named_candidate(0, "第一条")
+    selected.export_selection = LiveExportDecision(
+        candidate_index=0,
+        selected_for_export=True,
+        decision="export",
+        reason="publish_ready",
+        review_status="reviewed",
+        topic_name="主题 A",
+        series_key="topic-a",
+    )
+    rejected = make_named_candidate(1, "第二条")
+    rejected.export_selection = LiveExportDecision(
+        candidate_index=1,
+        selected_for_export=False,
+        decision="skip",
+        reason="boundary_fix_needs_human_review",
+        review_status="reviewed",
+        publish_ready_score=88,
+        topic_name="主题 A",
+        boundary_fix_suggestion="建议向后补足结束句。",
+        series_key="topic-a",
+    )
+
+    monkeypatch.setattr(export, "clip_segment", fake_clip)
+
+    export.export_live_clips(
+        "live.mp4",
+        [selected],
+        [],
+        str(tmp_path),
+        live_config(topic_review_publish_ready_threshold=85),
+        candidates=[selected, rejected],
+        review_status="reviewed",
+        review_provider={"provider": "fake"},
+    )
+
+    metadata = json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["review_provider"] == {"provider": "fake"}
+    assert metadata["publish_ready_threshold"] == 85
+    assert metadata["not_exported_count"] == 1
+    assert metadata["not_exported"][0]["reason"] == "boundary_fix_needs_human_review"
+    assert metadata["not_exported"][0]["boundary_fix_suggestion"] == "建议向后补足结束句。"
+    assert metadata["human_review"] == metadata["not_exported"]
 
 
 def test_export_live_clips_returns_none_and_skips_metadata_on_clip_failure(monkeypatch, tmp_path):
