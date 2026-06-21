@@ -84,6 +84,10 @@
 - 增强 `拆条报告.md`，列出导出清单、未导出候选、淘汰原因和人工复核项。
 - dry-run 输出完整拆条方案但不裁剪视频。
 
+第五批完成后，`live` 非 dry-run 默认只导出主题评审判定为发布就绪的候选；`--max-clips` 仅作为用户显式上限。主题评审失败、关闭或不可用时，CLI 默认不导出短视频，只输出未评审方案和 warning；显式 `--allow-unreviewed-export` 时才允许未评审兼容导出。`plan.json`、`metadata.json` 和 `拆条报告.md` 需要共同表达导出清单、未导出原因、人工复核项、边界补救建议和同主题系列。
+
+详细任务、验收标准与提交点见 [第五批：导出选择与标准交付物闭环](./implementation-batch-5-export-deliverables.md)。第五批要求每完成一个小任务并通过对应验证后立即进行一次 git commit，并必须建立 reviewed `live` 非 dry-run 最小端到端测试闭环。
+
 ### 6. skill 调度器
 
 目标：创建薄调度器 skill，围绕 CLI 底座提供面向用户的协作流程。
@@ -103,7 +107,8 @@
 - [第二批：ASR 抽象与最小 live dry-run 闭环](./implementation-batch-2-asr-foundation.md)
 - [第三批：StepAudio 分片识别与缓存闭环](./implementation-batch-3-stepaudio-sharding.md)
 - [第四批：主题评审与最小 reviewed dry-run 闭环](./implementation-batch-4-topic-review.md)
+- [第五批：导出选择与标准交付物闭环](./implementation-batch-5-export-deliverables.md)
 
 ## 提交节奏
 
-每一批都应拆成多个小提交，按“独立可测试能力”提交，而不是等整批完成后一次性提交。第一批的具体提交点见 [第一批执行方案](./implementation-batch-1-cli-foundation.md#建议提交点)，第二批的具体提交点见 [第二批执行方案](./implementation-batch-2-asr-foundation.md)，第三批的具体提交点见 [第三批执行方案](./implementation-batch-3-stepaudio-sharding.md)，第四批的具体提交点见 [第四批执行方案](./implementation-batch-4-topic-review.md)。第三批和第四批执行时，每完成一个小任务并通过对应验证命令后，必须立即进行一次 git commit。
+每一批都应拆成多个小提交，按“独立可测试能力”提交，而不是等整批完成后一次性提交。第一批的具体提交点见 [第一批执行方案](./implementation-batch-1-cli-foundation.md#建议提交点)，第二批的具体提交点见 [第二批执行方案](./implementation-batch-2-asr-foundation.md)，第三批的具体提交点见 [第三批执行方案](./implementation-batch-3-stepaudio-sharding.md)，第四批的具体提交点见 [第四批执行方案](./implementation-batch-4-topic-review.md)，第五批的具体提交点见 [第五批执行方案](./implementation-batch-5-export-deliverables.md)。第三批、第四批和第五批执行时，每完成一个小任务并通过对应验证命令后，必须立即进行一次 git commit。
