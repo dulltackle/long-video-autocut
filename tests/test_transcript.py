@@ -856,6 +856,45 @@ def test_stepaudio_transcribe_video_offsets_and_sorts_shard_chunks(monkeypatch, 
     assert len(calls) == 3
 
 
+def test_stepaudio_transcribe_video_merges_overlapping_shard_chunks(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+    install_stepaudio_media_success(monkeypatch, duration="40.0")
+    responses = [
+        '{"segments": [{"start": 0, "end": 25, "text": "第一段"}]}',
+        '{"segments": [{"start": 0, "end": 15, "text": "第一段"}, {"start": 14, "end": 20, "text": "第二段"}]}',
+    ]
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return self.body.encode("utf-8")
+
+    def fake_request(request, timeout):
+        calls.append(request)
+        return FakeResponse(responses[len(calls) - 1])
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", shard_seconds=20),
+        request_func=fake_request,
+    )
+
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+
+    assert result.success is True
+    assert result.chunks == [TranscriptChunk(0, 40, "第一段 第二段")]
+    assert len(calls) == 2
+
+
 def test_stepaudio_shard_cache_reuses_chunks_when_overall_cache_missing(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_bytes(b"video")
@@ -912,6 +951,38 @@ def test_stepaudio_shard_cache_reuses_chunks_when_overall_cache_missing(monkeypa
     assert second.from_cache is False
     assert second.chunks == first.chunks
     assert len(calls) == 3
+
+
+def test_stepaudio_shard_cache_signature_quantizes_time_to_milliseconds(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+    cache_path = tmp_path / "work" / "asr_shard_cache" / "shard_0000.json"
+    saved_shard = AudioShard(
+        index=0,
+        start=0.1 + 0.2,
+        end=60.0004,
+        audio_path=str(tmp_path / "work" / "asr_shards" / "shard_0000.wav"),
+        cache_path=str(cache_path),
+    )
+    loaded_shard = AudioShard(
+        index=0,
+        start=0.3,
+        end=60.0,
+        audio_path=saved_shard.audio_path,
+        cache_path=str(cache_path),
+    )
+    config = StepAudioConfig(api_key="test-key")
+
+    transcript.save_stepaudio_shard_cache(
+        str(video_path),
+        saved_shard,
+        [TranscriptChunk(0, 5, "缓存文本")],
+        config,
+    )
+
+    assert transcript.load_stepaudio_shard_cache(str(video_path), loaded_shard, config) == [
+        TranscriptChunk(0, 5, "缓存文本")
+    ]
 
 
 def test_stepaudio_corrupted_shard_cache_only_retries_that_shard(monkeypatch, tmp_path):
@@ -1054,6 +1125,28 @@ def test_stepaudio_non_retryable_invalid_json_does_not_retry(tmp_path):
     assert result.success is False
     assert "StepAudio response is not valid JSON" in result.error
     assert len(calls) == 1
+
+
+def test_stepaudio_local_file_read_error_does_not_retry(monkeypatch, tmp_path):
+    audio_path = tmp_path / "shard.wav"
+    audio_path.write_bytes(b"audio")
+    calls = []
+
+    def fail_build_request(audio_path_arg, config):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(transcript, "_build_stepaudio_request", fail_build_request)
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", retry_attempts=3),
+        request_func=lambda *args, **kwargs: calls.append(args),
+    )
+
+    result = transcriber.transcribe_audio_shard(str(audio_path), shard_index=0)
+
+    assert result.success is False
+    assert result.error == "StepAudio cannot read shard 0 audio file: permission denied"
+    assert calls == []
 
 
 def test_stepaudio_shard_cache_invalidates_when_audio_config_changes(monkeypatch, tmp_path):

@@ -332,6 +332,7 @@ class StepAudioTranscriber:
                 )
 
         chunks.sort(key=lambda chunk: (chunk.start, chunk.end, chunk.text))
+        chunks = _merge_overlapping_chunks(chunks)
 
         with open(transcript_path, "w", encoding="utf-8") as transcript_file:
             json.dump(
@@ -394,9 +395,17 @@ class StepAudioTranscriber:
 
         response_body = None
         attempts = max(1, int(self.config.retry_attempts))
+        try:
+            request = _build_stepaudio_request(audio_path, self.config)
+        except OSError as exc:
+            return VideoTranscriptionResult(
+                success=False,
+                chunks=[],
+                error=f"StepAudio cannot read {shard_label} audio file: {exc}",
+            )
+
         for attempt_index in range(attempts):
             try:
-                request = _build_stepaudio_request(audio_path, self.config)
                 with self.request_func(request, timeout=self.config.timeout) as response:
                     response_body = response.read().decode("utf-8")
                 break
@@ -415,7 +424,7 @@ class StepAudioTranscriber:
                         error=f"StepAudio {shard_label} request failed after {attempts} attempts: {reason}",
                     )
                 self._sleep_before_retry(attempt_index)
-            except (TimeoutError, OSError, urllib.error.URLError) as exc:
+            except (TimeoutError, ConnectionError, urllib.error.URLError) as exc:
                 reason = str(exc)
                 if attempt_index == attempts - 1:
                     return VideoTranscriptionResult(
@@ -842,6 +851,34 @@ def _offset_shard_chunks(shard, chunks):
     return offset_chunks
 
 
+def _merge_overlapping_chunks(chunks):
+    merged = []
+    for chunk in chunks:
+        if not merged or chunk.start >= merged[-1].end:
+            merged.append(chunk)
+            continue
+
+        previous = merged[-1]
+        merged[-1] = TranscriptChunk(
+            start=previous.start,
+            end=max(previous.end, chunk.end),
+            text=_merge_chunk_text(previous.text, chunk.text),
+        )
+    return merged
+
+
+def _merge_chunk_text(left, right):
+    left = str(left).strip()
+    right = str(right).strip()
+    if not left:
+        return right
+    if not right or right == left or right in left:
+        return left
+    if left in right:
+        return right
+    return f"{left} {right}"
+
+
 def _extract_stepaudio_segments(payload):
     if isinstance(payload, list):
         return payload
@@ -907,12 +944,16 @@ def _stepaudio_shard_cache_signature(config, shard):
         "provider": "stepaudio",
         "model": str(config.model),
         "language": str(config.language),
-        "shard_start": shard.start,
-        "shard_end": shard.end,
+        "shard_start_ms": _cache_time_milliseconds(shard.start),
+        "shard_end_ms": _cache_time_milliseconds(shard.end),
         "audio_sample_rate": int(config.audio_sample_rate),
         "audio_channels": int(config.audio_channels),
         "audio_format": _sanitize_audio_format(config.audio_format),
     }
+
+
+def _cache_time_milliseconds(seconds):
+    return int(round(float(seconds) * 1000))
 
 
 def _format_srt_time(seconds):
