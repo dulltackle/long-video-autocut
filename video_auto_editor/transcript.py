@@ -307,7 +307,17 @@ class StepAudioTranscriber:
             if not result.success:
                 result.transcript_path = transcript_path
                 return result
-            chunks.extend(result.chunks)
+            try:
+                chunks.extend(_offset_shard_chunks(shard, result.chunks))
+            except ValueError as exc:
+                return VideoTranscriptionResult(
+                    success=False,
+                    chunks=[],
+                    transcript_path=transcript_path,
+                    error=str(exc),
+                )
+
+        chunks.sort(key=lambda chunk: (chunk.start, chunk.end, chunk.text))
 
         with open(transcript_path, "w", encoding="utf-8") as transcript_file:
             json.dump(
@@ -733,6 +743,27 @@ def _build_audio_shard_plan(duration, work_dir, config):
         index += 1
         start = end
     return shards
+
+
+def _offset_shard_chunks(shard, chunks):
+    offset_chunks = []
+    for chunk in chunks:
+        text = str(chunk.text).strip()
+        if not text:
+            continue
+        if chunk.end < chunk.start:
+            raise ValueError(
+                f"StepAudio shard {shard.index} returned invalid timestamp: "
+                f"{chunk.start:g}-{chunk.end:g}"
+            )
+        offset_chunks.append(
+            TranscriptChunk(
+                start=shard.start + chunk.start,
+                end=shard.start + chunk.end,
+                text=text,
+            )
+        )
+    return offset_chunks
 
 
 def _extract_stepaudio_segments(payload):

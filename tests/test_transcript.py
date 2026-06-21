@@ -812,6 +812,77 @@ def test_stepaudio_transcribe_video_converts_success_response(monkeypatch, tmp_p
     assert b"audio" in body
 
 
+def test_stepaudio_transcribe_video_offsets_and_sorts_shard_chunks(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+    install_stepaudio_media_success(monkeypatch, duration="70.0")
+    responses = [
+        '{"segments": [{"start": 5, "end": 10, "text": " 第一段 "}]}',
+        '{"segments": [{"start": 0, "end": 30, "text": "第二段"}]}',
+        '{"segments": [{"start": 0, "end": 5, "text": "第三段"}]}',
+    ]
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return self.body.encode("utf-8")
+
+    def fake_request(request, timeout):
+        calls.append(request)
+        return FakeResponse(responses[len(calls) - 1])
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", shard_seconds=30),
+        request_func=fake_request,
+    )
+
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+
+    assert result.success is True
+    assert result.chunks == [
+        TranscriptChunk(5, 10, "第一段"),
+        TranscriptChunk(30, 60, "第二段"),
+        TranscriptChunk(60, 65, "第三段"),
+    ]
+    assert len(calls) == 3
+
+
+def test_stepaudio_transcribe_video_rejects_invalid_shard_timestamp(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+    install_stepaudio_media_success(monkeypatch, duration="10.0")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return '{"segments": [{"start": 10, "end": 5, "text": "坏时间戳"}]}'.encode("utf-8")
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key"),
+        request_func=lambda *args, **kwargs: FakeResponse(),
+    )
+
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+
+    assert result.success is False
+    assert result.chunks == []
+    assert result.error == "StepAudio shard 0 returned invalid timestamp: 10-5"
+
+
 def test_stepaudio_transcribe_video_rejects_oversized_shard_without_request(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_bytes(b"video")
