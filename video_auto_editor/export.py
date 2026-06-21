@@ -24,6 +24,7 @@ def export_live_clips(video_path, selected, chunks, output_dir, config=None):
             os.makedirs(subtitles_dir, exist_ok=True)
 
         for output_index, candidate in enumerate(selected, 1):
+            selection = candidate.export_selection
             filename_base = f"{output_index:03d}_{_safe_filename(candidate.title or f'直播片段_{output_index:03d}')}"
             output_path = os.path.join(clips_dir, f"{filename_base}.mp4")
             if not clip_segment(video_path, candidate, output_path, config):
@@ -52,6 +53,18 @@ def export_live_clips(video_path, selected, chunks, output_dir, config=None):
                     subtitle_path=subtitle_path,
                     summary=candidate.summary,
                     keywords=list(candidate.keywords),
+                    topic_name=selection.topic_name if selection else "",
+                    publish_ready_score=selection.publish_ready_score if selection else None,
+                    export_decision=selection.decision if selection else "",
+                    decision_reason=selection.reason if selection else "",
+                    original_start=selection.original_start if selection else candidate.start_time,
+                    original_end=selection.original_end if selection else candidate.end_time,
+                    final_start=selection.final_start if selection else candidate.start_time,
+                    final_end=selection.final_end if selection else candidate.end_time,
+                    boundary_fix_applied=selection.boundary_fix_applied if selection else False,
+                    boundary_fix_suggestion=selection.boundary_fix_suggestion if selection else "",
+                    series_key=selection.series_key if selection else "",
+                    needs_human_review=selection.needs_human_review if selection else False,
                 )
             )
 

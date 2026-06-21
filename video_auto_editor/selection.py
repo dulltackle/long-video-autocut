@@ -1,5 +1,7 @@
 """候选片段选择策略。"""
 
+import hashlib
+
 from video_auto_editor.config import CONFIG
 from video_auto_editor.models import LiveExportDecision
 
@@ -105,6 +107,9 @@ def _select_reviewed_live_exports(candidates, max_clips, config):
     for candidate in candidates:
         rejection_reason = _reviewed_rejection_reason(candidate, config)
         if candidate.index in selected_indexes:
+            original_start = candidate.start_time
+            original_end = candidate.end_time
+            _apply_final_boundary(candidate)
             decision = _decision_payload(
                 candidate,
                 True,
@@ -112,6 +117,8 @@ def _select_reviewed_live_exports(candidates, max_clips, config):
                 "publish_ready",
                 "reviewed",
                 export_rank=rank_by_index[candidate.index],
+                original_start=original_start,
+                original_end=original_end,
             )
         elif rejection_reason is None:
             decision = _decision_payload(candidate, False, "skip", "max_clips_limit", "reviewed")
@@ -153,6 +160,8 @@ def _reviewed_rejection_reason(candidate, config):
         return "missing_review"
     if review.needs_human_review:
         return "needs_human_review"
+    if review.boundary_fix_suggestion and not _has_explicit_boundary_fix(review):
+        return "boundary_fix_needs_human_review"
     threshold = int(config.get("topic_review_publish_ready_threshold", 80))
     if int(review.publish_ready_score) < threshold:
         return "publish_ready_score_below_threshold"
@@ -170,8 +179,36 @@ def _reviewed_quality_key(candidate):
     return (ready_score, live_score, candidate.base_score, candidate.duration, -candidate.index)
 
 
-def _decision_payload(candidate, selected, decision, reason, review_status, export_rank=None):
+def _apply_final_boundary(candidate):
     review = candidate.review
+    if review is None or not _has_explicit_boundary_fix(review):
+        return
+    final_start = float(review.boundary_fix_start)
+    final_end = float(review.boundary_fix_end)
+    if final_start < 0 or final_end <= final_start:
+        return
+    candidate.start_time = final_start
+    candidate.end_time = final_end
+    candidate.duration = final_end - final_start
+
+
+def _has_explicit_boundary_fix(review):
+    return review.boundary_fix_start is not None and review.boundary_fix_end is not None
+
+
+def _decision_payload(
+    candidate,
+    selected,
+    decision,
+    reason,
+    review_status,
+    export_rank=None,
+    original_start=None,
+    original_end=None,
+):
+    review = candidate.review
+    boundary_fix_applied = bool(review is not None and _has_explicit_boundary_fix(review) and selected)
+    topic_name = review.topic_name if review is not None else ""
     return LiveExportDecision(
         candidate_index=candidate.index,
         selected_for_export=selected,
@@ -180,14 +217,24 @@ def _decision_payload(candidate, selected, decision, reason, review_status, expo
         review_status=review_status,
         publish_ready_score=int(review.publish_ready_score) if review is not None else None,
         export_rank=export_rank,
-        original_start=candidate.start_time,
-        original_end=candidate.end_time,
+        original_start=candidate.start_time if original_start is None else original_start,
+        original_end=candidate.end_time if original_end is None else original_end,
         final_start=candidate.start_time,
         final_end=candidate.end_time,
-        topic_name=review.topic_name if review is not None else "",
+        topic_name=topic_name,
         needs_human_review=bool(review.needs_human_review) if review is not None else False,
         boundary_fix_suggestion=review.boundary_fix_suggestion if review is not None else "",
+        boundary_fix_applied=boundary_fix_applied,
+        series_key=_series_key(topic_name),
     )
+
+
+def _series_key(topic_name):
+    normalized = str(topic_name or "").strip()
+    if not normalized:
+        return ""
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
+    return f"topic-{digest}"
 
 
 def _live_score_key(candidate):

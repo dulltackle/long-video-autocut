@@ -3,7 +3,7 @@ from pathlib import Path
 
 from video_auto_editor import export
 from video_auto_editor.config import CONFIG
-from video_auto_editor.models import ClipCandidate, LiveClipInfo, TranscriptChunk
+from video_auto_editor.models import ClipCandidate, LiveClipInfo, LiveExportDecision, TranscriptChunk
 
 
 def live_config(**overrides):
@@ -77,6 +77,49 @@ def test_export_live_clips_writes_safe_paths_metadata_and_shifted_srt(monkeypatc
         "00:00:10,000 --> 00:00:14,000\n"
         "片尾\n\n"
     )
+
+
+def test_export_live_clips_carries_selection_boundary_and_series(monkeypatch, tmp_path):
+    def fake_clip(video_path, candidate, output_path, config=None):
+        Path(output_path).write_text("clip", encoding="utf-8")
+        return True
+
+    candidate = make_candidate()
+    candidate.start_time = 12
+    candidate.end_time = 22
+    candidate.duration = 10
+    candidate.export_selection = LiveExportDecision(
+        candidate_index=0,
+        selected_for_export=True,
+        decision="export",
+        reason="publish_ready",
+        review_status="reviewed",
+        publish_ready_score=91,
+        export_rank=1,
+        original_start=10,
+        original_end=20,
+        final_start=12,
+        final_end=22,
+        topic_name="主题 A",
+        boundary_fix_applied=True,
+        boundary_fix_suggestion="使用明确字段修正边界。",
+        series_key="topic-abc",
+    )
+
+    monkeypatch.setattr(export, "clip_segment", fake_clip)
+
+    result = export.export_live_clips("live.mp4", [candidate], [], str(tmp_path), live_config())
+
+    assert result[0].topic_name == "主题 A"
+    assert result[0].publish_ready_score == 91
+    assert result[0].export_decision == "export"
+    assert result[0].decision_reason == "publish_ready"
+    assert result[0].original_start == 10
+    assert result[0].original_end == 20
+    assert result[0].final_start == 12
+    assert result[0].final_end == 22
+    assert result[0].boundary_fix_applied is True
+    assert result[0].series_key == "topic-abc"
 
 
 def test_export_live_clips_returns_none_and_skips_metadata_on_clip_failure(monkeypatch, tmp_path):

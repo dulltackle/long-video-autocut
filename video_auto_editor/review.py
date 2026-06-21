@@ -306,6 +306,8 @@ def _parse_review_payload(payload, requested_ids):
             needs_human_review=bool(item["needs_human_review"]),
             reject_reason=str(item["reject_reason"]),
             boundary_fix_suggestion=str(item["boundary_fix_suggestion"]),
+            boundary_fix_start=_optional_float(item.get("boundary_fix_start"), "boundary_fix_start"),
+            boundary_fix_end=_optional_float(item.get("boundary_fix_end"), "boundary_fix_end"),
         )
 
     missing_ids = [candidate_id for candidate_id in requested_ids if requested_ids[candidate_id] not in reviews]
@@ -360,6 +362,15 @@ def _bounded_int(value, field_name, minimum, maximum):
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Topic review field {field_name} must be an integer") from exc
     return max(minimum, min(maximum, parsed))
+
+
+def _optional_float(value, field_name):
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Topic review field {field_name} must be a number") from exc
 
 
 def _validate_https_base_url(base_url):

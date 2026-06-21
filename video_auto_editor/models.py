@@ -29,6 +29,8 @@ class TopicReviewResult:
     needs_human_review: bool = False
     reject_reason: str = ""
     boundary_fix_suggestion: str = ""
+    boundary_fix_start: Optional[float] = None
+    boundary_fix_end: Optional[float] = None
 
 
 @dataclass
@@ -91,6 +93,18 @@ class LiveClipInfo:
     subtitle_path: str = ""
     summary: str = ""
     keywords: List[str] = field(default_factory=list)
+    topic_name: str = ""
+    publish_ready_score: Optional[int] = None
+    export_decision: str = ""
+    decision_reason: str = ""
+    original_start: float = 0.0
+    original_end: float = 0.0
+    final_start: float = 0.0
+    final_end: float = 0.0
+    boundary_fix_applied: bool = False
+    boundary_fix_suggestion: str = ""
+    series_key: str = ""
+    needs_human_review: bool = False
 
 
 @dataclass

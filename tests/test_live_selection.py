@@ -81,6 +81,9 @@ def review(
     complete=True,
     human=False,
     topic="主题",
+    suggestion="",
+    boundary_start=None,
+    boundary_end=None,
 ):
     return TopicReviewResult(
         topic_name=topic,
@@ -94,7 +97,9 @@ def review(
         keywords=[topic],
         needs_human_review=human,
         reject_reason="",
-        boundary_fix_suggestion="",
+        boundary_fix_suggestion=suggestion,
+        boundary_fix_start=boundary_start,
+        boundary_fix_end=boundary_end,
     )
 
 
@@ -207,3 +212,52 @@ def test_select_live_exports_preserves_unreviewed_compatibility_when_allowed():
         1: "legacy_score_selection",
     }
     assert decisions[1].selected_for_export is True
+
+
+def test_select_live_exports_applies_explicit_boundary_fix():
+    candidate = make_candidate(0, 10, 70, adjusted=90)
+    candidate.review = review(boundary_start=12.5, boundary_end=68.0)
+
+    selected, decisions = select_live_exports([candidate], None, live_config(), review_status="reviewed")
+
+    assert selected == [candidate]
+    assert candidate.start_time == 12.5
+    assert candidate.end_time == 68.0
+    assert candidate.duration == 55.5
+    assert decisions[0].original_start == 10
+    assert decisions[0].original_end == 70
+    assert decisions[0].final_start == 12.5
+    assert decisions[0].final_end == 68.0
+    assert decisions[0].boundary_fix_applied is True
+
+
+def test_select_live_exports_does_not_parse_natural_language_boundary_suggestion():
+    candidate = make_candidate(0, 10, 70, adjusted=90)
+    candidate.review = review(suggestion="建议向后补足结束句到 75 秒。")
+
+    selected, decisions = select_live_exports([candidate], None, live_config(), review_status="reviewed")
+
+    assert selected == []
+    assert candidate.start_time == 10
+    assert candidate.end_time == 70
+    assert decisions[0].reason == "boundary_fix_needs_human_review"
+    assert decisions[0].boundary_fix_suggestion == "建议向后补足结束句到 75 秒。"
+    assert decisions[0].boundary_fix_applied is False
+
+
+def test_select_live_exports_assigns_stable_series_key_by_topic_name():
+    candidates = [
+        make_candidate(0, 0, 10, adjusted=90),
+        make_candidate(1, 20, 30, adjusted=89),
+        make_candidate(2, 40, 50, adjusted=88),
+    ]
+    candidates[0].review = review(topic="同一主题")
+    candidates[1].review = review(topic="同一主题")
+    candidates[2].review = review(topic="另一主题")
+
+    _, decisions = select_live_exports(candidates, None, live_config(), review_status="reviewed")
+    series_by_index = {decision.candidate_index: decision.series_key for decision in decisions}
+
+    assert series_by_index[0]
+    assert series_by_index[0] == series_by_index[1]
+    assert series_by_index[0] != series_by_index[2]
