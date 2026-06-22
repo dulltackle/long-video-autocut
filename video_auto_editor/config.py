@@ -1,4 +1,6 @@
-"""全局默认配置。"""
+"""全局默认配置与配置文件加载。"""
+
+import json
 
 CONFIG = {
     "silence_noise": -30,
@@ -59,3 +61,60 @@ CONFIG = {
     "whisper_sample_rate": 16000,
     "whisper_channels": 1,
 }
+
+
+def load_config_file(path, base_config=None):
+    """读取并校验 JSON 配置文件，返回覆盖项。"""
+    base_config = base_config or CONFIG
+    try:
+        with open(path, "r", encoding="utf-8") as config_file:
+            payload = json.load(config_file)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"配置文件 {path} 必须是合法 JSON：{exc.msg}") from exc
+    except OSError as exc:
+        raise ValueError(f"无法读取配置文件 {path}：{exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"配置文件 {path} 必须是 JSON object")
+
+    for key, value in payload.items():
+        if key not in base_config:
+            raise ValueError(f"配置文件 {path} 包含未知配置项：{key}")
+        try:
+            _validate_config_value(key, value, base_config[key])
+        except ValueError as exc:
+            raise ValueError(f"配置文件 {path}：{exc}") from exc
+    return payload
+
+
+def merge_config_file(base_config, path):
+    """把配置文件覆盖到 base_config 副本上。"""
+    merged = dict(base_config)
+    merged.update(load_config_file(path, base_config=base_config))
+    return merged
+
+
+def _validate_config_value(key, value, default_value):
+    if value is None:
+        raise ValueError(f"配置项 {key} 不允许为 null")
+
+    expected_type = type(default_value)
+    if expected_type is bool:
+        if type(value) is not bool:
+            raise ValueError(f"配置项 {key} 必须是 boolean")
+        return
+    if expected_type is int:
+        if type(value) is not int:
+            raise ValueError(f"配置项 {key} 必须是 integer")
+        return
+    if expected_type is float:
+        if type(value) not in {int, float}:
+            raise ValueError(f"配置项 {key} 必须是 number")
+        return
+    if expected_type is str:
+        if type(value) is not str:
+            raise ValueError(f"配置项 {key} 必须是 string")
+        return
+
+    if not isinstance(value, expected_type):
+        raise ValueError(f"配置项 {key} 类型不匹配")

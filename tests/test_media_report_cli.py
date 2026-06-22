@@ -255,14 +255,14 @@ def test_generate_live_report_lists_exports_rejections_human_review_series_and_d
 def test_main_dispatches_batch_subcommand(monkeypatch, tmp_path):
     calls = []
 
-    def fake_process_batch(input_dir, output_dir, work_dir):
-        calls.append((input_dir, output_dir, work_dir))
+    def fake_process_batch(input_dir, output_dir, work_dir, config=None):
+        calls.append((input_dir, output_dir, work_dir, config["asr_provider"]))
 
     monkeypatch.setattr(cli, "process_batch", fake_process_batch)
 
     cli.main(["batch", str(tmp_path), "--output-dir", "out", "--work-dir", "work"])
 
-    assert calls == [(str(tmp_path), "out", "work")]
+    assert calls == [(str(tmp_path), "out", "work", "stepaudio")]
 
 
 def test_main_dispatches_single_subcommand(monkeypatch, tmp_path):
@@ -270,15 +270,48 @@ def test_main_dispatches_single_subcommand(monkeypatch, tmp_path):
     video_path = tmp_path / "input.mp4"
     video_path.write_text("not real video", encoding="utf-8")
 
-    def fake_process_single(video_path_arg, output_dir, work_dir):
-        calls.append((video_path_arg, output_dir, work_dir))
+    def fake_process_single(video_path_arg, output_dir, work_dir, config=None):
+        calls.append((video_path_arg, output_dir, work_dir, config["asr_provider"]))
         return ClipInfo("input", "out/input_clip.mp4", "", 0, False, 0)
 
     monkeypatch.setattr(cli, "process_single_video", fake_process_single)
 
     cli.main(["single", str(video_path), "--output-dir", "out", "--work-dir", "work"])
 
-    assert calls == [(str(video_path), "out", "work")]
+    assert calls == [(str(video_path), "out", "work", "stepaudio")]
+
+
+def test_main_passes_config_file_to_single_subcommand(monkeypatch, tmp_path):
+    calls = []
+    video_path = tmp_path / "input.mp4"
+    video_path.write_text("not real video", encoding="utf-8")
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"asr_provider": "whisper"}', encoding="utf-8")
+
+    def fake_process_single(video_path_arg, output_dir, work_dir, config=None):
+        calls.append(config["asr_provider"])
+        return ClipInfo("input", "out/input_clip.mp4", "", 0, False, 0)
+
+    monkeypatch.setattr(cli, "process_single_video", fake_process_single)
+
+    cli.main(["single", str(video_path), "--config-file", str(config_path)])
+
+    assert calls == ["whisper"]
+
+
+def test_main_passes_config_file_to_batch_subcommand(monkeypatch, tmp_path):
+    calls = []
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"min_score": 75}', encoding="utf-8")
+
+    def fake_process_batch(input_dir, output_dir, work_dir, config=None):
+        calls.append(config["min_score"])
+
+    monkeypatch.setattr(cli, "process_batch", fake_process_batch)
+
+    cli.main(["batch", str(tmp_path), "--config-file", str(config_path)])
+
+    assert calls == [75]
 
 
 def test_main_dispatches_live_subcommand(monkeypatch, tmp_path):
@@ -323,6 +356,65 @@ def test_main_dispatches_live_subcommand(monkeypatch, tmp_path):
     )
 
     assert calls == [(str(video_path), "out", "work", 2, True, True, {"course_title": "直播课"}, True)]
+
+
+def test_main_passes_config_file_to_live_subcommand(monkeypatch, tmp_path):
+    calls = []
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("not real video", encoding="utf-8")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        '{"asr_provider": "whisper", "allow_unreviewed_export": true, "max_clips": 4}',
+        encoding="utf-8",
+    )
+
+    def fake_process_live(video_path_arg, output_dir, work_dir, config=None, course_context=None, dry_run=False):
+        calls.append(
+            (
+                config["asr_provider"],
+                config["allow_unreviewed_export"],
+                config["max_clips"],
+                config.get("max_clips_user_provided", False),
+            )
+        )
+        return []
+
+    monkeypatch.setattr(cli, "process_live_video", fake_process_live)
+
+    cli.main(["live", str(video_path), "--config-file", str(config_path)])
+
+    assert calls == [("whisper", True, 4, False)]
+
+
+def test_main_live_cli_max_clips_overrides_config_file(monkeypatch, tmp_path):
+    calls = []
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("not real video", encoding="utf-8")
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"max_clips": 4}', encoding="utf-8")
+
+    def fake_process_live(video_path_arg, output_dir, work_dir, config=None, course_context=None, dry_run=False):
+        calls.append((config["max_clips"], config.get("max_clips_user_provided", False)))
+        return []
+
+    monkeypatch.setattr(cli, "process_live_video", fake_process_live)
+
+    cli.main(["live", str(video_path), "--config-file", str(config_path), "--max-clips", "2"])
+
+    assert calls == [(2, True)]
+
+
+def test_main_rejects_invalid_config_file(tmp_path, capsys):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("not real video", encoding="utf-8")
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"unknown": true}', encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["live", str(video_path), "--config-file", str(config_path)])
+
+    assert exc_info.value.code == 2
+    assert "未知配置项：unknown" in capsys.readouterr().err
 
 
 def test_main_uses_protective_live_max_clips_when_unspecified(monkeypatch, tmp_path):

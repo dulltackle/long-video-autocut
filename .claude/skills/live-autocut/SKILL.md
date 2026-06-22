@@ -74,10 +74,12 @@ build = write_course_context(
 export STEPFUN_API_KEY=sk-...
 video-auto-editor live path/to/live.mp4 \
   --output-dir out/live --work-dir work/live \
-  --context-file out/live/course-context.json
+  --context-file out/live/course-context.json \
+  --config-file config.json
 ```
 
 支持用户显式开关，不要改写参数语义：
+- `--config-file`：读取 JSON 配置文件覆盖 CLI 底座默认配置，可调整模型、阈值、ASR provider、分片时长等；API Key 仍通过 `STEPFUN_API_KEY` 等环境变量提供，不写入配置文件。
 - `--dry-run`：只产出 `transcript.srt`、`plan.json`、报告，不导出视频。
 - `--max-clips N`：限制导出数量。
 - `--allow-unreviewed-export`：评审不可用时兼容导出未评审方案。

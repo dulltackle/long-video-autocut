@@ -6,7 +6,7 @@ import glob
 import os
 import shutil
 
-from video_auto_editor.config import CONFIG
+from video_auto_editor.config import CONFIG, merge_config_file
 from video_auto_editor.context import load_course_context
 from video_auto_editor.dedup import check_duplicate_content, check_duplicate_live_candidates, cross_video_dedup
 from video_auto_editor.export import export_live_clips
@@ -401,6 +401,7 @@ def _build_live_warnings(config, review_warnings=None):
 def _add_common_output_args(parser):
     parser.add_argument("--output-dir", default="./output", help="输出目录，默认 ./output")
     parser.add_argument("--work-dir", default="./video_work", help="临时工作目录，默认 ./video_work")
+    parser.add_argument("--config-file", help="JSON 配置文件，用于覆盖全局默认配置")
 
 
 def _positive_int(value):
@@ -434,7 +435,12 @@ def _build_parser():
     live_parser.add_argument("--max-clips", type=_positive_int, default=None, help="最多导出短视频数量；未传时使用临时保护上限 5")
     live_parser.add_argument("--dry-run", action="store_true", help="只生成转写、报告和 plan.json，不导出短视频")
     live_parser.add_argument("--context-file", help="课程上下文 JSON 文件")
-    live_parser.add_argument("--allow-unreviewed-export", action="store_true", help="允许导出未评审拆条结果")
+    live_parser.add_argument(
+        "--allow-unreviewed-export",
+        action="store_true",
+        default=None,
+        help="允许导出未评审拆条结果",
+    )
 
     return parser
 
@@ -447,16 +453,22 @@ def main(argv=None):
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.work_dir, exist_ok=True)
 
+    try:
+        runtime_config = merge_config_file(CONFIG, args.config_file) if args.config_file else CONFIG.copy()
+    except ValueError as exc:
+        parser.error(str(exc))
+
     if args.command == "batch":
-        process_batch(args.input_dir, args.output_dir, args.work_dir)
+        process_batch(args.input_dir, args.output_dir, args.work_dir, config=runtime_config)
         return
 
     if args.command == "live":
-        live_config = CONFIG.copy()
+        live_config = runtime_config.copy()
         if args.max_clips is not None:
             live_config["max_clips"] = args.max_clips
             live_config["max_clips_user_provided"] = True
-        live_config["allow_unreviewed_export"] = args.allow_unreviewed_export
+        if args.allow_unreviewed_export is not None:
+            live_config["allow_unreviewed_export"] = args.allow_unreviewed_export
         course_context = None
         if args.context_file:
             try:
@@ -473,7 +485,7 @@ def main(argv=None):
         )
         return
 
-    clip = process_single_video(args.video_path, args.output_dir, args.work_dir)
+    clip = process_single_video(args.video_path, args.output_dir, args.work_dir, config=runtime_config)
     if clip:
         print(f"  Scenario A complete: {clip.clip_path}")
     else:
