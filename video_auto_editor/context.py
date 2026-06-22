@@ -131,11 +131,14 @@ def write_course_context(raw, path):
     """采集课程信息并写出合法上下文 JSON，返回采集结果。"""
     build = build_course_context(raw)
     directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as context_file:
-        json.dump(build.payload, context_file, ensure_ascii=False, indent=2)
-        context_file.write("\n")
+    try:
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as context_file:
+            json.dump(build.payload, context_file, ensure_ascii=False, indent=2)
+            context_file.write("\n")
+    except OSError as exc:
+        raise ValueError(f"无法写出课程上下文文件：{exc}") from exc
     return build
 
 
