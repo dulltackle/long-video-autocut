@@ -93,8 +93,10 @@ def test_default_topic_review_config_uses_stepfun_chat():
     assert CONFIG["topic_review_enabled"] is True
     assert CONFIG["topic_review_provider"] == "stepfun_chat"
     assert CONFIG["topic_review_model"] == "step-2-mini"
-    assert CONFIG["topic_review_timeout"] == 60
+    assert CONFIG["topic_review_timeout"] == 180
     assert CONFIG["topic_review_batch_size"] == 3
+    assert CONFIG["topic_review_retry_attempts"] == 3
+    assert CONFIG["topic_review_retry_backoff_seconds"] == 2.0
     assert CONFIG["topic_review_temperature"] == 0.2
     assert CONFIG["topic_review_api_key_env"] == "STEPFUN_API_KEY"
     assert CONFIG["topic_review_base_url_env"] == "STEPFUN_BASE_URL"

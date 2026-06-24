@@ -17,6 +17,8 @@ def test_load_config_file_accepts_known_fields(tmp_path):
             "asr_provider": "whisper",
             "max_clips": 3,
             "allow_unreviewed_export": True,
+            "topic_review_retry_attempts": 2,
+            "topic_review_retry_backoff_seconds": 0.5,
         },
     )
 
@@ -26,6 +28,8 @@ def test_load_config_file_accepts_known_fields(tmp_path):
         "asr_provider": "whisper",
         "max_clips": 3,
         "allow_unreviewed_export": True,
+        "topic_review_retry_attempts": 2,
+        "topic_review_retry_backoff_seconds": 0.5,
     }
 
 
