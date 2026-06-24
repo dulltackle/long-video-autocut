@@ -121,6 +121,14 @@ PY
 # 5. 真实完整导出（不加 --dry-run）
 echo
 echo "🚀 运行 live 拆条（完整导出）..."
+E2E_OUT_ABS="$("${PY}" -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "${E2E_OUT}")"
+ROOT_ABS="$("${PY}" -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "${ROOT_DIR}")"
+HOME_ABS="$("${PY}" -c 'import os; print(os.path.abspath(os.path.expanduser("~")))')"
+if [[ -z "${E2E_OUT}" || "${E2E_OUT_ABS}" == "/" || "${E2E_OUT_ABS}" == "${ROOT_ABS}" || "${E2E_OUT_ABS}" == "${HOME_ABS}" ]]; then
+  echo "❌ 输出目录不安全，拒绝清理：${E2E_OUT}" >&2
+  exit 1
+fi
+rm -rf -- "${E2E_OUT_ABS}"
 LIVE_ARGS=(
   live "${E2E_VIDEO}"
   --config-file "${E2E_CONFIG}"
@@ -130,7 +138,7 @@ LIVE_ARGS=(
 if [[ -n "${E2E_MAX_CLIPS}" ]]; then
   LIVE_ARGS+=(--max-clips "${E2E_MAX_CLIPS}")
 fi
-if [[ "${E2E_ALLOW_UNREVIEWED_EXPORT}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+if [[ "${E2E_ALLOW_UNREVIEWED_EXPORT,,}" =~ ^(1|true|yes|on|t|y)$ ]]; then
   LIVE_ARGS+=(--allow-unreviewed-export)
 fi
 if [[ -n "${E2E_EXTRA_ARGS}" ]]; then

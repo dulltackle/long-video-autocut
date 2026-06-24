@@ -792,6 +792,109 @@ def test_process_live_video_keeps_unreviewed_plan_on_review_failure(monkeypatch,
     assert "主题评审失败：模型响应缺少字段" in report
 
 
+def test_process_live_video_passes_clean_review_provider_to_export_after_review_failure(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    output_dir = tmp_path / "out"
+    work_dir = tmp_path / "work"
+    chunks = [TranscriptChunk(10, 70, "直播文本。")]
+    candidates = [ClipCandidate(0, 10, 70, 60, "直播文本。", base_score=90, title="直播候选")]
+    captured = {}
+
+    class FakeReviewer:
+        provider_name = "stepfun_chat"
+        model = "fake-review"
+        base_url = "https://api.example/v1"
+
+        def is_available(self):
+            return True
+
+        def review_batches(self, batches):
+            return TopicReviewProviderResult(
+                success=False,
+                reviews={
+                    0: TopicReviewResult(
+                        topic_name="直播主题",
+                        topic_complete=True,
+                        learning_value=9,
+                        share_value=8,
+                        publish_ready_score=92,
+                        export_decision="publish_ready",
+                        title="评审标题",
+                        summary="评审摘要",
+                        keywords=["评审", "直播"],
+                        needs_human_review=False,
+                        reject_reason="",
+                        boundary_fix_suggestion="",
+                    )
+                },
+                error="第二批失败",
+                failed_batches=[
+                    {
+                        "batch_index": 1,
+                        "candidate_range": "candidate_1",
+                        "attempt": 1,
+                        "max_attempts": 1,
+                        "failure_type": "timeout",
+                        "error": "timeout",
+                    }
+                ],
+            )
+
+    def fake_export(*args, **kwargs):
+        captured["review_provider"] = kwargs["review_provider"]
+        captured["review_status"] = kwargs["review_status"]
+        return [
+            LiveClipInfo(
+                1,
+                "直播候选",
+                10,
+                70,
+                60,
+                90,
+                "直播文本。",
+                str(output_dir / "clips" / "001.mp4"),
+            )
+        ]
+
+    monkeypatch.setattr(cli, "get_video_duration", lambda video_path_arg: 120.0)
+    monkeypatch.setattr(cli, "detect_silence", lambda video_path_arg, config=None: [])
+    monkeypatch.setattr(
+        cli,
+        "transcribe_video",
+        lambda *args, **kwargs: VideoTranscriptionResult(success=True, chunks=chunks, cache_path="cache.json"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "generate_clip_candidates",
+        lambda chunks_arg, silences, total_duration, config=None: candidates,
+    )
+    monkeypatch.setattr(cli, "create_topic_reviewer", lambda config: FakeReviewer())
+    monkeypatch.setattr(cli, "export_live_clips", fake_export)
+
+    result = cli.process_live_video(
+        str(video_path),
+        str(output_dir),
+        str(work_dir),
+        config={**cli.CONFIG, "allow_unreviewed_export": True},
+        dry_run=False,
+    )
+
+    assert result
+    expected_provider = {
+        "provider": "stepfun_chat",
+        "model": "fake-review",
+        "base_url": "https://api.example/v1",
+    }
+    assert captured["review_status"] == "unreviewed"
+    assert captured["review_provider"] == expected_provider
+    assert "review_diagnostics" not in captured["review_provider"]
+    plan = json.loads((output_dir / "plan.json").read_text(encoding="utf-8"))
+    assert plan["review_provider"] == expected_provider
+    assert plan["reviewed_candidate_count"] == 1
+    assert plan["failed_review_batch_count"] == 1
+
+
 def test_review_live_candidates_degrades_on_invalid_batch_size(monkeypatch):
     candidate = ClipCandidate(0, 10, 70, 60, "直播文本。", base_score=90)
 

@@ -29,6 +29,21 @@ def _load_json(path):
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise VerifyError(f"{path.name} 不是合法 JSON：{exc.msg}") from exc
+    except UnicodeDecodeError as exc:
+        raise VerifyError(f"{path.name} 不是合法 UTF-8：{exc}") from exc
+
+
+def _output_child_path(output_dir, raw_path, label):
+    path = Path(str(raw_path))
+    if path.is_absolute() or ".." in path.parts:
+        raise VerifyError(f"{label} 必须是输出目录内的相对路径：{raw_path}")
+    output_root = output_dir.resolve()
+    resolved = (output_root / path).resolve()
+    try:
+        resolved.relative_to(output_root)
+    except ValueError as exc:
+        raise VerifyError(f"{label} 路径越界：{raw_path}") from exc
+    return resolved
 
 
 def _check_transcript_srt(output_dir):
@@ -65,12 +80,15 @@ def _check_metadata(output_dir):
     if not isinstance(clips, list) or not clips:
         raise VerifyError("metadata.json clips 为空")
     for idx, clip in enumerate(clips):
-        for field in ("title", "summary", "output_path"):
+        for field in ("title", "summary", "output_path", "subtitle_path"):
             if not clip.get(field):
                 raise VerifyError(f"metadata.json clips[{idx}] 缺少非空字段 {field}")
-        clip_file = output_dir / clip["output_path"]
+        clip_file = _output_child_path(output_dir, clip["output_path"], f"metadata.json clips[{idx}] output_path")
         if not clip_file.exists() or clip_file.stat().st_size == 0:
             raise VerifyError(f"metadata.json clips[{idx}] 指向的视频不存在或为空：{clip['output_path']}")
+        subtitle_file = _output_child_path(output_dir, clip["subtitle_path"], f"metadata.json clips[{idx}] subtitle_path")
+        if not subtitle_file.exists() or subtitle_file.stat().st_size == 0:
+            raise VerifyError(f"metadata.json clips[{idx}] 指向的字幕不存在或为空：{clip['subtitle_path']}")
     if metadata.get("export_count") != len(clips):
         raise VerifyError(
             f"metadata.json export_count({metadata.get('export_count')}) 与 clips 数({len(clips)})不一致"
@@ -91,9 +109,9 @@ def _check_clip_files(output_dir, metadata):
         raise VerifyError("subtitles/ 下没有导出的 .srt")
 
     clips_in_metadata = len(metadata.get("clips", []))
-    if not (clips_in_metadata == len(clip_files) == len(subtitle_files)):
+    if len(clip_files) < clips_in_metadata or len(subtitle_files) < clips_in_metadata:
         raise VerifyError(
-            "交付物计数不一致："
+            "交付物缺失："
             f"metadata.clips={clips_in_metadata}、clips/*.mp4={len(clip_files)}、subtitles/*.srt={len(subtitle_files)}"
         )
 

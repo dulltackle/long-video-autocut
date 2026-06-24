@@ -259,7 +259,7 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
             config,
             candidates=candidates,
             review_status=review_status,
-            review_provider=review_provider,
+            review_provider=plan_review_provider,
         )
         if exports is None:
             print("   ❌ Failed to export live clips")

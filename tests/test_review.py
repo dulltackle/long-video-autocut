@@ -524,6 +524,45 @@ def test_stepfun_chat_reviewer_cache_signature_changes_with_model(tmp_path):
     assert len(list(cache_dir.glob("*.json"))) == 2
 
 
+def test_stepfun_chat_reviewer_cache_signature_changes_with_generation_params(tmp_path):
+    cache_dir = tmp_path / "topic_review_cache"
+    batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})
+    calls = []
+
+    def fake_request(request, timeout):
+        body = json.loads(request.data.decode("utf-8"))
+        calls.append((body["temperature"], body.get("reasoning_effort", "")))
+        return FakeResponse(chat_response(review_content(title=f"标题-{len(calls)}")))
+
+    base_config = {
+        "topic_review_api_key": "sk-test",
+        "topic_review_base_url": "https://api.example/v1",
+        "topic_review_model": "review-model",
+        "topic_review_cache_dir": str(cache_dir),
+        "topic_review_temperature": 0.1,
+        "topic_review_reasoning_effort": "low",
+    }
+
+    first = StepFunChatReviewer(base_config, request_func=fake_request)
+    second = StepFunChatReviewer(
+        {
+            **base_config,
+            "topic_review_temperature": 0.8,
+            "topic_review_reasoning_effort": "high",
+        },
+        request_func=fake_request,
+    )
+
+    first_result = first.review_batches(batches)
+    second_result = second.review_batches(batches)
+
+    assert first_result.success is True
+    assert second_result.success is True
+    assert calls == [(0.1, "low"), (0.8, "high")]
+    assert second_result.reviews[0].title == "标题-2"
+    assert len(list(cache_dir.glob("*.json"))) == 2
+
+
 def test_stepfun_chat_reviewer_does_not_cache_failed_batch(tmp_path):
     cache_dir = tmp_path / "topic_review_cache"
     batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})

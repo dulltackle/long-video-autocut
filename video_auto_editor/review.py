@@ -322,6 +322,8 @@ class StepFunChatReviewer:
             "provider": self.provider_name,
             "model": self.model,
             "base_url": self.base_url,
+            "temperature": self.temperature,
+            "reasoning_effort": self.reasoning_effort,
             "required_review_fields": sorted(REQUIRED_REVIEW_FIELDS),
             "batch": batch.to_payload(),
         }
