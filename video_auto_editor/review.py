@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -110,6 +111,12 @@ class StepFunChatReviewer:
         self.base_url = _resolve_topic_review_base_url(self.config)
         self.model = str(_config_get(self.config, "topic_review_model", "step-2-mini"))
         self.timeout = int(_config_get(self.config, "topic_review_timeout", 60))
+        self.retry_attempts = _positive_int_config(self.config, "topic_review_retry_attempts", 1)
+        self.retry_backoff_seconds = _non_negative_float_config(
+            self.config,
+            "topic_review_retry_backoff_seconds",
+            0.0,
+        )
         self.temperature = float(_config_get(self.config, "topic_review_temperature", 0.2))
         self.reasoning_effort = str(_config_get(self.config, "topic_review_reasoning_effort", "")).strip()
         self.provider_name = str(_config_get(self.config, "topic_review_provider", "stepfun_chat"))
@@ -141,18 +148,10 @@ class StepFunChatReviewer:
             candidate.candidate_id: candidate.candidate_index
             for candidate in batch.candidates
         }
-        try:
-            request = self._build_request(batch)
-            with self.request_func(request, timeout=self.timeout) as response:
-                raw_response = response.read().decode("utf-8")
-        except ValueError as exc:
-            return TopicReviewProviderResult(False, error=str(exc))
-        except urllib.error.HTTPError as exc:
-            return TopicReviewProviderResult(False, error=f"Topic review HTTP error: {exc.code}")
-        except (urllib.error.URLError, OSError) as exc:
-            return TopicReviewProviderResult(False, error=f"Topic review request failed: {exc}")
-        except Exception as exc:
-            return TopicReviewProviderResult(False, error=f"Topic review request failed: {exc}")
+        request_result = self._request_batch_with_retry(batch)
+        if not request_result.success:
+            return request_result
+        raw_response = request_result.provider_info["raw_response"]
 
         try:
             chat_payload = json.loads(raw_response)
@@ -173,6 +172,33 @@ class StepFunChatReviewer:
         except ValueError as exc:
             return TopicReviewProviderResult(False, error=str(exc))
         return TopicReviewProviderResult(True, reviews=reviews)
+
+    def _request_batch_with_retry(self, batch):
+        for attempt in range(1, self.retry_attempts + 1):
+            try:
+                request = self._build_request(batch)
+                with self.request_func(request, timeout=self.timeout) as response:
+                    raw_response = response.read().decode("utf-8")
+                return TopicReviewProviderResult(True, provider_info={"raw_response": raw_response})
+            except ValueError as exc:
+                return TopicReviewProviderResult(False, error=str(exc))
+            except urllib.error.HTTPError as exc:
+                if not _is_retryable_http_status(exc.code) or attempt >= self.retry_attempts:
+                    return TopicReviewProviderResult(False, error=f"Topic review HTTP error: {exc.code}")
+                self._sleep_before_retry(attempt)
+            except (TimeoutError, urllib.error.URLError, OSError) as exc:
+                if attempt >= self.retry_attempts:
+                    return TopicReviewProviderResult(False, error=f"Topic review request failed: {exc}")
+                self._sleep_before_retry(attempt)
+            except Exception as exc:
+                return TopicReviewProviderResult(False, error=f"Topic review request failed: {exc}")
+
+        return TopicReviewProviderResult(False, error="Topic review request failed")
+
+    def _sleep_before_retry(self, failed_attempt):
+        delay = self.retry_backoff_seconds * failed_attempt
+        if delay > 0:
+            time.sleep(delay)
 
     def _build_request(self, batch):
         _validate_https_base_url(self.base_url)
@@ -375,6 +401,28 @@ def _topic_review_batch_size(config):
     if batch_size < 1:
         raise ValueError(f"Invalid topic_review_batch_size: {batch_size}, must be >= 1")
     return batch_size
+
+
+def _is_retryable_http_status(status_code):
+    return int(status_code) in {429, 500, 502, 503, 504}
+
+
+def _positive_int_config(config, key, default):
+    raw_value = _config_get(config, key, default)
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return int(default)
+    return max(1, value)
+
+
+def _non_negative_float_config(config, key, default):
+    raw_value = _config_get(config, key, default)
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return float(default)
+    return max(0.0, value)
 
 
 def _bounded_int(value, field_name, minimum, maximum):

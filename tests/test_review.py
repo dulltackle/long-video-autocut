@@ -68,6 +68,16 @@ def review_content_missing(field_name):
     return json.dumps(payload, ensure_ascii=False)
 
 
+def http_error(status_code):
+    return urllib.error.HTTPError(
+        "https://api.example/v1/chat/completions",
+        status_code,
+        "error",
+        {},
+        None,
+    )
+
+
 def test_topic_review_result_captures_required_contract_fields():
     review = TopicReviewResult(
         topic_name="直播拆条",
@@ -250,6 +260,100 @@ def test_stepfun_chat_reviewer_omits_reasoning_effort_when_blank():
     assert "reasoning_effort" not in calls[0]
 
 
+def test_stepfun_chat_reviewer_retries_timeout_then_succeeds():
+    calls = []
+    batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})
+
+    def fake_request(request, timeout):
+        calls.append(request)
+        if len(calls) == 1:
+            raise TimeoutError("timed out")
+        return FakeResponse(chat_response(review_content()))
+
+    reviewer = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_retry_attempts": 2,
+            "topic_review_retry_backoff_seconds": 0,
+        },
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is True
+    assert len(calls) == 2
+    assert result.reviews[0].topic_name == "直播拆条"
+
+
+def test_stepfun_chat_reviewer_reports_failure_after_retry_attempts_exhausted():
+    calls = []
+
+    def fake_request(request, timeout):
+        calls.append(request)
+        raise TimeoutError("timed out")
+
+    reviewer = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_retry_attempts": 3,
+            "topic_review_retry_backoff_seconds": 0,
+        },
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(build_topic_review_batches([make_candidate(0, 0)]))
+
+    assert result.success is False
+    assert len(calls) == 3
+    assert result.error == "Topic review request failed: timed out"
+
+
+def test_stepfun_chat_reviewer_retries_http_500_but_not_http_400():
+    retryable_calls = []
+
+    def retryable_request(request, timeout):
+        retryable_calls.append(request)
+        if len(retryable_calls) == 1:
+            raise http_error(500)
+        return FakeResponse(chat_response(review_content()))
+
+    retryable_reviewer = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_retry_attempts": 2,
+            "topic_review_retry_backoff_seconds": 0,
+        },
+        request_func=retryable_request,
+    )
+
+    retryable_result = retryable_reviewer.review_batches(build_topic_review_batches([make_candidate(0, 0)]))
+
+    assert retryable_result.success is True
+    assert len(retryable_calls) == 2
+
+    non_retryable_calls = []
+
+    def non_retryable_request(request, timeout):
+        non_retryable_calls.append(request)
+        raise http_error(400)
+
+    non_retryable_reviewer = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_retry_attempts": 3,
+            "topic_review_retry_backoff_seconds": 0,
+        },
+        request_func=non_retryable_request,
+    )
+
+    non_retryable_result = non_retryable_reviewer.review_batches(build_topic_review_batches([make_candidate(0, 0)]))
+
+    assert non_retryable_result.success is False
+    assert len(non_retryable_calls) == 1
+    assert non_retryable_result.error == "Topic review HTTP error: 400"
+
+
 def test_stepfun_chat_reviewer_rejects_non_https_base_url_without_request():
     def fail_request(*args, **kwargs):
         raise AssertionError("unsafe base_url should not make HTTP request")
@@ -299,7 +403,13 @@ def test_stepfun_chat_reviewer_reports_http_failure():
     def fake_request(request, timeout):
         raise urllib.error.URLError("network down")
 
-    reviewer = StepFunChatReviewer({"topic_review_api_key": "sk-test"}, request_func=fake_request)
+    reviewer = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_retry_backoff_seconds": 0,
+        },
+        request_func=fake_request,
+    )
 
     result = reviewer.review_batches(build_topic_review_batches([make_candidate(0, 0)]))
 
