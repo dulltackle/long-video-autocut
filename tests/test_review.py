@@ -215,6 +215,83 @@ def test_stepfun_chat_reviewer_maps_success_response_to_review_result(monkeypatc
     assert calls[0][2]["messages"][1]["content"]
 
 
+def test_stepfun_chat_reviewer_accepts_bare_single_review_object(monkeypatch):
+    # step-3.7-flash 等模型对单候选请求会直接返回裸评审对象，需被宽容解析。
+    batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})
+    bare_object = json.loads(review_content())["reviews"][0]
+
+    def fake_request(request, timeout):
+        return FakeResponse(chat_response(json.dumps(bare_object, ensure_ascii=False)))
+
+    reviewer = StepFunChatReviewer(
+        {"topic_review_api_key": "sk-test", "topic_review_base_url": "https://api.example/v1"},
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is True
+    assert result.reviews[0].topic_name == "直播拆条"
+
+
+def test_stepfun_chat_reviewer_accepts_bare_review_array(monkeypatch):
+    batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})
+    bare_array = json.loads(review_content())["reviews"]
+
+    def fake_request(request, timeout):
+        return FakeResponse(chat_response(json.dumps(bare_array, ensure_ascii=False)))
+
+    reviewer = StepFunChatReviewer(
+        {"topic_review_api_key": "sk-test", "topic_review_base_url": "https://api.example/v1"},
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is True
+    assert result.reviews[0].topic_name == "直播拆条"
+
+
+def test_stepfun_chat_reviewer_recovers_review_with_corrupted_candidate_id_key(monkeypatch):
+    # step-3.7-flash 偶发把首键写坏（candidate_id 键名被破坏），但其余必填字段完整；
+    # 单候选批次下应按上下文回填 candidate_id 并成功解析，而非整体失败。
+    batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})
+    bare_object = json.loads(review_content())["reviews"][0]
+    bare_object.pop("candidate_id")
+    corrupted = {": [{": "candidate_0", **bare_object}
+
+    def fake_request(request, timeout):
+        return FakeResponse(chat_response(json.dumps(corrupted, ensure_ascii=False)))
+
+    reviewer = StepFunChatReviewer(
+        {"topic_review_api_key": "sk-test", "topic_review_base_url": "https://api.example/v1"},
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is True
+    assert result.reviews[0].topic_name == "直播拆条"
+
+
+def test_stepfun_chat_reviewer_rejects_unstructured_object(monkeypatch):
+    batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})
+
+    def fake_request(request, timeout):
+        return FakeResponse(chat_response(json.dumps({"unexpected": "value"}, ensure_ascii=False)))
+
+    reviewer = StepFunChatReviewer(
+        {"topic_review_api_key": "sk-test", "topic_review_base_url": "https://api.example/v1"},
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is False
+    assert "Topic review response must contain a reviews list" in result.error
+    assert "failure_type=invalid_schema" in result.error
+
+
 def test_stepfun_chat_reviewer_injects_reasoning_effort_when_configured():
     calls = []
     batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})

@@ -38,7 +38,7 @@ class StepAudioConfig:
     model: str = "stepaudio-2.5-asr"
     language: str = "zh"
     timeout: int = 120
-    max_upload_bytes: int = 200 * 1024 * 1024
+    max_upload_bytes: int = 10 * 1024 * 1024
     shard_seconds: int = 600
     audio_sample_rate: int = 16000
     audio_channels: int = 1
@@ -383,13 +383,14 @@ class StepAudioTranscriber:
                 chunks=[],
                 error=f"StepAudio cannot read {shard_label} audio file: {exc}",
             )
-        if audio_size > self.config.max_upload_bytes:
+        encoded_size = _base64_encoded_size(audio_size)
+        if encoded_size > self.config.max_upload_bytes:
             return VideoTranscriptionResult(
                 success=False,
                 chunks=[],
                 error=(
                     f"StepAudio {shard_label} audio is too large for upload: "
-                    f"{audio_size} bytes > {self.config.max_upload_bytes} bytes"
+                    f"{encoded_size} bytes (base64) > {self.config.max_upload_bytes} bytes"
                 ),
             )
 
@@ -861,8 +862,32 @@ def _probe_media_duration(video_path):
         return None
 
 
-def _build_audio_shard_plan(duration, work_dir, config):
+def _base64_encoded_size(raw_size):
+    """base64 编码后的字节数：每 3 字节原始数据编码为 4 字节（向上取整）。"""
+    return (int(raw_size) + 2) // 3 * 4
+
+
+def _effective_shard_seconds(config):
+    """把分片时长封顶在 base64 后 payload 不超过 max_upload_bytes 的范围内。
+
+    StepAudio SSE 端点限制的是 base64 后的请求体大小，故原始音频预算为
+    ``max_upload_bytes * 3 / 4``；再按 16-bit PCM 码率估算单位时长字节数，
+    给出安全的分片时长上限。压缩格式的实际字节更小，此估算偏保守。
+    """
     shard_seconds = max(float(config.shard_seconds), 0.001)
+    bytes_per_second = int(config.audio_sample_rate) * int(config.audio_channels) * 2
+    if bytes_per_second <= 0:
+        return shard_seconds
+    raw_budget = (int(config.max_upload_bytes) // 4) * 3
+    usable = raw_budget - 1024  # 预留 WAV 头与 JSON 包裹余量
+    max_shard_seconds = usable / bytes_per_second
+    if max_shard_seconds < 1:
+        max_shard_seconds = 1.0
+    return min(shard_seconds, float(int(max_shard_seconds)))
+
+
+def _build_audio_shard_plan(duration, work_dir, config):
+    shard_seconds = _effective_shard_seconds(config)
     audio_format = _sanitize_audio_format(config.audio_format)
     shard_dir = os.path.join(work_dir, "asr_shards")
     cache_dir = os.path.join(work_dir, "asr_shard_cache")

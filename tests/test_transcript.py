@@ -139,7 +139,7 @@ def test_default_asr_config_uses_stepaudio():
     assert CONFIG["asr_model"] == "stepaudio-2.5-asr"
     assert CONFIG["asr_timeout"] == 120
     assert CONFIG["asr_language"] == "zh"
-    assert CONFIG["asr_max_upload_bytes"] == 200 * 1024 * 1024
+    assert CONFIG["asr_max_upload_bytes"] == 10 * 1024 * 1024
     assert CONFIG["asr_shard_seconds"] == 600
     assert CONFIG["asr_audio_sample_rate"] == 16000
     assert CONFIG["asr_audio_channels"] == 1
@@ -188,7 +188,7 @@ def test_create_stepaudio_transcriber_reads_base_url_from_env(monkeypatch):
         model="custom-asr",
         language="en",
         timeout=30,
-        max_upload_bytes=200 * 1024 * 1024,
+        max_upload_bytes=10 * 1024 * 1024,
         shard_seconds=600,
         audio_sample_rate=16000,
         audio_channels=1,
@@ -1297,7 +1297,7 @@ def test_stepaudio_transcribe_video_rejects_oversized_shard_without_request(monk
 
     assert result.success is False
     assert result.chunks == []
-    assert result.error == "StepAudio shard 0 audio is too large for upload: 5 bytes > 3 bytes"
+    assert result.error == "StepAudio shard 0 audio is too large for upload: 8 bytes (base64) > 3 bytes"
 
 
 def test_stepaudio_audio_shard_reports_missing_file_without_request(tmp_path):
@@ -1379,6 +1379,60 @@ def test_prepare_stepaudio_audio_shards_extracts_and_cuts_contiguous_plan(monkey
         "-f", "mp3",
         str(tmp_path / "work" / "asr_shards" / "shard_0000.mp3"),
     ]
+
+
+def test_build_audio_shard_plan_caps_shard_seconds_by_base64_budget(tmp_path):
+    # base64 后须 ≤ max_upload_bytes：原始预算 = max_upload_bytes * 3/4。
+    # 16k/mono/16-bit = 32000 字节/秒，max_upload_bytes=10MiB 时分片须封顶在约 245s，
+    # 即使偏好的 shard_seconds 设到 600 也不会超限。
+    config = StepAudioConfig(
+        shard_seconds=600,
+        audio_sample_rate=16000,
+        audio_channels=1,
+        audio_format="wav",
+        max_upload_bytes=10 * 1024 * 1024,
+    )
+
+    shards = transcript._build_audio_shard_plan(1000.0, str(tmp_path / "work"), config)
+
+    bytes_per_second = 16000 * 1 * 2
+    for shard in shards:
+        raw_size = (shard.end - shard.start) * bytes_per_second
+        assert transcript._base64_encoded_size(raw_size) <= config.max_upload_bytes
+    # 偏好 600s 被封顶到更短，分片数量随之增加且连续覆盖整段。
+    assert shards[0].end - shards[0].start < 600
+    assert shards[0].start == 0.0
+    assert shards[-1].end == 1000.0
+    for earlier, later in zip(shards, shards[1:]):
+        assert later.start == earlier.end
+
+
+def test_stepaudio_rejects_shard_when_base64_exceeds_limit_even_if_raw_fits(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+    install_stepaudio_media_success(monkeypatch, duration="10.0")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("oversized shard should not be uploaded")
+
+    # 原始 9 字节 ≤ 上限 10，但 base64 后为 12 字节 > 10，须在发送前拦截。
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", max_upload_bytes=10),
+        request_func=fail_if_called,
+    )
+
+    def write_nine_bytes(cmd, **kwargs):
+        if cmd[0] == "ffprobe":
+            return completed(0, stdout='{"format": {"duration": "10.0"}}')
+        Path(cmd[-1]).write_bytes(b"123456789")
+        return completed(0)
+
+    monkeypatch.setattr(transcript.subprocess, "run", write_nine_bytes)
+
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+
+    assert result.success is False
+    assert result.error == "StepAudio shard 0 audio is too large for upload: 12 bytes (base64) > 10 bytes"
 
 
 def test_prepare_stepaudio_audio_shards_reports_ffmpeg_extract_failure(monkeypatch, tmp_path):

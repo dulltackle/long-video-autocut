@@ -47,7 +47,7 @@ CONFIG = {
     "asr_model": "stepaudio-2.5-asr",
     "asr_timeout": 120,
     "asr_language": "zh",
-    "asr_max_upload_bytes": 200 * 1024 * 1024,
+    "asr_max_upload_bytes": 10 * 1024 * 1024,
     "asr_shard_seconds": 600,
     "asr_audio_sample_rate": 16000,
     "asr_audio_channels": 1,

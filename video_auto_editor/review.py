@@ -450,15 +450,51 @@ def create_topic_reviewer(config=None, request_func=None):
     raise ValueError(f"Unknown topic review provider: {provider}")
 
 
-def _parse_review_payload(payload, requested_ids):
-    if not isinstance(payload, dict) or not isinstance(payload.get("reviews"), list):
-        raise ValueError("Topic review response must contain a reviews list")
+def _coerce_review_items(payload):
+    """兼容评审模型的多种返回形态，统一成评审对象列表。
 
+    既接受规范的 {"reviews": [...]}，也接受裸数组 [...] 和裸单个评审对象
+    {"candidate_id": ...}，以适配未严格遵循 schema 的 Chat 模型。
+
+    部分模型偶发把首个键名写坏（candidate_id 键被破坏），但其余必填评审字段
+    完整。只要对象包含全部 REQUIRED_REVIEW_FIELDS，仍按裸单个评审对象处理，
+    candidate_id 留待 _parse_review_payload 在单候选批次中按上下文回填。
+    """
+    if isinstance(payload, dict):
+        if isinstance(payload.get("reviews"), list):
+            return payload["reviews"]
+        if "candidate_id" in payload:
+            return [payload]
+        if REQUIRED_REVIEW_FIELDS.issubset(payload.keys()):
+            return [payload]
+    elif isinstance(payload, list):
+        return payload
+    raise ValueError("Topic review response must contain a reviews list")
+
+
+def _parse_review_payload(payload, requested_ids):
+    items = _coerce_review_items(payload)
+
+    # 仅当模型把单候选评审的 candidate_id 键写坏（裸对象、无 reviews 包装、缺 candidate_id
+    # 键但含全部必填字段）时，按单候选批次上下文回填 candidate_id；其余情况下 candidate_id
+    # 缺失或不匹配仍视为错误，避免掩盖真正的契约违例。
+    recover_single = (
+        len(requested_ids) == 1
+        and len(items) == 1
+        and isinstance(payload, dict)
+        and "reviews" not in payload
+        and "candidate_id" not in payload
+        and REQUIRED_REVIEW_FIELDS.issubset(payload.keys())
+    )
+    single_requested = next(iter(requested_ids)) if recover_single else None
     reviews = {}
-    for item in payload["reviews"]:
+    for item in items:
         if not isinstance(item, dict):
             raise ValueError("Topic review item must be an object")
         candidate_id = item.get("candidate_id")
+        if single_requested is not None and (not candidate_id or candidate_id not in requested_ids):
+            # 单候选批次只可能对应这一个候选，回填被模型写坏的 candidate_id。
+            candidate_id = single_requested
         if not candidate_id:
             raise ValueError("Topic review item missing candidate_id")
         if candidate_id not in requested_ids:
