@@ -156,21 +156,41 @@ class StepFunChatReviewer:
         try:
             chat_payload = json.loads(raw_response)
         except json.JSONDecodeError as exc:
-            return TopicReviewProviderResult(False, error=f"Invalid Chat Completions JSON: {exc.msg}")
+            return self._batch_failure(
+                batch,
+                _request_attempt(request_result),
+                "invalid_chat_json",
+                f"Invalid Chat Completions JSON: {exc.msg}",
+            )
 
         content = _extract_chat_content(chat_payload)
         if content is None:
-            return TopicReviewProviderResult(False, error="Chat Completions response missing message content")
+            return self._batch_failure(
+                batch,
+                _request_attempt(request_result),
+                "invalid_chat_response",
+                "Chat Completions response missing message content",
+            )
 
         try:
             review_payload = json.loads(content)
         except json.JSONDecodeError as exc:
-            return TopicReviewProviderResult(False, error=f"Invalid topic review JSON: {exc.msg}")
+            return self._batch_failure(
+                batch,
+                _request_attempt(request_result),
+                "invalid_topic_json",
+                f"Invalid topic review JSON: {exc.msg}",
+            )
 
         try:
             reviews = _parse_review_payload(review_payload, requested_ids)
         except ValueError as exc:
-            return TopicReviewProviderResult(False, error=str(exc))
+            return self._batch_failure(
+                batch,
+                _request_attempt(request_result),
+                _schema_failure_type(str(exc)),
+                str(exc),
+            )
         return TopicReviewProviderResult(True, reviews=reviews)
 
     def _request_batch_with_retry(self, batch):
@@ -179,26 +199,53 @@ class StepFunChatReviewer:
                 request = self._build_request(batch)
                 with self.request_func(request, timeout=self.timeout) as response:
                     raw_response = response.read().decode("utf-8")
-                return TopicReviewProviderResult(True, provider_info={"raw_response": raw_response})
+                return TopicReviewProviderResult(True, provider_info={"raw_response": raw_response, "attempt": attempt})
             except ValueError as exc:
-                return TopicReviewProviderResult(False, error=str(exc))
+                return self._batch_failure(batch, attempt, "invalid_config", str(exc))
             except urllib.error.HTTPError as exc:
                 if not _is_retryable_http_status(exc.code) or attempt >= self.retry_attempts:
-                    return TopicReviewProviderResult(False, error=f"Topic review HTTP error: {exc.code}")
+                    return self._batch_failure(
+                        batch,
+                        attempt,
+                        f"http_{exc.code}",
+                        f"Topic review HTTP error: {exc.code}",
+                    )
                 self._sleep_before_retry(attempt)
             except (TimeoutError, urllib.error.URLError, OSError) as exc:
                 if attempt >= self.retry_attempts:
-                    return TopicReviewProviderResult(False, error=f"Topic review request failed: {exc}")
+                    return self._batch_failure(
+                        batch,
+                        attempt,
+                        _request_failure_type(exc),
+                        f"Topic review request failed: {exc}",
+                    )
                 self._sleep_before_retry(attempt)
             except Exception as exc:
-                return TopicReviewProviderResult(False, error=f"Topic review request failed: {exc}")
+                return self._batch_failure(
+                    batch,
+                    attempt,
+                    "request_error",
+                    f"Topic review request failed: {exc}",
+                )
 
-        return TopicReviewProviderResult(False, error="Topic review request failed")
+        return self._batch_failure(batch, self.retry_attempts, "request_error", "Topic review request failed")
 
     def _sleep_before_retry(self, failed_attempt):
         delay = self.retry_backoff_seconds * failed_attempt
         if delay > 0:
             time.sleep(delay)
+
+    def _batch_failure(self, batch, attempt, failure_type, message):
+        return TopicReviewProviderResult(
+            False,
+            error=(
+                f"{message} "
+                f"[batch_index={batch.batch_index} "
+                f"candidate_range={_batch_candidate_range(batch)} "
+                f"attempt={attempt}/{self.retry_attempts} "
+                f"failure_type={failure_type}]"
+            ),
+        )
 
     def _build_request(self, batch):
         _validate_https_base_url(self.base_url)
@@ -405,6 +452,37 @@ def _topic_review_batch_size(config):
 
 def _is_retryable_http_status(status_code):
     return int(status_code) in {429, 500, 502, 503, 504}
+
+
+def _request_attempt(request_result):
+    return int((request_result.provider_info or {}).get("attempt", 1))
+
+
+def _batch_candidate_range(batch):
+    candidate_ids = [candidate.candidate_id for candidate in batch.candidates]
+    if not candidate_ids:
+        return "none"
+    if len(candidate_ids) == 1:
+        return candidate_ids[0]
+    return f"{candidate_ids[0]}-{candidate_ids[-1]}"
+
+
+def _request_failure_type(exc):
+    text = str(exc).lower()
+    reason = getattr(exc, "reason", None)
+    if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError) or "timed out" in text:
+        return "timeout"
+    if isinstance(exc, urllib.error.URLError):
+        return "url_error"
+    if isinstance(exc, OSError):
+        return "os_error"
+    return "request_error"
+
+
+def _schema_failure_type(message):
+    if "unknown candidate_id" in message:
+        return "unknown_candidate"
+    return "invalid_schema"
 
 
 def _positive_int_config(config, key, default):

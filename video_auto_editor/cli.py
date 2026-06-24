@@ -203,6 +203,8 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
         print(f"   ✅ Reviewed {len(candidates)} candidates")
     else:
         print("   ⚠️  Topic review unavailable; writing unreviewed plan")
+        for warning in review_warnings:
+            print(f"   ⚠️  {warning}")
 
     print("\n🏆 Step 7: Selecting live exports...")
     selected, _ = select_live_exports(candidates, None, config, review_status=review_status)

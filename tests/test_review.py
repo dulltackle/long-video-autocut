@@ -306,7 +306,11 @@ def test_stepfun_chat_reviewer_reports_failure_after_retry_attempts_exhausted():
 
     assert result.success is False
     assert len(calls) == 3
-    assert result.error == "Topic review request failed: timed out"
+    assert "Topic review request failed: timed out" in result.error
+    assert "batch_index=0" in result.error
+    assert "candidate_range=candidate_0" in result.error
+    assert "attempt=3/3" in result.error
+    assert "failure_type=timeout" in result.error
 
 
 def test_stepfun_chat_reviewer_retries_http_500_but_not_http_400():
@@ -351,7 +355,33 @@ def test_stepfun_chat_reviewer_retries_http_500_but_not_http_400():
 
     assert non_retryable_result.success is False
     assert len(non_retryable_calls) == 1
-    assert non_retryable_result.error == "Topic review HTTP error: 400"
+    assert "Topic review HTTP error: 400" in non_retryable_result.error
+    assert "attempt=1/3" in non_retryable_result.error
+    assert "failure_type=http_400" in non_retryable_result.error
+
+
+def test_stepfun_chat_reviewer_failure_includes_batch_index_and_candidate_range():
+    candidates = [make_candidate(12, 0), make_candidate(13, 30)]
+
+    def fake_request(request, timeout):
+        raise TimeoutError("timed out")
+
+    reviewer = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_retry_attempts": 2,
+            "topic_review_retry_backoff_seconds": 0,
+        },
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(build_topic_review_batches(candidates, config={"topic_review_batch_size": 2}))
+
+    assert result.success is False
+    assert "batch_index=0" in result.error
+    assert "candidate_range=candidate_12-candidate_13" in result.error
+    assert "attempt=2/2" in result.error
+    assert "failure_type=timeout" in result.error
 
 
 def test_stepfun_chat_reviewer_rejects_non_https_base_url_without_request():
@@ -366,7 +396,9 @@ def test_stepfun_chat_reviewer_rejects_non_https_base_url_without_request():
     result = reviewer.review_batches(build_topic_review_batches([make_candidate(0, 0)]))
 
     assert result.success is False
-    assert result.error == "Topic review base_url must use HTTPS for credential safety"
+    assert "Topic review base_url must use HTTPS for credential safety" in result.error
+    assert "batch_index=0" in result.error
+    assert "failure_type=invalid_config" in result.error
 
 
 def test_stepfun_chat_reviewer_clamps_review_scores_to_expected_ranges():
@@ -415,6 +447,7 @@ def test_stepfun_chat_reviewer_reports_http_failure():
 
     assert result.success is False
     assert "Topic review request failed" in result.error
+    assert "failure_type=url_error" in result.error
 
 
 def test_stepfun_chat_reviewer_reports_invalid_chat_json():
@@ -427,6 +460,7 @@ def test_stepfun_chat_reviewer_reports_invalid_chat_json():
 
     assert result.success is False
     assert result.error.startswith("Invalid Chat Completions JSON")
+    assert "failure_type=invalid_chat_json" in result.error
 
 
 def test_stepfun_chat_reviewer_reports_invalid_model_json():
@@ -439,6 +473,7 @@ def test_stepfun_chat_reviewer_reports_invalid_model_json():
 
     assert result.success is False
     assert result.error.startswith("Invalid topic review JSON")
+    assert "failure_type=invalid_topic_json" in result.error
 
 
 def test_stepfun_chat_reviewer_reports_missing_required_review_field():
@@ -465,7 +500,8 @@ def test_stepfun_chat_reviewer_reports_missing_candidate_id():
     result = reviewer.review_batches(build_topic_review_batches([make_candidate(0, 0)]))
 
     assert result.success is False
-    assert result.error == "Topic review item missing candidate_id"
+    assert "Topic review item missing candidate_id" in result.error
+    assert "failure_type=invalid_schema" in result.error
 
 
 def test_stepfun_chat_reviewer_reports_unknown_candidate_id():
@@ -477,7 +513,8 @@ def test_stepfun_chat_reviewer_reports_unknown_candidate_id():
     result = reviewer.review_batches(build_topic_review_batches([make_candidate(0, 0)]))
 
     assert result.success is False
-    assert result.error == "Topic review returned unknown candidate_id: candidate_99"
+    assert "Topic review returned unknown candidate_id: candidate_99" in result.error
+    assert "failure_type=unknown_candidate" in result.error
 
 
 def test_create_topic_reviewer_rejects_unknown_provider():
