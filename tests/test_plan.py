@@ -143,3 +143,34 @@ def test_build_plan_writes_export_selection_and_exports():
             "dry_run": True,
         }
     ]
+
+
+def test_build_plan_writes_partial_review_diagnostics():
+    candidate = make_candidate()
+
+    payload = build_plan(
+        "live.mp4",
+        None,
+        [candidate],
+        [],
+        status="unreviewed",
+        review_diagnostics={
+            "reviewed_candidate_count": 1,
+            "failed_review_batch_count": 1,
+            "failed_review_batches": [
+                {
+                    "batch_index": 1,
+                    "candidate_range": "candidate_3-candidate_5",
+                    "attempt": 3,
+                    "max_attempts": 3,
+                    "failure_type": "timeout",
+                    "error": "Topic review request failed: timed out",
+                }
+            ],
+        },
+    )
+
+    assert payload["status"] == "unreviewed"
+    assert payload["reviewed_candidate_count"] == 1
+    assert payload["failed_review_batch_count"] == 1
+    assert payload["failed_review_batches"][0]["candidate_range"] == "candidate_3-candidate_5"

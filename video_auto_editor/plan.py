@@ -12,11 +12,13 @@ def build_plan(
     warnings=None,
     status="unreviewed",
     review_provider=None,
+    review_diagnostics=None,
     config=None,
     dry_run=False,
 ):
     """构造可被调度器读取的拆条方案。"""
     config = config or {}
+    review_diagnostics = review_diagnostics or {}
     export_mode = _export_mode(status, config)
     return {
         "source_video": os.path.basename(source_video),
@@ -31,6 +33,11 @@ def build_plan(
             "summary": course_context.summary() if course_context is not None else {},
         },
         "review_provider": review_provider or {},
+        "reviewed_candidate_count": int(
+            review_diagnostics.get("reviewed_candidate_count", _reviewed_candidate_count(candidates))
+        ),
+        "failed_review_batch_count": int(review_diagnostics.get("failed_review_batch_count", 0)),
+        "failed_review_batches": list(review_diagnostics.get("failed_review_batches", [])),
         "candidates": [_candidate_payload(candidate) for candidate in candidates],
         "selected": [_candidate_payload(candidate) for candidate in selected],
         "exports": [_planned_export_payload(candidate, index, dry_run) for index, candidate in enumerate(selected, 1)],
@@ -47,6 +54,7 @@ def write_plan(
     warnings=None,
     status="unreviewed",
     review_provider=None,
+    review_diagnostics=None,
     config=None,
     dry_run=False,
 ):
@@ -63,6 +71,7 @@ def write_plan(
                 warnings,
                 status=status,
                 review_provider=review_provider,
+                review_diagnostics=review_diagnostics,
                 config=config,
                 dry_run=dry_run,
             ),
@@ -113,6 +122,10 @@ def _review_payload(review):
         "boundary_fix_start": review.boundary_fix_start,
         "boundary_fix_end": review.boundary_fix_end,
     }
+
+
+def _reviewed_candidate_count(candidates):
+    return sum(1 for candidate in candidates if candidate.review is not None)
 
 
 def _export_mode(status, config):

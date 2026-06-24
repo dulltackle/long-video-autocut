@@ -484,6 +484,45 @@ def test_stepfun_chat_reviewer_does_not_cache_failed_batch(tmp_path):
     assert len(calls) == 1
 
 
+def test_stepfun_chat_reviewer_preserves_successful_reviews_when_later_batch_fails():
+    candidates = [make_candidate(0, 0), make_candidate(1, 30)]
+    batches = build_topic_review_batches(candidates, config={"topic_review_batch_size": 1})
+    calls = []
+
+    def fake_request(request, timeout):
+        body = json.loads(request.data.decode("utf-8"))
+        candidate_id = json.loads(body["messages"][1]["content"])["candidates"][0]["candidate_id"]
+        calls.append(candidate_id)
+        if candidate_id == "candidate_1":
+            raise TimeoutError("timed out")
+        return FakeResponse(chat_response(review_content(candidate_id=candidate_id)))
+
+    reviewer = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_retry_attempts": 1,
+        },
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is False
+    assert calls == ["candidate_0", "candidate_1"]
+    assert result.reviews[0].topic_name == "直播拆条"
+    assert 1 not in result.reviews
+    assert result.failed_batches == [
+        {
+            "batch_index": 1,
+            "candidate_range": "candidate_1",
+            "attempt": 1,
+            "max_attempts": 1,
+            "failure_type": "timeout",
+            "error": "Topic review request failed: timed out",
+        }
+    ]
+
+
 def test_stepfun_chat_reviewer_rejects_non_https_base_url_without_request():
     def fail_request(*args, **kwargs):
         raise AssertionError("unsafe base_url should not make HTTP request")

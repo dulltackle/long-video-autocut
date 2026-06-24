@@ -210,6 +210,12 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
         print("   ⚠️  Topic review unavailable; writing unreviewed plan")
         for warning in review_warnings:
             print(f"   ⚠️  {warning}")
+    review_diagnostics = review_provider.get("review_diagnostics", {})
+    plan_review_provider = {
+        key: value
+        for key, value in review_provider.items()
+        if key != "review_diagnostics"
+    }
 
     print("\n🏆 Step 7: Selecting live exports...")
     selected, _ = select_live_exports(candidates, None, config, review_status=review_status)
@@ -231,7 +237,8 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
         selected,
         warnings,
         status=review_status,
-        review_provider=review_provider,
+        review_provider=plan_review_provider,
+        review_diagnostics=review_diagnostics,
         config=config,
         dry_run=dry_run,
     )
@@ -382,6 +389,8 @@ def _review_live_candidates(candidates, course_context, config, video_work=None)
     result = reviewer.review_batches(batches)
     provider_info = result.provider_info or provider_info
     if not result.success:
+        provider_info = dict(provider_info)
+        provider_info["review_diagnostics"] = _review_failure_diagnostics(result)
         return "unreviewed", provider_info, [f"主题评审失败：{result.error}"]
 
     for candidate in candidates:
@@ -400,6 +409,15 @@ def _topic_reviewer_info(reviewer):
         "provider": getattr(reviewer, "provider_name", ""),
         "model": getattr(reviewer, "model", ""),
         "base_url": getattr(reviewer, "base_url", ""),
+    }
+
+
+def _review_failure_diagnostics(result):
+    failed_batches = [dict(batch) for batch in getattr(result, "failed_batches", [])]
+    return {
+        "reviewed_candidate_count": len(getattr(result, "reviews", {}) or {}),
+        "failed_review_batch_count": len(failed_batches),
+        "failed_review_batches": failed_batches,
     }
 
 

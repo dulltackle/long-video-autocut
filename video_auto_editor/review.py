@@ -92,6 +92,7 @@ class TopicReviewProviderResult:
     reviews: dict[int, TopicReviewResult] = field(default_factory=dict)
     error: str = ""
     provider_info: dict = field(default_factory=dict)
+    failed_batches: list = field(default_factory=list)
 
 
 class TopicReviewer(Protocol):
@@ -144,6 +145,7 @@ class StepFunChatReviewer:
             result = self._review_batch(batch)
             if not result.success:
                 result.provider_info = provider_info
+                result.reviews = dict(reviews)
                 return result
             reviews.update(result.reviews)
         return TopicReviewProviderResult(True, reviews=reviews, provider_info=provider_info)
@@ -246,6 +248,14 @@ class StepFunChatReviewer:
             time.sleep(delay)
 
     def _batch_failure(self, batch, attempt, failure_type, message):
+        failed_batch = {
+            "batch_index": batch.batch_index,
+            "candidate_range": _batch_candidate_range(batch),
+            "attempt": attempt,
+            "max_attempts": self.retry_attempts,
+            "failure_type": failure_type,
+            "error": message,
+        }
         return TopicReviewProviderResult(
             False,
             error=(
@@ -255,6 +265,7 @@ class StepFunChatReviewer:
                 f"attempt={attempt}/{self.retry_attempts} "
                 f"failure_type={failure_type}]"
             ),
+            failed_batches=[failed_batch],
         )
 
     def _read_cached_batch(self, batch, requested_ids):
