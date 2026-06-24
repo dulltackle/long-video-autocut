@@ -36,6 +36,7 @@ CONFIG = {
     "topic_review_timeout": 60,
     "topic_review_batch_size": 3,
     "topic_review_temperature": 0.2,
+    "topic_review_reasoning_effort": "",
     "topic_review_api_key_env": "STEPFUN_API_KEY",
     "topic_review_base_url_env": "STEPFUN_BASE_URL",
     "topic_review_base_url": "https://api.stepfun.com/v1",

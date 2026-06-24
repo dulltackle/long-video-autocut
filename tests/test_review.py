@@ -203,6 +203,51 @@ def test_stepfun_chat_reviewer_maps_success_response_to_review_result(monkeypatc
     assert calls[0][2]["messages"][1]["content"]
 
 
+def test_stepfun_chat_reviewer_injects_reasoning_effort_when_configured():
+    calls = []
+    batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})
+
+    def fake_request(request, timeout):
+        calls.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse(chat_response(review_content()))
+
+    reviewer = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_base_url": "https://api.example/v1",
+            "topic_review_reasoning_effort": "high",
+        },
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is True
+    assert calls[0]["reasoning_effort"] == "high"
+
+
+def test_stepfun_chat_reviewer_omits_reasoning_effort_when_blank():
+    calls = []
+    batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})
+
+    def fake_request(request, timeout):
+        calls.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse(chat_response(review_content()))
+
+    reviewer = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_base_url": "https://api.example/v1",
+        },
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is True
+    assert "reasoning_effort" not in calls[0]
+
+
 def test_stepfun_chat_reviewer_rejects_non_https_base_url_without_request():
     def fail_request(*args, **kwargs):
         raise AssertionError("unsafe base_url should not make HTTP request")

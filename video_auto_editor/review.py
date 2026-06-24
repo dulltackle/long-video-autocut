@@ -111,6 +111,7 @@ class StepFunChatReviewer:
         self.model = str(_config_get(self.config, "topic_review_model", "step-2-mini"))
         self.timeout = int(_config_get(self.config, "topic_review_timeout", 60))
         self.temperature = float(_config_get(self.config, "topic_review_temperature", 0.2))
+        self.reasoning_effort = str(_config_get(self.config, "topic_review_reasoning_effort", "")).strip()
         self.provider_name = str(_config_get(self.config, "topic_review_provider", "stepfun_chat"))
         self.request_func = request_func or urllib.request.urlopen
 
@@ -194,6 +195,8 @@ class StepFunChatReviewer:
                 },
             ],
         }
+        if self.reasoning_effort:
+            body["reasoning_effort"] = self.reasoning_effort
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         return urllib.request.Request(
             endpoint,
