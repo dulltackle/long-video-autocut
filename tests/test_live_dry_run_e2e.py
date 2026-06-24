@@ -159,7 +159,8 @@ def test_live_dry_run_generates_plan_report_and_transcript_without_exports(monke
     assert "第四段内容，需要人工确认边界。" in srt
     assert "00:01:30,000 --> 00:02:00,000" in srt
     assert len(asr_calls) == 2
-    assert len(review_calls) == 2
+    assert len(review_calls) == 1
+    assert len(list((work_dir / "live" / "topic_review_cache").glob("*.json"))) == 1
 
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     assert plan["status"] == "reviewed"
