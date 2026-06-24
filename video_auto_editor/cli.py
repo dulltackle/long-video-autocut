@@ -198,7 +198,12 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
     print(f"   Marked {sum(1 for candidate in candidates if candidate.is_duplicate)} duplicate candidates")
 
     print("\n🧠 Step 6: Reviewing clip topics...")
-    review_status, review_provider, review_warnings = _review_live_candidates(candidates, course_context, config)
+    review_status, review_provider, review_warnings = _review_live_candidates(
+        candidates,
+        course_context,
+        config,
+        video_work=video_work,
+    )
     if review_status == "reviewed":
         print(f"   ✅ Reviewed {len(candidates)} candidates")
     else:
@@ -351,14 +356,17 @@ def _live_candidate_score(candidate):
     return candidate.adjusted_score if candidate.adjusted_score is not None else candidate.base_score
 
 
-def _review_live_candidates(candidates, course_context, config):
+def _review_live_candidates(candidates, course_context, config, video_work=None):
     if not candidates:
         return "unreviewed", {}, []
     if not config.get("topic_review_enabled", True):
         return "unreviewed", {}, ["主题评审已关闭，plan.json status 为 unreviewed。"]
 
     try:
-        reviewer = create_topic_reviewer(config)
+        review_config = dict(config)
+        if video_work:
+            review_config["topic_review_cache_dir"] = os.path.join(video_work, "topic_review_cache")
+        reviewer = create_topic_reviewer(review_config)
     except ValueError as exc:
         return "unreviewed", {}, [f"主题评审 provider 配置错误：{exc}"]
 

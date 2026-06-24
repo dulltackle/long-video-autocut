@@ -1,5 +1,6 @@
 """直播主题评审输入构造与 provider 封装。"""
 
+import hashlib
 import json
 import os
 import time
@@ -27,6 +28,9 @@ REQUIRED_REVIEW_FIELDS = {
     "reject_reason",
     "boundary_fix_suggestion",
 }
+
+TOPIC_REVIEW_CACHE_SCHEMA_VERSION = "topic_review_cache_v1"
+TOPIC_REVIEW_PROMPT_VERSION = "stepfun_chat_topic_review_v1"
 
 
 @dataclass
@@ -120,6 +124,7 @@ class StepFunChatReviewer:
         self.temperature = float(_config_get(self.config, "topic_review_temperature", 0.2))
         self.reasoning_effort = str(_config_get(self.config, "topic_review_reasoning_effort", "")).strip()
         self.provider_name = str(_config_get(self.config, "topic_review_provider", "stepfun_chat"))
+        self.cache_dir = str(_config_get(self.config, "topic_review_cache_dir", "") or "")
         self.request_func = request_func or urllib.request.urlopen
 
     def is_available(self):
@@ -148,6 +153,10 @@ class StepFunChatReviewer:
             candidate.candidate_id: candidate.candidate_index
             for candidate in batch.candidates
         }
+        cached = self._read_cached_batch(batch, requested_ids)
+        if cached is not None:
+            return cached
+
         request_result = self._request_batch_with_retry(batch)
         if not request_result.success:
             return request_result
@@ -191,6 +200,7 @@ class StepFunChatReviewer:
                 _schema_failure_type(str(exc)),
                 str(exc),
             )
+        self._write_cached_batch(batch, requested_ids, reviews)
         return TopicReviewProviderResult(True, reviews=reviews)
 
     def _request_batch_with_retry(self, batch):
@@ -246,6 +256,66 @@ class StepFunChatReviewer:
                 f"failure_type={failure_type}]"
             ),
         )
+
+    def _read_cached_batch(self, batch, requested_ids):
+        cache_path = self._cache_path(batch)
+        if not cache_path or not os.path.exists(cache_path):
+            return None
+        try:
+            with open(cache_path, "r", encoding="utf-8") as cache_file:
+                payload = json.load(cache_file)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if payload.get("schema_version") != TOPIC_REVIEW_CACHE_SCHEMA_VERSION:
+            return None
+        if payload.get("signature") != self._cache_signature(batch):
+            return None
+        try:
+            reviews = _parse_review_payload({"reviews": payload.get("reviews")}, requested_ids)
+        except ValueError:
+            return None
+        return TopicReviewProviderResult(True, reviews=reviews, provider_info={"cache_hit": True})
+
+    def _write_cached_batch(self, batch, requested_ids, reviews):
+        cache_path = self._cache_path(batch)
+        if not cache_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            payload = {
+                "schema_version": TOPIC_REVIEW_CACHE_SCHEMA_VERSION,
+                "signature": self._cache_signature(batch),
+                "reviews": [
+                    _review_result_cache_item(candidate_id, reviews[candidate_index])
+                    for candidate_id, candidate_index in requested_ids.items()
+                    if candidate_index in reviews
+                ],
+            }
+            if len(payload["reviews"]) != len(requested_ids):
+                return
+            with open(cache_path, "w", encoding="utf-8") as cache_file:
+                json.dump(payload, cache_file, ensure_ascii=False, indent=2, sort_keys=True)
+                cache_file.write("\n")
+        except OSError:
+            return
+
+    def _cache_path(self, batch):
+        if not self.cache_dir:
+            return ""
+        return os.path.join(self.cache_dir, f"{self._cache_signature(batch)}.json")
+
+    def _cache_signature(self, batch):
+        payload = {
+            "schema_version": TOPIC_REVIEW_CACHE_SCHEMA_VERSION,
+            "prompt_version": TOPIC_REVIEW_PROMPT_VERSION,
+            "provider": self.provider_name,
+            "model": self.model,
+            "base_url": self.base_url,
+            "required_review_fields": sorted(REQUIRED_REVIEW_FIELDS),
+            "batch": batch.to_payload(),
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def _build_request(self, batch):
         _validate_https_base_url(self.base_url)
@@ -483,6 +553,26 @@ def _schema_failure_type(message):
     if "unknown candidate_id" in message:
         return "unknown_candidate"
     return "invalid_schema"
+
+
+def _review_result_cache_item(candidate_id, review):
+    return {
+        "candidate_id": candidate_id,
+        "topic_name": review.topic_name,
+        "topic_complete": review.topic_complete,
+        "learning_value": review.learning_value,
+        "share_value": review.share_value,
+        "publish_ready_score": review.publish_ready_score,
+        "export_decision": review.export_decision,
+        "title": review.title,
+        "summary": review.summary,
+        "keywords": list(review.keywords),
+        "needs_human_review": review.needs_human_review,
+        "reject_reason": review.reject_reason,
+        "boundary_fix_suggestion": review.boundary_fix_suggestion,
+        "boundary_fix_start": review.boundary_fix_start,
+        "boundary_fix_end": review.boundary_fix_end,
+    }
 
 
 def _positive_int_config(config, key, default):

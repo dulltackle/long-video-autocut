@@ -384,6 +384,106 @@ def test_stepfun_chat_reviewer_failure_includes_batch_index_and_candidate_range(
     assert "failure_type=timeout" in result.error
 
 
+def test_stepfun_chat_reviewer_uses_successful_batch_cache(tmp_path):
+    cache_dir = tmp_path / "topic_review_cache"
+    batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})
+    calls = []
+
+    def first_request(request, timeout):
+        calls.append(request)
+        return FakeResponse(chat_response(review_content()))
+
+    config = {
+        "topic_review_api_key": "sk-test",
+        "topic_review_base_url": "https://api.example/v1",
+        "topic_review_model": "review-model",
+        "topic_review_cache_dir": str(cache_dir),
+    }
+    first = StepFunChatReviewer(config, request_func=first_request)
+
+    first_result = first.review_batches(batches)
+
+    assert first_result.success is True
+    assert len(calls) == 1
+    assert len(list(cache_dir.glob("*.json"))) == 1
+
+    def fail_if_called(request, timeout):
+        raise AssertionError("cached batch should not make HTTP request")
+
+    second = StepFunChatReviewer(config, request_func=fail_if_called)
+
+    second_result = second.review_batches(batches)
+
+    assert second_result.success is True
+    assert second_result.reviews[0].title == "直播拆条的判断标准"
+
+
+def test_stepfun_chat_reviewer_cache_signature_changes_with_model(tmp_path):
+    cache_dir = tmp_path / "topic_review_cache"
+    batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})
+    calls = []
+
+    def fake_request(request, timeout):
+        calls.append(json.loads(request.data.decode("utf-8"))["model"])
+        return FakeResponse(chat_response(review_content(title=f"标题-{len(calls)}")))
+
+    base_config = {
+        "topic_review_api_key": "sk-test",
+        "topic_review_base_url": "https://api.example/v1",
+        "topic_review_model": "review-model-a",
+        "topic_review_cache_dir": str(cache_dir),
+    }
+
+    first = StepFunChatReviewer(base_config, request_func=fake_request)
+    second = StepFunChatReviewer({**base_config, "topic_review_model": "review-model-b"}, request_func=fake_request)
+
+    first_result = first.review_batches(batches)
+    second_result = second.review_batches(batches)
+
+    assert first_result.success is True
+    assert second_result.success is True
+    assert calls == ["review-model-a", "review-model-b"]
+    assert second_result.reviews[0].title == "标题-2"
+    assert len(list(cache_dir.glob("*.json"))) == 2
+
+
+def test_stepfun_chat_reviewer_does_not_cache_failed_batch(tmp_path):
+    cache_dir = tmp_path / "topic_review_cache"
+    batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})
+
+    failing = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_cache_dir": str(cache_dir),
+        },
+        request_func=lambda request, timeout: FakeResponse(chat_response("{bad json")),
+    )
+
+    failed_result = failing.review_batches(batches)
+
+    assert failed_result.success is False
+    assert list(cache_dir.glob("*.json")) == []
+
+    calls = []
+
+    def success_request(request, timeout):
+        calls.append(request)
+        return FakeResponse(chat_response(review_content()))
+
+    succeeding = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_cache_dir": str(cache_dir),
+        },
+        request_func=success_request,
+    )
+
+    success_result = succeeding.review_batches(batches)
+
+    assert success_result.success is True
+    assert len(calls) == 1
+
+
 def test_stepfun_chat_reviewer_rejects_non_https_base_url_without_request():
     def fail_request(*args, **kwargs):
         raise AssertionError("unsafe base_url should not make HTTP request")
