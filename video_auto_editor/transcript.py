@@ -1,12 +1,12 @@
 """Whisper CLI 转写封装。"""
 
+import base64
 import json
 import os
 import re
 import subprocess
 import sys
 import time
-import uuid
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -435,16 +435,7 @@ class StepAudioTranscriber:
                 self._sleep_before_retry(attempt_index)
 
         try:
-            payload = json.loads(response_body)
-        except json.JSONDecodeError as exc:
-            return VideoTranscriptionResult(
-                success=False,
-                chunks=[],
-                error=f"StepAudio response is not valid JSON: {exc}",
-            )
-
-        try:
-            chunks = _parse_stepaudio_payload(payload)
+            chunks = _parse_stepaudio_sse(response_body)
         except ValueError as exc:
             return VideoTranscriptionResult(
                 success=False,
@@ -779,15 +770,81 @@ def _parse_whisper_json(transcript_path):
     return []
 
 
-def _parse_stepaudio_payload(payload):
-    segments = _extract_stepaudio_segments(payload)
-    chunks = []
-    for segment in segments:
-        text = str(segment.get("text", "")).strip()
-        if not text:
+_STEPAUDIO_SENTENCE_ENDINGS = "。！？!?…."
+_STEPAUDIO_MAX_CHUNK_CHARS = 40
+
+
+def _parse_stepaudio_sse(response_body):
+    """解析 StepAudio ASR SSE 流，提取带时间戳的 delta 事件并聚合成句级分段。"""
+    deltas = []
+    error_message = None
+    for raw_line in str(response_body).splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
             continue
-        chunks.append(_chunk_from_dict(segment))
+        data = line[len("data:"):].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        if event_type == "error":
+            error_message = str(event.get("message") or "unknown error")
+            continue
+        if event_type != "transcript.text.delta":
+            continue
+        delta = str(event.get("delta", ""))
+        if not delta.strip():
+            continue
+        start = _stepaudio_ms_to_seconds(event.get("start_time"))
+        end = _stepaudio_ms_to_seconds(event.get("end_time"))
+        if start is None or end is None:
+            continue
+        deltas.append((start, end, delta))
+
+    chunks = _aggregate_stepaudio_deltas(deltas)
+    if not chunks and error_message is not None:
+        raise ValueError(f"StepAudio SSE error: {error_message}")
     return chunks
+
+
+def _aggregate_stepaudio_deltas(deltas):
+    """把逐字 delta 聚合为句级分段：遇句末标点或超长即断句。
+
+    依赖 StepAudio ASR SSE 的 delta 为逐字（单字符）粒度：因此句末标点会单独成段，
+    分段的 end 取触发断句那个 delta 的 end_time 是准确的；若未来 API 改为多字符 delta、
+    且标点不在 delta 末尾，end 可能越界并与下一段重叠，届时需改为按字符级跟踪边界。
+    """
+    chunks = []
+    start = None
+    end = None
+    buffer = ""
+    for delta_start, delta_end, delta in deltas:
+        if start is None:
+            start = delta_start
+        end = delta_end
+        buffer += delta
+        buffer_stripped = buffer.strip()
+        last_char = delta.strip()[-1:]
+        if last_char in _STEPAUDIO_SENTENCE_ENDINGS or len(buffer_stripped) >= _STEPAUDIO_MAX_CHUNK_CHARS:
+            chunks.append(TranscriptChunk(start=start, end=end, text=buffer_stripped))
+            start = None
+            end = None
+            buffer = ""
+    if buffer.strip():
+        chunks.append(TranscriptChunk(start=start, end=end, text=buffer.strip()))
+    return chunks
+
+
+def _stepaudio_ms_to_seconds(value):
+    try:
+        return float(value) / 1000.0
+    except (TypeError, ValueError):
+        return None
 
 
 def _probe_media_duration(video_path):
@@ -879,26 +936,6 @@ def _merge_chunk_text(left, right):
     return f"{left} {right}"
 
 
-def _extract_stepaudio_segments(payload):
-    if isinstance(payload, list):
-        return payload
-    if not isinstance(payload, dict):
-        raise ValueError("StepAudio response is not a JSON object")
-
-    for key in ("segments", "chunks"):
-        if isinstance(payload.get(key), list):
-            return payload[key]
-
-    for key in ("data", "result"):
-        nested = payload.get(key)
-        if isinstance(nested, dict):
-            for nested_key in ("segments", "chunks"):
-                if isinstance(nested.get(nested_key), list):
-                    return nested[nested_key]
-
-    raise ValueError("StepAudio response missing timestamped segments")
-
-
 def _chunk_from_dict(item):
     try:
         return TranscriptChunk(
@@ -975,56 +1012,60 @@ def _normalize_subtitle_text(text):
 
 
 def _build_stepaudio_request(video_path, config):
-    boundary = f"----video-auto-editor-{uuid.uuid4().hex}"
-    body = _encode_stepaudio_multipart(video_path, config, boundary)
-    url = _join_url(config.base_url, "audio/transcriptions")
+    body = _encode_stepaudio_payload(video_path, config)
+    url = _join_url(config.base_url, "audio/asr/sse")
     return urllib.request.Request(
         url,
         data=body,
         headers={
             "Authorization": f"Bearer {config.api_key}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
         },
         method="POST",
     )
 
 
-def _encode_stepaudio_multipart(video_path, config, boundary):
-    file_name = _sanitize_multipart_filename(os.path.basename(video_path))
-    with open(video_path, "rb") as video_file:
-        file_content = video_file.read()
+def _encode_stepaudio_payload(video_path, config):
+    # 此处传入的是分片音频，已被 asr_shard_seconds 限制在 SSE 端点允许的大小内
+    # （base64 后须 ≤10MB），故整片读入内存可接受；若改大分片需同步评估内存占用。
+    with open(video_path, "rb") as audio_file:
+        audio_content = audio_file.read()
 
-    fields = [
-        ("model", config.model),
-        ("language", config.language),
-        ("response_format", "verbose_json"),
-    ]
-    body = bytearray()
-    for name, value in fields:
-        body.extend(f"--{boundary}\r\n".encode("utf-8"))
-        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
-        body.extend(str(value).encode("utf-8"))
-        body.extend(b"\r\n")
+    payload = {
+        "audio": {
+            "data": base64.b64encode(audio_content).decode("ascii"),
+            "input": {
+                "transcription": {
+                    "language": config.language,
+                    "model": config.model,
+                    "enable_itn": True,
+                    "enable_timestamp": True,
+                },
+                "format": _stepaudio_audio_format(config),
+            },
+        }
+    }
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
-    body.extend(f"--{boundary}\r\n".encode("utf-8"))
-    body.extend(
-        (
-            f'Content-Disposition: form-data; name="file"; filename="{file_name}"\r\n'
-            "Content-Type: application/octet-stream\r\n\r\n"
-        ).encode("utf-8")
-    )
-    body.extend(file_content)
-    body.extend(b"\r\n")
-    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
-    return bytes(body)
+
+def _stepaudio_audio_format(config):
+    audio_format = _sanitize_audio_format(config.audio_format)
+    fmt = {"type": audio_format}
+    if audio_format == "pcm":
+        fmt.update(
+            {
+                "codec": "pcm_s16le",
+                "rate": int(config.audio_sample_rate),
+                "bits": 16,
+                "channel": int(config.audio_channels),
+            }
+        )
+    return fmt
 
 
 def _join_url(base_url, path):
     return f"{str(base_url).rstrip('/')}/{path.lstrip('/')}"
-
-
-def _sanitize_multipart_filename(file_name):
-    return re.sub(r'[\r\n"\\]', "_", str(file_name)) or "upload.bin"
 
 
 def _sanitize_audio_format(audio_format):

@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import subprocess
@@ -39,6 +40,24 @@ def install_stepaudio_media_success(monkeypatch, duration="125.0"):
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(transcript.subprocess, "run", fake_run)
+
+
+def stepaudio_sse(*deltas, text=""):
+    """构造 StepAudio ASR SSE 响应体。
+
+    每个 delta 为 (start_seconds, end_seconds, text)，时间戳以毫秒写入流中。
+    """
+    lines = []
+    for start, end, delta_text in deltas:
+        event = {
+            "type": "transcript.text.delta",
+            "delta": delta_text,
+            "start_time": int(round(start * 1000)),
+            "end_time": int(round(end * 1000)),
+        }
+        lines.append("data: " + json.dumps(event, ensure_ascii=False))
+    lines.append("data: " + json.dumps({"type": "transcript.text.done", "text": text}, ensure_ascii=False))
+    return ("\n\n".join(lines) + "\n\n").encode("utf-8")
 
 
 def test_is_available_returns_true_when_whisper_help_succeeds(monkeypatch):
@@ -774,12 +793,7 @@ def test_stepaudio_transcribe_video_converts_success_response(monkeypatch, tmp_p
             return False
 
         def read(self):
-            return (
-                '{"segments": ['
-                '{"start": 1.25, "end": 2.5, "text": " 第一段 "},'
-                '{"start": 3, "end": 4, "text": ""}'
-                "]}"
-            ).encode("utf-8")
+            return stepaudio_sse((1.25, 2.5, " 第一段 "), (3, 4, ""))
 
     def fake_request(request, timeout):
         captured["request"] = request
@@ -804,12 +818,56 @@ def test_stepaudio_transcribe_video_converts_success_response(monkeypatch, tmp_p
     assert result.transcript_path == str(tmp_path / "live.stepaudio.json")
     assert json.loads((tmp_path / "live.stepaudio.json").read_text(encoding="utf-8"))["chunks"][0]["text"] == "第一段"
     assert captured["timeout"] == 30
-    assert captured["request"].full_url == "https://example.test/v1/audio/transcriptions"
-    body = captured["request"].data
-    assert b'name="model"\r\n\r\nstepaudio-2.5-asr' in body
-    assert b'name="language"\r\n\r\nzh' in body
-    assert b'name="file"; filename="shard_0000.wav"' in body
-    assert b"audio" in body
+    request = captured["request"]
+    assert request.full_url == "https://example.test/v1/audio/asr/sse"
+    assert request.get_header("Content-type") == "application/json"
+    assert request.get_header("Accept") == "text/event-stream"
+    payload = json.loads(request.data.decode("utf-8"))
+    transcription = payload["audio"]["input"]["transcription"]
+    assert transcription["model"] == "stepaudio-2.5-asr"
+    assert transcription["language"] == "zh"
+    assert transcription["enable_timestamp"] is True
+    assert payload["audio"]["input"]["format"] == {"type": "wav"}
+    assert base64.b64decode(payload["audio"]["data"]) == b"audio"
+
+
+def test_stepaudio_aggregates_per_character_deltas_into_sentences(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+    install_stepaudio_media_success(monkeypatch)
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            # StepAudio SSE 返回逐字 delta，应按句末标点聚合成句级分段。
+            return stepaudio_sse(
+                (0.0, 0.5, "今"),
+                (0.5, 1.0, "天"),
+                (1.0, 1.5, "好"),
+                (1.5, 2.0, "。"),
+                (2.0, 2.5, "明"),
+                (2.5, 3.0, "天"),
+                (3.0, 3.5, "见"),
+                (3.5, 4.0, "！"),
+            )
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key"),
+        request_func=lambda *args, **kwargs: FakeResponse(),
+    )
+
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+
+    assert result.success is True
+    assert result.chunks == [
+        TranscriptChunk(0.0, 2.0, "今天好。"),
+        TranscriptChunk(2.0, 4.0, "明天见！"),
+    ]
 
 
 def test_stepaudio_transcribe_video_offsets_and_sorts_shard_chunks(monkeypatch, tmp_path):
@@ -817,9 +875,9 @@ def test_stepaudio_transcribe_video_offsets_and_sorts_shard_chunks(monkeypatch, 
     video_path.write_bytes(b"video")
     install_stepaudio_media_success(monkeypatch, duration="70.0")
     responses = [
-        '{"segments": [{"start": 5, "end": 10, "text": " 第一段 "}]}',
-        '{"segments": [{"start": 0, "end": 30, "text": "第二段"}]}',
-        '{"segments": [{"start": 0, "end": 5, "text": "第三段"}]}',
+        stepaudio_sse((5, 10, " 第一段 ")),
+        stepaudio_sse((0, 30, "第二段")),
+        stepaudio_sse((0, 5, "第三段")),
     ]
     calls = []
 
@@ -834,7 +892,7 @@ def test_stepaudio_transcribe_video_offsets_and_sorts_shard_chunks(monkeypatch, 
             return False
 
         def read(self):
-            return self.body.encode("utf-8")
+            return self.body
 
     def fake_request(request, timeout):
         calls.append(request)
@@ -861,8 +919,8 @@ def test_stepaudio_transcribe_video_merges_overlapping_shard_chunks(monkeypatch,
     video_path.write_bytes(b"video")
     install_stepaudio_media_success(monkeypatch, duration="40.0")
     responses = [
-        '{"segments": [{"start": 0, "end": 25, "text": "第一段"}]}',
-        '{"segments": [{"start": 0, "end": 15, "text": "第一段"}, {"start": 14, "end": 20, "text": "第二段"}]}',
+        stepaudio_sse((0, 25, "第一段")),
+        stepaudio_sse((0, 15, "第一段"), (14, 20, "第二段")),
     ]
     calls = []
 
@@ -877,7 +935,7 @@ def test_stepaudio_transcribe_video_merges_overlapping_shard_chunks(monkeypatch,
             return False
 
         def read(self):
-            return self.body.encode("utf-8")
+            return self.body
 
     def fake_request(request, timeout):
         calls.append(request)
@@ -891,7 +949,7 @@ def test_stepaudio_transcribe_video_merges_overlapping_shard_chunks(monkeypatch,
     result = transcriber.transcribe_video(str(video_path), str(tmp_path))
 
     assert result.success is True
-    assert result.chunks == [TranscriptChunk(0, 40, "第一段 第二段")]
+    assert result.chunks == [TranscriptChunk(0, 40, "第一段第二段")]
     assert len(calls) == 2
 
 
@@ -902,9 +960,9 @@ def test_stepaudio_shard_cache_reuses_chunks_when_overall_cache_missing(monkeypa
     install_stepaudio_media_success(monkeypatch, duration="70.0")
     calls = []
     responses = [
-        '{"segments": [{"start": 0, "end": 10, "text": "第一段"}]}',
-        '{"segments": [{"start": 0, "end": 20, "text": "第二段"}]}',
-        '{"segments": [{"start": 0, "end": 5, "text": "第三段"}]}',
+        stepaudio_sse((0, 10, "第一段")),
+        stepaudio_sse((0, 20, "第二段")),
+        stepaudio_sse((0, 5, "第三段")),
     ]
 
     class FakeResponse:
@@ -918,7 +976,7 @@ def test_stepaudio_shard_cache_reuses_chunks_when_overall_cache_missing(monkeypa
             return False
 
         def read(self):
-            return self.body.encode("utf-8")
+            return self.body
 
     def fake_request(request, timeout):
         calls.append(request)
@@ -992,10 +1050,10 @@ def test_stepaudio_corrupted_shard_cache_only_retries_that_shard(monkeypatch, tm
     install_stepaudio_media_success(monkeypatch, duration="70.0")
     calls = []
     responses = [
-        '{"segments": [{"start": 0, "end": 10, "text": "第一段"}]}',
-        '{"segments": [{"start": 0, "end": 20, "text": "第二段"}]}',
-        '{"segments": [{"start": 0, "end": 5, "text": "第三段"}]}',
-        '{"segments": [{"start": 1, "end": 21, "text": "第二段重识别"}]}',
+        stepaudio_sse((0, 10, "第一段")),
+        stepaudio_sse((0, 20, "第二段")),
+        stepaudio_sse((0, 5, "第三段")),
+        stepaudio_sse((1, 21, "第二段重识别")),
     ]
 
     class FakeResponse:
@@ -1009,7 +1067,7 @@ def test_stepaudio_corrupted_shard_cache_only_retries_that_shard(monkeypatch, tm
             return False
 
         def read(self):
-            return self.body.encode("utf-8")
+            return self.body
 
     def fake_request(request, timeout):
         calls.append(request)
@@ -1050,7 +1108,7 @@ def test_stepaudio_retryable_request_succeeds_and_writes_shard_cache(monkeypatch
             return False
 
         def read(self):
-            return '{"segments": [{"start": 0, "end": 5, "text": "重试成功"}]}'.encode("utf-8")
+            return stepaudio_sse((0, 5, "重试成功"))
 
     def fake_request(request, timeout):
         calls.append(request)
@@ -1096,7 +1154,7 @@ def test_stepaudio_retry_exhaustion_reports_shard_index(monkeypatch, tmp_path):
     assert len(calls) == 2
 
 
-def test_stepaudio_non_retryable_invalid_json_does_not_retry(tmp_path):
+def test_stepaudio_non_retryable_empty_stream_does_not_retry(tmp_path):
     audio_path = tmp_path / "shard.wav"
     audio_path.write_bytes(b"audio")
     calls = []
@@ -1109,7 +1167,7 @@ def test_stepaudio_non_retryable_invalid_json_does_not_retry(tmp_path):
             return False
 
         def read(self):
-            return b"{bad json"
+            return stepaudio_sse()
 
     def fake_request(request, timeout):
         calls.append(request)
@@ -1123,7 +1181,7 @@ def test_stepaudio_non_retryable_invalid_json_does_not_retry(tmp_path):
     result = transcriber.transcribe_audio_shard(str(audio_path), shard_index=0)
 
     assert result.success is False
-    assert "StepAudio response is not valid JSON" in result.error
+    assert result.error == "StepAudio response missing timestamped segments"
     assert len(calls) == 1
 
 
@@ -1156,8 +1214,8 @@ def test_stepaudio_shard_cache_invalidates_when_audio_config_changes(monkeypatch
     install_stepaudio_media_success(monkeypatch, duration="10.0")
     calls = []
     responses = [
-        '{"segments": [{"start": 0, "end": 5, "text": "旧配置"}]}',
-        '{"segments": [{"start": 0, "end": 5, "text": "新配置"}]}',
+        stepaudio_sse((0, 5, "旧配置")),
+        stepaudio_sse((0, 5, "新配置")),
     ]
 
     class FakeResponse:
@@ -1171,7 +1229,7 @@ def test_stepaudio_shard_cache_invalidates_when_audio_config_changes(monkeypatch
             return False
 
         def read(self):
-            return self.body.encode("utf-8")
+            return self.body
 
     def fake_request(request, timeout):
         calls.append(request)
@@ -1208,7 +1266,7 @@ def test_stepaudio_transcribe_video_rejects_invalid_shard_timestamp(monkeypatch,
             return False
 
         def read(self):
-            return '{"segments": [{"start": 10, "end": 5, "text": "坏时间戳"}]}'.encode("utf-8")
+            return stepaudio_sse((10, 5, "坏时间戳"))
 
     transcriber = StepAudioTranscriber(
         StepAudioConfig(api_key="test-key"),
@@ -1363,8 +1421,8 @@ def test_stepaudio_transcribe_video_reports_shard_cut_failure(monkeypatch, tmp_p
     assert result.error == "StepAudio shard 0 audio cut failed: cut failed"
 
 
-def test_stepaudio_multipart_sanitizes_filename(tmp_path):
-    audio_path = tmp_path / 'bad"name\n.wav'
+def test_stepaudio_request_encodes_pcm_format_with_codec(tmp_path):
+    audio_path = tmp_path / "shard.pcm"
     audio_path.write_bytes(b"audio")
     captured = {}
 
@@ -1376,28 +1434,49 @@ def test_stepaudio_multipart_sanitizes_filename(tmp_path):
             return False
 
         def read(self):
-            return b'{"segments": [{"start": 0, "end": 1, "text": "ok"}]}'
+            return stepaudio_sse((0, 1, "ok"))
 
     def fake_request(request, timeout):
         captured["body"] = request.data
         return FakeResponse()
 
     transcriber = StepAudioTranscriber(
-        StepAudioConfig(api_key="test-key"),
+        StepAudioConfig(
+            api_key="test-key",
+            audio_format="pcm",
+            audio_sample_rate=16000,
+            audio_channels=1,
+        ),
         request_func=fake_request,
     )
 
     result = transcriber.transcribe_audio_shard(str(audio_path))
 
     assert result.success is True
-    assert b'filename="bad_name_.wav"' in captured["body"]
-    assert b'filename="bad"name' not in captured["body"]
+    payload = json.loads(captured["body"].decode("utf-8"))
+    assert payload["audio"]["input"]["format"] == {
+        "type": "pcm",
+        "codec": "pcm_s16le",
+        "rate": 16000,
+        "bits": 16,
+        "channel": 1,
+    }
+    assert base64.b64decode(payload["audio"]["data"]) == b"audio"
 
 
-def test_stepaudio_transcribe_video_supports_nested_segments(monkeypatch, tmp_path):
+def test_stepaudio_sse_ignores_non_delta_and_blank_events(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_bytes(b"video")
     install_stepaudio_media_success(monkeypatch)
+
+    stream = (
+        ": keep-alive comment\n\n"
+        'data: {"type": "transcript.text.delta", "delta": " 第一段 ", "start_time": 10000, "end_time": 12000}\n\n'
+        'data: {"type": "transcript.text.delta", "delta": "   ", "start_time": 12000, "end_time": 13000}\n\n'
+        'data: {"type": "session.created", "session_id": "sse_x"}\n\n'
+        'data: {"type": "transcript.text.done", "text": "第一段"}\n\n'
+        "data: [DONE]\n\n"
+    ).encode("utf-8")
 
     class FakeResponse:
         def __enter__(self):
@@ -1407,7 +1486,7 @@ def test_stepaudio_transcribe_video_supports_nested_segments(monkeypatch, tmp_pa
             return False
 
         def read(self):
-            return '{"data": {"segments": [{"start": 10, "end": 12, "text": "嵌套片段"}]}}'.encode("utf-8")
+            return stream
 
     transcriber = StepAudioTranscriber(
         StepAudioConfig(api_key="test-key"),
@@ -1417,7 +1496,7 @@ def test_stepaudio_transcribe_video_supports_nested_segments(monkeypatch, tmp_pa
     result = transcriber.transcribe_video(str(video_path), str(tmp_path))
 
     assert result.success is True
-    assert result.chunks == [TranscriptChunk(10, 12, "嵌套片段")]
+    assert result.chunks == [TranscriptChunk(10, 12, "第一段")]
 
 
 def test_stepaudio_transcribe_video_returns_http_error(monkeypatch, tmp_path):
@@ -1446,7 +1525,7 @@ def test_stepaudio_transcribe_video_returns_http_error(monkeypatch, tmp_path):
     assert result.error == "StepAudio shard 0 request failed after 1 attempts: HTTP 500: failed"
 
 
-def test_stepaudio_transcribe_video_returns_invalid_json_error(monkeypatch, tmp_path):
+def test_stepaudio_transcribe_video_surfaces_sse_error_event(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_bytes(b"video")
     install_stepaudio_media_success(monkeypatch)
@@ -1459,7 +1538,7 @@ def test_stepaudio_transcribe_video_returns_invalid_json_error(monkeypatch, tmp_
             return False
 
         def read(self):
-            return b"{bad json"
+            return b'data: {"type": "error", "message": "decode failed"}\n\n'
 
     transcriber = StepAudioTranscriber(
         StepAudioConfig(api_key="test-key"),
@@ -1470,7 +1549,7 @@ def test_stepaudio_transcribe_video_returns_invalid_json_error(monkeypatch, tmp_
 
     assert result.success is False
     assert result.chunks == []
-    assert "StepAudio response is not valid JSON" in result.error
+    assert result.error == "StepAudio SSE error: decode failed"
 
 
 def test_stepaudio_transcribe_video_returns_missing_timestamp_error(monkeypatch, tmp_path):
@@ -1486,7 +1565,7 @@ def test_stepaudio_transcribe_video_returns_missing_timestamp_error(monkeypatch,
             return False
 
         def read(self):
-            return b'{"text": "no timestamps"}'
+            return stepaudio_sse(text="no timestamps")
 
     transcriber = StepAudioTranscriber(
         StepAudioConfig(api_key="test-key"),

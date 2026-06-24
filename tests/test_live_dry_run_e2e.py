@@ -7,6 +7,20 @@ def completed(returncode=0, stderr="", stdout=""):
     return type("Completed", (), {"returncode": returncode, "stderr": stderr, "stdout": stdout})()
 
 
+def sse(*deltas):
+    lines = []
+    for start, end, text in deltas:
+        event = {
+            "type": "transcript.text.delta",
+            "delta": text,
+            "start_time": int(round(start * 1000)),
+            "end_time": int(round(end * 1000)),
+        }
+        lines.append("data: " + json.dumps(event, ensure_ascii=False))
+    lines.append('data: {"type": "transcript.text.done", "text": ""}')
+    return "\n\n".join(lines) + "\n\n"
+
+
 def test_live_dry_run_generates_plan_report_and_transcript_without_exports(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_text("fake video", encoding="utf-8")
@@ -15,23 +29,13 @@ def test_live_dry_run_generates_plan_report_and_transcript_without_exports(monke
     asr_calls = []
     review_calls = []
     asr_responses = [
-        json.dumps(
-            {
-                "segments": [
-                    {"start": 0, "end": 30, "text": "第一段内容，介绍核心概念。"},
-                    {"start": 30, "end": 60, "text": "第二段内容，展开方法步骤。"},
-                ]
-            },
-            ensure_ascii=False,
+        sse(
+            (0, 30, "第一段内容，介绍核心概念。"),
+            (30, 60, "第二段内容，展开方法步骤。"),
         ),
-        json.dumps(
-            {
-                "segments": [
-                    {"start": 0, "end": 30, "text": "第三段内容，展开案例。"},
-                    {"start": 30, "end": 60, "text": "第四段内容，需要人工确认边界。"},
-                ]
-            },
-            ensure_ascii=False,
+        sse(
+            (0, 30, "第三段内容，展开案例。"),
+            (30, 60, "第四段内容，需要人工确认边界。"),
         ),
     ]
 
@@ -61,7 +65,7 @@ def test_live_dry_run_generates_plan_report_and_transcript_without_exports(monke
         raise AssertionError(f"unexpected command: {cmd}")
 
     def fake_request(request, timeout):
-        if request.full_url.endswith("/audio/transcriptions"):
+        if request.full_url.endswith("/audio/asr/sse"):
             asr_calls.append(request)
             return FakeResponse(asr_responses[len(asr_calls) - 1])
         if request.full_url.endswith("/chat/completions"):

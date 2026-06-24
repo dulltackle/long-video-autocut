@@ -185,8 +185,26 @@ class StepFunChatReviewer:
                 {
                     "role": "system",
                     "content": (
-                        "你是直播课程短视频主题评审器。"
-                        "请只返回 JSON object，格式为 {\"reviews\": [...]}。"
+                        "你是直播课程短视频主题评审器。输入 candidates 是按时间排序的候选片段，"
+                        "你要为输入里的每一个候选各产出一条评审，并只返回一个 JSON object，"
+                        "结构为 {\"reviews\": [<逐个候选的评审对象>]}。\n"
+                        "reviews 必须是数组，数组里的每个元素都必须是对象（不能是字符串），"
+                        "且与输入候选一一对应。每个评审对象必须且只能包含以下字段：\n"
+                        "- candidate_id: 字符串，原样回填对应候选的 candidate_id；\n"
+                        "- topic_name: 字符串，该片段的主题名；\n"
+                        "- topic_complete: 布尔，主题是否自成完整一段；\n"
+                        "- learning_value: 整数 0-10，学习价值；\n"
+                        "- share_value: 整数 0-10，传播价值；\n"
+                        "- publish_ready_score: 整数 0-100，发布就绪综合分；\n"
+                        "- export_decision: 字符串，取值 publish_ready / needs_review / reject 之一；\n"
+                        "- title: 字符串，建议的短视频标题；\n"
+                        "- summary: 字符串，一句话内容摘要；\n"
+                        "- keywords: 字符串数组，关键词；\n"
+                        "- needs_human_review: 布尔，是否需要人工复核；\n"
+                        "- reject_reason: 字符串，若不建议发布则给出原因，否则空字符串；\n"
+                        "- boundary_fix_suggestion: 字符串，边界修正建议，无则空字符串；\n"
+                        "可选字段 boundary_fix_start / boundary_fix_end 为数字（秒），用于建议裁剪边界。\n"
+                        "不要输出除该 JSON object 以外的任何文字。"
                     ),
                 },
                 {
