@@ -491,19 +491,26 @@ def create_topic_reviewer(config=None, request_func=None):
     raise ValueError(f"Unknown topic review provider: {provider}")
 
 
+_REVIEW_LIST_ALIASES = ("reviews", "candidates", "results", "data")
+
+
 def _coerce_review_items(payload):
     """兼容评审模型的多种返回形态，统一成评审对象列表。
 
-    既接受规范的 {"reviews": [...]}，也接受裸数组 [...] 和裸单个评审对象
-    {"candidate_id": ...}，以适配未严格遵循 schema 的 Chat 模型。
+    既接受规范的 {"reviews": [...]}，也接受 candidates/results/data 等常见别名键
+    包裹的数组（仅当其值为 list 时），以及裸数组 [...] 和裸单个评审对象
+    {"candidate_id": ...}，以适配未严格遵循 schema 的 Chat 模型。别名仅放宽
+    "数组放在哪个键下"，每个评审对象仍走 _parse_review_payload 的完整字段与
+    candidate_id 校验，不掩盖契约违例。
 
     部分模型偶发把首个键名写坏（candidate_id 键被破坏），但其余必填评审字段
     完整。只要对象包含全部 REQUIRED_REVIEW_FIELDS，仍按裸单个评审对象处理，
     candidate_id 留待 _parse_review_payload 在单候选批次中按上下文回填。
     """
     if isinstance(payload, dict):
-        if isinstance(payload.get("reviews"), list):
-            return payload["reviews"]
+        for alias in _REVIEW_LIST_ALIASES:
+            if isinstance(payload.get(alias), list):
+                return payload[alias]
         if "candidate_id" in payload:
             return [payload]
         if REQUIRED_REVIEW_FIELDS.issubset(payload.keys()):

@@ -827,6 +827,72 @@ def test_stepfun_chat_reviewer_reports_unknown_candidate_id():
     assert "failure_type=unknown_candidate" in result.error
 
 
+def _review_item(candidate_id, **overrides):
+    item = json.loads(review_content(candidate_id=candidate_id))["reviews"][0]
+    item.update(overrides)
+    return item
+
+
+def test_stepfun_chat_reviewer_accepts_candidates_alias_for_reviews_list():
+    # step-3.7-flash 等模型多候选时会把评审数组写进 candidates 键而非 reviews。
+    candidates = [make_candidate(index, index * 30) for index in range(4)]
+    batches = build_topic_review_batches(candidates, config={"topic_review_batch_size": 4})
+    items = [_review_item(f"candidate_{index}", title=f"标题{index}") for index in range(4)]
+
+    def fake_request(request, timeout):
+        return FakeResponse(chat_response(json.dumps({"candidates": items}, ensure_ascii=False)))
+
+    reviewer = StepFunChatReviewer(
+        {"topic_review_api_key": "sk-test", "topic_review_base_url": "https://api.example/v1"},
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is True
+    assert set(result.reviews.keys()) == {0, 1, 2, 3}
+    assert result.reviews[2].title == "标题2"
+
+
+@pytest.mark.parametrize("alias", ["results", "data"])
+def test_stepfun_chat_reviewer_accepts_results_and_data_aliases(alias):
+    candidates = [make_candidate(0, 0), make_candidate(1, 30)]
+    batches = build_topic_review_batches(candidates, config={"topic_review_batch_size": 2})
+    items = [_review_item("candidate_0", title="甲"), _review_item("candidate_1", title="乙")]
+
+    def fake_request(request, timeout):
+        return FakeResponse(chat_response(json.dumps({alias: items}, ensure_ascii=False)))
+
+    reviewer = StepFunChatReviewer(
+        {"topic_review_api_key": "sk-test", "topic_review_base_url": "https://api.example/v1"},
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is True
+    assert result.reviews[0].title == "甲"
+    assert result.reviews[1].title == "乙"
+
+
+def test_stepfun_chat_reviewer_rejects_non_list_alias_value():
+    # 别名只放宽"数组放在哪个键下"，值非 list 时仍按非法形态报错，不放宽严格性。
+    batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})
+
+    def fake_request(request, timeout):
+        return FakeResponse(chat_response(json.dumps({"candidates": "x"}, ensure_ascii=False)))
+
+    reviewer = StepFunChatReviewer(
+        {"topic_review_api_key": "sk-test", "topic_review_retry_attempts": 1},
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is False
+    assert "Topic review response must contain a reviews list" in result.error
+
+
 def test_create_topic_reviewer_rejects_unknown_provider():
     with pytest.raises(ValueError, match="Unknown topic review provider: unknown"):
         create_topic_reviewer({"topic_review_provider": "unknown"})
