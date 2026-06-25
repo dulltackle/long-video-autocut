@@ -886,7 +886,9 @@ def test_process_live_video_passes_clean_review_provider_to_export_after_review_
         "model": "fake-review",
         "base_url": "https://api.example/v1",
     }
-    assert captured["review_status"] == "unreviewed"
+    # 新契约：只要有任意候选评审成功即进入 reviewed 选择路径，失败批次的候选自然跳过，
+    # 但传给导出的 review_provider 仍保持干净（不泄漏 review_diagnostics）。
+    assert captured["review_status"] == "reviewed"
     assert captured["review_provider"] == expected_provider
     assert "review_diagnostics" not in captured["review_provider"]
     plan = json.loads((output_dir / "plan.json").read_text(encoding="utf-8"))

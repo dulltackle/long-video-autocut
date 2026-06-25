@@ -388,7 +388,11 @@ def _review_live_candidates(candidates, course_context, config, video_work=None)
 
     result = reviewer.review_batches(batches)
     provider_info = result.provider_info or provider_info
-    if not result.success:
+
+    # 只要有任意候选评审成功，就进入 reviewed 选择路径：失败批次内的候选因无 review，
+    # 会在 _reviewed_rejection_reason 中以 missing_review 自然跳过导出。仅当成功评审数
+    # 为 0 时才整体降级为 unreviewed，保护既有契约。
+    if not result.reviews:
         provider_info = dict(provider_info)
         provider_info["review_diagnostics"] = _review_failure_diagnostics(result)
         return "unreviewed", provider_info, [f"主题评审失败：{result.error}"]
@@ -401,7 +405,15 @@ def _review_live_candidates(candidates, course_context, config, video_work=None)
         candidate.title = review.title or candidate.title
         candidate.summary = review.summary or candidate.summary
         candidate.keywords = list(review.keywords) or candidate.keywords
-    return "reviewed", provider_info, []
+
+    warnings = []
+    if result.failed_batches:
+        provider_info = dict(provider_info)
+        provider_info["review_diagnostics"] = _review_failure_diagnostics(result)
+        warnings.append(
+            f"部分批次评审失败（{len(result.failed_batches)}/{len(batches)}），相关候选已跳过导出。"
+        )
+    return "reviewed", provider_info, warnings
 
 
 def _topic_reviewer_info(reviewer):
