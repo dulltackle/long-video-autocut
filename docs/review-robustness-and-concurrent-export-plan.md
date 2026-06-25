@@ -24,11 +24,11 @@
 
 ## 进度清单
 
-- [ ] 任务 1：评审部分失败优雅降级（commit 1）
-- [ ] 任务 2：解析器兼容 `candidates`/`results`/`data` 等 reviews 别名（commit 2）
-- [ ] 任务 3：schema 失败有限重试 + 重试时强化 schema 约束（commit 3）
-- [ ] 任务 4：导出阶段并发裁剪（commit 4）
-- [ ] 收尾：回归 + 真实复跑验证（不单独 commit，或并入末次）
+- [x] 任务 1：评审部分失败优雅降级（commit 1）
+- [x] 任务 2：解析器兼容 `candidates`/`results`/`data` 等 reviews 别名（commit 2）
+- [x] 任务 3：schema 失败有限重试 + 重试时强化 schema 约束（commit 3）
+- [x] 任务 4：导出阶段并发裁剪（commit 4）
+- [x] 收尾：全量回归 259 passed（含全部新增用例）；真实 90 分钟复跑需用户提供 mp4/凭证后单独执行
 
 ---
 
