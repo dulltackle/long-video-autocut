@@ -198,26 +198,63 @@ class StepFunChatReviewer:
         if cached is not None:
             return cached
 
-        request_result = self._request_batch_with_retry(batch)
+        # 把"请求 + 解析"作为一个可重试单元：网络/可重试 HTTP 失败按退避重试；
+        # 200 响应但结构不合规（invalid_topic_json / invalid_schema）立即带强约束
+        # 重发（服务端健康，无需退避）。其余失败（invalid_config / invalid_chat_* /
+        # unknown_candidate）不重试，立即落败，交由上层部分降级兜底。
+        last_failure = None
+        for attempt in range(1, self.retry_attempts + 1):
+            outcome = self._attempt_review(batch, requested_ids, attempt)
+            if outcome.success:
+                self._write_cached_batch(batch, requested_ids, outcome.reviews)
+                return outcome
+
+            last_failure = outcome
+            if attempt >= self.retry_attempts:
+                break
+            failure_type = _failed_batch_type(outcome)
+            if _is_network_retryable_failure(failure_type):
+                self._sleep_before_retry(attempt)
+                continue
+            if failure_type in _SCHEMA_RETRYABLE_FAILURES:
+                continue
+            break
+
+        return last_failure
+
+    def _attempt_review(self, batch, requested_ids, attempt):
+        request_result = self._request_batch_once(batch, attempt)
         if not request_result.success:
             return request_result
         raw_response = request_result.provider_info["raw_response"]
+        return self._parse_batch_response(batch, raw_response, requested_ids, attempt)
 
+    def _request_batch_once(self, batch, attempt):
+        try:
+            request = self._build_request(batch, attempt)
+            with self.request_func(request, timeout=self.timeout) as response:
+                raw_response = response.read().decode("utf-8")
+            return TopicReviewProviderResult(True, provider_info={"raw_response": raw_response, "attempt": attempt})
+        except ValueError as exc:
+            return self._batch_failure(batch, attempt, "invalid_config", str(exc))
+        except urllib.error.HTTPError as exc:
+            return self._batch_failure(batch, attempt, f"http_{exc.code}", f"Topic review HTTP error: {exc.code}")
+        except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            return self._batch_failure(batch, attempt, _request_failure_type(exc), f"Topic review request failed: {exc}")
+        except Exception as exc:
+            return self._batch_failure(batch, attempt, "request_error", f"Topic review request failed: {exc}")
+
+    def _parse_batch_response(self, batch, raw_response, requested_ids, attempt):
         try:
             chat_payload = json.loads(raw_response)
         except json.JSONDecodeError as exc:
-            return self._batch_failure(
-                batch,
-                _request_attempt(request_result),
-                "invalid_chat_json",
-                f"Invalid Chat Completions JSON: {exc.msg}",
-            )
+            return self._batch_failure(batch, attempt, "invalid_chat_json", f"Invalid Chat Completions JSON: {exc.msg}")
 
         content = _extract_chat_content(chat_payload)
         if content is None:
             return self._batch_failure(
                 batch,
-                _request_attempt(request_result),
+                attempt,
                 "invalid_chat_response",
                 "Chat Completions response missing message content",
             )
@@ -225,61 +262,13 @@ class StepFunChatReviewer:
         try:
             review_payload = json.loads(content)
         except json.JSONDecodeError as exc:
-            return self._batch_failure(
-                batch,
-                _request_attempt(request_result),
-                "invalid_topic_json",
-                f"Invalid topic review JSON: {exc.msg}",
-            )
+            return self._batch_failure(batch, attempt, "invalid_topic_json", f"Invalid topic review JSON: {exc.msg}")
 
         try:
             reviews = _parse_review_payload(review_payload, requested_ids)
         except ValueError as exc:
-            return self._batch_failure(
-                batch,
-                _request_attempt(request_result),
-                _schema_failure_type(str(exc)),
-                str(exc),
-            )
-        self._write_cached_batch(batch, requested_ids, reviews)
+            return self._batch_failure(batch, attempt, _schema_failure_type(str(exc)), str(exc))
         return TopicReviewProviderResult(True, reviews=reviews)
-
-    def _request_batch_with_retry(self, batch):
-        for attempt in range(1, self.retry_attempts + 1):
-            try:
-                request = self._build_request(batch)
-                with self.request_func(request, timeout=self.timeout) as response:
-                    raw_response = response.read().decode("utf-8")
-                return TopicReviewProviderResult(True, provider_info={"raw_response": raw_response, "attempt": attempt})
-            except ValueError as exc:
-                return self._batch_failure(batch, attempt, "invalid_config", str(exc))
-            except urllib.error.HTTPError as exc:
-                if not _is_retryable_http_status(exc.code) or attempt >= self.retry_attempts:
-                    return self._batch_failure(
-                        batch,
-                        attempt,
-                        f"http_{exc.code}",
-                        f"Topic review HTTP error: {exc.code}",
-                    )
-                self._sleep_before_retry(attempt)
-            except (TimeoutError, urllib.error.URLError, OSError) as exc:
-                if attempt >= self.retry_attempts:
-                    return self._batch_failure(
-                        batch,
-                        attempt,
-                        _request_failure_type(exc),
-                        f"Topic review request failed: {exc}",
-                    )
-                self._sleep_before_retry(attempt)
-            except Exception as exc:
-                return self._batch_failure(
-                    batch,
-                    attempt,
-                    "request_error",
-                    f"Topic review request failed: {exc}",
-                )
-
-        return self._batch_failure(batch, self.retry_attempts, "request_error", "Topic review request failed")
 
     def _sleep_before_retry(self, failed_attempt):
         delay = self.retry_backoff_seconds * failed_attempt
@@ -369,14 +358,10 @@ class StepFunChatReviewer:
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
-    def _build_request(self, batch):
+    def _build_request(self, batch, attempt=1):
         _validate_https_base_url(self.base_url)
         endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
-        body = {
-            "model": self.model,
-            "temperature": self.temperature,
-            "response_format": {"type": "json_object"},
-            "messages": [
+        messages = [
                 {
                     "role": "system",
                     "content": (
@@ -406,7 +391,14 @@ class StepFunChatReviewer:
                     "role": "user",
                     "content": json.dumps(batch.to_payload(), ensure_ascii=False, sort_keys=True),
                 },
-            ],
+        ]
+        if attempt > 1:
+            messages.append({"role": "user", "content": _SCHEMA_RETRY_REMINDER})
+        body = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "response_format": {"type": "json_object"},
+            "messages": messages,
         }
         if self.reasoning_effort:
             body["reasoning_effort"] = self.reasoning_effort
@@ -619,8 +611,34 @@ def _is_retryable_http_status(status_code):
     return int(status_code) in {429, 500, 502, 503, 504}
 
 
-def _request_attempt(request_result):
-    return int((request_result.provider_info or {}).get("attempt", 1))
+# 200 响应但模型输出结构不合规的失败类型：可在重试余额内带强约束重发（无需退避）。
+_SCHEMA_RETRYABLE_FAILURES = ("invalid_topic_json", "invalid_schema")
+
+# 重试时追加的强约束提示，仅在 attempt>1 时附加为额外 user 消息，不影响首次请求体与缓存签名。
+_SCHEMA_RETRY_REMINDER = (
+    "上一次返回的结构不合规，已被拒绝。本次必须严格只返回一个 JSON object，"
+    "结构为 {\"reviews\": [<逐个候选的评审对象>]}：reviews 是数组，每个候选一条且与输入"
+    "candidates 一一对应，candidate_id 原样回填。禁止输出该 JSON object 以外的任何文字、"
+    "解释或 Markdown 代码块。"
+)
+
+
+def _failed_batch_type(result):
+    failed_batches = getattr(result, "failed_batches", None) or []
+    if failed_batches:
+        return failed_batches[0].get("failure_type", "")
+    return ""
+
+
+def _is_network_retryable_failure(failure_type):
+    if failure_type in {"timeout", "url_error", "os_error"}:
+        return True
+    if failure_type.startswith("http_"):
+        try:
+            return _is_retryable_http_status(int(failure_type[len("http_"):]))
+        except ValueError:
+            return False
+    return False
 
 
 def _batch_candidate_range(batch):

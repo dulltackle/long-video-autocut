@@ -893,6 +893,113 @@ def test_stepfun_chat_reviewer_rejects_non_list_alias_value():
     assert "Topic review response must contain a reviews list" in result.error
 
 
+def test_stepfun_chat_reviewer_retries_schema_failure_then_succeeds():
+    # 第一次返回结构不合规（invalid_schema），重试时带强约束提示后返回合规结果。
+    batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})
+    calls = []
+
+    def fake_request(request, timeout):
+        body = json.loads(request.data.decode("utf-8"))
+        calls.append(body)
+        if len(calls) == 1:
+            return FakeResponse(chat_response(json.dumps({"unexpected": "value"}, ensure_ascii=False)))
+        return FakeResponse(chat_response(review_content()))
+
+    reviewer = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_retry_attempts": 3,
+            "topic_review_retry_backoff_seconds": 0,
+        },
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is True
+    assert result.reviews[0].topic_name == "直播拆条"
+    assert len(calls) == 2
+    # 首次请求不附加强约束提示，重试请求追加一条额外 user 消息。
+    assert len(calls[0]["messages"]) == 2
+    assert len(calls[1]["messages"]) == 3
+    assert calls[1]["messages"][2]["role"] == "user"
+    assert "结构不合规" in calls[1]["messages"][2]["content"]
+
+
+def test_stepfun_chat_reviewer_retries_invalid_topic_json_then_succeeds():
+    batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})
+    calls = []
+
+    def fake_request(request, timeout):
+        calls.append(request)
+        if len(calls) == 1:
+            return FakeResponse(chat_response("{bad json"))
+        return FakeResponse(chat_response(review_content()))
+
+    reviewer = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_retry_attempts": 2,
+            "topic_review_retry_backoff_seconds": 0,
+        },
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is True
+    assert len(calls) == 2
+
+
+def test_stepfun_chat_reviewer_schema_failure_exhausts_retries():
+    batches = build_topic_review_batches([make_candidate(0, 0)], config={"topic_review_batch_size": 1})
+    calls = []
+
+    def fake_request(request, timeout):
+        calls.append(request)
+        return FakeResponse(chat_response(json.dumps({"unexpected": "value"}, ensure_ascii=False)))
+
+    reviewer = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_retry_attempts": 3,
+            "topic_review_retry_backoff_seconds": 0,
+        },
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is False
+    assert len(calls) == 3
+    assert "failure_type=invalid_schema" in result.error
+    assert "attempt=3/3" in result.error
+
+
+def test_stepfun_chat_reviewer_does_not_retry_invalid_config():
+    calls = []
+
+    def fake_request(request, timeout):
+        calls.append(request)
+        raise AssertionError("invalid config should not reach the request layer")
+
+    reviewer = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_base_url": "http://api.example/v1",
+            "topic_review_retry_attempts": 3,
+        },
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(build_topic_review_batches([make_candidate(0, 0)]))
+
+    assert result.success is False
+    assert "failure_type=invalid_config" in result.error
+    assert "attempt=1/3" in result.error
+    assert calls == []
+
+
 def test_create_topic_reviewer_rejects_unknown_provider():
     with pytest.raises(ValueError, match="Unknown topic review provider: unknown"):
         create_topic_reviewer({"topic_review_provider": "unknown"})
