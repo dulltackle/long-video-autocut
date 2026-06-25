@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 
 from video_auto_editor import export
@@ -204,6 +205,79 @@ def test_export_live_clips_cleans_previous_outputs_on_later_clip_failure(monkeyp
         [TranscriptChunk(10, 20, "字幕")],
         str(tmp_path),
         live_config(),
+    )
+
+    assert result is None
+    assert not list((tmp_path / "clips").glob("*.mp4"))
+    assert not list((tmp_path / "subtitles").glob("*.srt"))
+    assert not (tmp_path / "metadata.json").exists()
+
+
+def test_export_live_clips_runs_clips_concurrently(monkeypatch, tmp_path):
+    # 屏障要求全部 3 条 clip 同时进入裁剪才能放行；若实现仍串行，屏障会超时抛
+    # BrokenBarrierError 使测试失败，精确证明并发确实发生。
+    barrier = threading.Barrier(3, timeout=5)
+
+    def fake_clip(video_path, candidate, output_path, config=None):
+        barrier.wait()
+        Path(output_path).write_text("clip", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(export, "clip_segment", fake_clip)
+
+    candidates = [make_named_candidate(index, f"第{index}条") for index in range(3)]
+    result = export.export_live_clips(
+        "live.mp4",
+        candidates,
+        [],
+        str(tmp_path),
+        live_config(export_concurrency=3, export_subtitles=False),
+    )
+
+    assert len(result) == 3
+    assert [clip.index for clip in result] == [1, 2, 3]
+
+
+def test_export_live_clips_concurrency_one_preserves_order_and_numbering(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_clip(video_path, candidate, output_path, config=None):
+        calls.append(candidate.index)
+        Path(output_path).write_text("clip", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(export, "clip_segment", fake_clip)
+
+    candidates = [make_named_candidate(index, f"第{index}条") for index in range(3)]
+    result = export.export_live_clips(
+        "live.mp4",
+        candidates,
+        [],
+        str(tmp_path),
+        live_config(export_concurrency=1, export_subtitles=False),
+    )
+
+    assert calls == [0, 1, 2]
+    assert [clip.index for clip in result] == [1, 2, 3]
+    assert [clip.title for clip in result] == ["第0条", "第1条", "第2条"]
+    assert Path(result[0].output_path).name == "001_第0条.mp4"
+    assert Path(result[2].output_path).name == "003_第2条.mp4"
+
+
+def test_export_live_clips_concurrent_failure_cleans_all_outputs(monkeypatch, tmp_path):
+    def fake_clip(video_path, candidate, output_path, config=None):
+        Path(output_path).write_text("clip", encoding="utf-8")
+        return candidate.index != 1
+
+    monkeypatch.setattr(export, "clip_segment", fake_clip)
+
+    candidates = [make_named_candidate(index, f"第{index}条") for index in range(3)]
+    result = export.export_live_clips(
+        "live.mp4",
+        candidates,
+        [TranscriptChunk(10, 20, "字幕")],
+        str(tmp_path),
+        live_config(export_concurrency=3),
     )
 
     assert result is None

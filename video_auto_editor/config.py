@@ -29,6 +29,7 @@ CONFIG = {
     "allow_unreviewed_export": False,
     "min_clip_gap_seconds": 5,
     "export_subtitles": True,
+    "export_concurrency": 4,
     "live_report_name": "拆条报告.md",
     "topic_review_enabled": True,
     "topic_review_provider": "stepfun_chat",

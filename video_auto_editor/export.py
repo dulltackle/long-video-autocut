@@ -21,62 +21,34 @@ def export_live_clips(
     review_status="reviewed",
     review_provider=None,
 ):
-    """批量导出直播短视频、字幕和 metadata；任一视频失败时返回 None。"""
+    """批量导出直播短视频、字幕和 metadata；任一视频失败时返回 None。
+
+    各 clip 互相独立，按 export_concurrency 并发裁剪（含字幕切片），但产物顺序、
+    文件名编号、失败清理与 metadata 内容与串行实现完全一致。
+    """
     config = config or CONFIG
     clips_dir = os.path.join(output_dir, "clips")
     subtitles_dir = os.path.join(output_dir, "subtitles")
+    export_subtitles = config.get("export_subtitles", True)
     written_paths = []
-    exports = []
 
     try:
         os.makedirs(clips_dir, exist_ok=True)
-        if config.get("export_subtitles", True):
+        if export_subtitles:
             os.makedirs(subtitles_dir, exist_ok=True)
 
-        for output_index, candidate in enumerate(selected, 1):
-            selection = candidate.export_selection
-            filename_base = f"{output_index:03d}_{_safe_filename(candidate.title or f'直播片段_{output_index:03d}')}"
-            output_path = os.path.join(clips_dir, f"{filename_base}.mp4")
-            if not clip_segment(video_path, candidate, output_path, config):
-                _cleanup_written_paths(written_paths + [output_path])
-                return None
-            written_paths.append(output_path)
+        jobs = _build_clip_jobs(selected, clips_dir, subtitles_dir, export_subtitles)
+        results = _run_clip_jobs(jobs, video_path, chunks, config, export_subtitles)
 
-            subtitle_path = ""
-            if config.get("export_subtitles", True):
-                subtitle_path = os.path.join(subtitles_dir, f"{filename_base}.srt")
-                clip_start = max(0.0, candidate.start_time - float(config["buffer_start"]))
-                clip_end = candidate.end_time + float(config["buffer_end"])
-                written_paths.append(subtitle_path)
-                export_srt(_slice_chunks_for_clip(chunks, clip_start, clip_end), subtitle_path)
+        # 先汇总所有实际写出的路径（含失败 clip），保证失败时能清理干净。
+        for result in results:
+            written_paths.extend(result["paths"])
+        if any(not result["ok"] for result in results):
+            _cleanup_written_paths(written_paths)
+            return None
 
-            exports.append(
-                LiveClipInfo(
-                    index=output_index,
-                    title=candidate.title or f"直播片段_{output_index:03d}",
-                    start_time=candidate.start_time,
-                    end_time=candidate.end_time,
-                    duration=candidate.duration,
-                    score=candidate.adjusted_score if candidate.adjusted_score is not None else candidate.base_score,
-                    text=candidate.text,
-                    output_path=output_path,
-                    subtitle_path=subtitle_path,
-                    summary=candidate.summary,
-                    keywords=list(candidate.keywords),
-                    topic_name=selection.topic_name if selection else "",
-                    publish_ready_score=selection.publish_ready_score if selection else None,
-                    export_decision=selection.decision if selection else "",
-                    decision_reason=selection.reason if selection else "",
-                    original_start=selection.original_start if selection else candidate.start_time,
-                    original_end=selection.original_end if selection else candidate.end_time,
-                    final_start=selection.final_start if selection else candidate.start_time,
-                    final_end=selection.final_end if selection else candidate.end_time,
-                    boundary_fix_applied=selection.boundary_fix_applied if selection else False,
-                    boundary_fix_suggestion=selection.boundary_fix_suggestion if selection else "",
-                    series_key=selection.series_key if selection else "",
-                    needs_human_review=selection.needs_human_review if selection else False,
-                )
-            )
+        # executor.map / 串行均保持输入顺序，exports 按 output_index 升序排列。
+        exports = [result["info"] for result in results]
 
         metadata_path = os.path.join(output_dir, "metadata.json")
         written_paths.append(metadata_path)
@@ -93,6 +65,91 @@ def export_live_clips(
     except (OSError, ValueError):
         _cleanup_written_paths(written_paths)
         return None
+
+
+def _build_clip_jobs(selected, clips_dir, subtitles_dir, export_subtitles):
+    """按导出顺序预计算每条 clip 的编号、文件名与输出路径（纯计算，确定顺序）。"""
+    jobs = []
+    for output_index, candidate in enumerate(selected, 1):
+        filename_base = f"{output_index:03d}_{_safe_filename(candidate.title or f'直播片段_{output_index:03d}')}"
+        jobs.append(
+            {
+                "output_index": output_index,
+                "candidate": candidate,
+                "output_path": os.path.join(clips_dir, f"{filename_base}.mp4"),
+                "subtitle_path": os.path.join(subtitles_dir, f"{filename_base}.srt") if export_subtitles else "",
+            }
+        )
+    return jobs
+
+
+def _run_clip_jobs(jobs, video_path, chunks, config, export_subtitles):
+    """并发执行各 clip 裁剪与字幕切片，返回与输入同序的结果列表。"""
+    if not jobs:
+        return []
+
+    def worker(job):
+        return _run_single_clip_job(job, video_path, chunks, config, export_subtitles)
+
+    workers = max(1, min(int(config.get("export_concurrency", 1)), len(jobs)))
+    if workers == 1:
+        return [worker(job) for job in jobs]
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(worker, jobs))
+
+
+def _run_single_clip_job(job, video_path, chunks, config, export_subtitles):
+    """裁剪单条 clip（subprocess I/O）及其字幕；返回成功标记与已写出路径。"""
+    candidate = job["candidate"]
+    output_path = job["output_path"]
+    subtitle_path = job["subtitle_path"]
+    paths = [output_path]
+    try:
+        if not clip_segment(video_path, candidate, output_path, config):
+            return {"index": job["output_index"], "ok": False, "paths": paths, "info": None}
+
+        if export_subtitles and subtitle_path:
+            paths.append(subtitle_path)
+            clip_start = max(0.0, candidate.start_time - float(config["buffer_start"]))
+            clip_end = candidate.end_time + float(config["buffer_end"])
+            export_srt(_slice_chunks_for_clip(chunks, clip_start, clip_end), subtitle_path)
+
+        info = _build_clip_info(candidate, job["output_index"], output_path, subtitle_path)
+        return {"index": job["output_index"], "ok": True, "paths": paths, "info": info}
+    except (OSError, ValueError):
+        return {"index": job["output_index"], "ok": False, "paths": paths, "info": None}
+
+
+def _build_clip_info(candidate, output_index, output_path, subtitle_path):
+    selection = candidate.export_selection
+    return LiveClipInfo(
+        index=output_index,
+        title=candidate.title or f"直播片段_{output_index:03d}",
+        start_time=candidate.start_time,
+        end_time=candidate.end_time,
+        duration=candidate.duration,
+        score=candidate.adjusted_score if candidate.adjusted_score is not None else candidate.base_score,
+        text=candidate.text,
+        output_path=output_path,
+        subtitle_path=subtitle_path,
+        summary=candidate.summary,
+        keywords=list(candidate.keywords),
+        topic_name=selection.topic_name if selection else "",
+        publish_ready_score=selection.publish_ready_score if selection else None,
+        export_decision=selection.decision if selection else "",
+        decision_reason=selection.reason if selection else "",
+        original_start=selection.original_start if selection else candidate.start_time,
+        original_end=selection.original_end if selection else candidate.end_time,
+        final_start=selection.final_start if selection else candidate.start_time,
+        final_end=selection.final_end if selection else candidate.end_time,
+        boundary_fix_applied=selection.boundary_fix_applied if selection else False,
+        boundary_fix_suggestion=selection.boundary_fix_suggestion if selection else "",
+        series_key=selection.series_key if selection else "",
+        needs_human_review=selection.needs_human_review if selection else False,
+    )
 
 
 def _slice_chunks_for_clip(chunks, clip_start, clip_end):
