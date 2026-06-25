@@ -117,6 +117,7 @@ class StepFunChatReviewer:
         self.model = str(_config_get(self.config, "topic_review_model", "step-2-mini"))
         self.timeout = int(_config_get(self.config, "topic_review_timeout", 60))
         self.retry_attempts = _positive_int_config(self.config, "topic_review_retry_attempts", 1)
+        self.concurrency = _positive_int_config(self.config, "topic_review_concurrency", 1)
         self.retry_backoff_seconds = _non_negative_float_config(
             self.config,
             "topic_review_retry_backoff_seconds",
@@ -140,6 +141,12 @@ class StepFunChatReviewer:
         if not batches:
             return TopicReviewProviderResult(True, provider_info=provider_info)
 
+        if self.concurrency > 1 and len(batches) > 1:
+            return self._review_batches_concurrent(batches, provider_info)
+        return self._review_batches_sequential(batches, provider_info)
+
+    def _review_batches_sequential(self, batches, provider_info):
+        """串行评审：遇到首个失败批次即返回，保留此前成功结果。"""
         reviews = {}
         for batch in batches:
             result = self._review_batch(batch)
@@ -148,6 +155,38 @@ class StepFunChatReviewer:
                 result.reviews = dict(reviews)
                 return result
             reviews.update(result.reviews)
+        return TopicReviewProviderResult(True, reviews=reviews, provider_info=provider_info)
+
+    def _review_batches_concurrent(self, batches, provider_info):
+        """并发评审：各批次互相独立，I/O 并行后聚合结果与全部失败诊断。
+
+        批次之间无共享状态（缓存按 signature 写入各自文件、请求各自独立），
+        因此可安全并行。与串行路径相比，失败时不会短路，而是跑完全部批次，
+        保留所有成功评审并汇总全部失败批次，便于一次性定位问题。
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        workers = min(self.concurrency, len(batches))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            results = list(executor.map(self._review_batch, batches))
+
+        reviews = {}
+        failed_batches = []
+        errors = []
+        for result in results:
+            reviews.update(result.reviews)
+            if not result.success:
+                failed_batches.extend(result.failed_batches)
+                errors.append(result.error)
+
+        if failed_batches:
+            return TopicReviewProviderResult(
+                False,
+                reviews=reviews,
+                error="; ".join(errors),
+                provider_info=provider_info,
+                failed_batches=failed_batches,
+            )
         return TopicReviewProviderResult(True, reviews=reviews, provider_info=provider_info)
 
     def _review_batch(self, batch):

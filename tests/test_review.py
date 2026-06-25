@@ -1,4 +1,5 @@
 import json
+import threading
 import urllib.error
 
 import pytest
@@ -110,7 +111,7 @@ def test_default_topic_review_config_uses_stepfun_chat():
     assert CONFIG["topic_review_temperature"] == 0.2
     assert CONFIG["topic_review_api_key_env"] == "STEPFUN_API_KEY"
     assert CONFIG["topic_review_base_url_env"] == "STEPFUN_BASE_URL"
-    assert CONFIG["topic_review_base_url"] == "https://api.stepfun.com/v1"
+    assert CONFIG["topic_review_base_url"] == "https://api.stepfun.com/step_plan/v1"
     assert CONFIG["topic_review_publish_ready_threshold"] == 80
 
 
@@ -637,6 +638,60 @@ def test_stepfun_chat_reviewer_preserves_successful_reviews_when_later_batch_fai
             "error": "Topic review request failed: timed out",
         }
     ]
+
+
+def test_stepfun_chat_reviewer_reviews_batches_concurrently():
+    candidates = [make_candidate(index, index * 30) for index in range(4)]
+    batches = build_topic_review_batches(candidates, config={"topic_review_batch_size": 1})
+
+    # 屏障要求全部 4 个请求同时到达才能放行；若实现把批次串行化，屏障会超时
+    # 抛 BrokenBarrierError，从而让测试失败，精确证明并发确实发生。
+    barrier = threading.Barrier(4, timeout=5)
+
+    def fake_request(request, timeout):
+        body = json.loads(request.data.decode("utf-8"))
+        candidate_id = json.loads(body["messages"][1]["content"])["candidates"][0]["candidate_id"]
+        barrier.wait()
+        return FakeResponse(chat_response(review_content(candidate_id=candidate_id)))
+
+    reviewer = StepFunChatReviewer(
+        {"topic_review_api_key": "sk-test", "topic_review_concurrency": 4},
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is True
+    assert set(result.reviews.keys()) == {0, 1, 2, 3}
+
+
+def test_stepfun_chat_reviewer_concurrent_path_aggregates_all_failures():
+    candidates = [make_candidate(index, index * 30) for index in range(4)]
+    batches = build_topic_review_batches(candidates, config={"topic_review_batch_size": 1})
+
+    def fake_request(request, timeout):
+        body = json.loads(request.data.decode("utf-8"))
+        candidate_id = json.loads(body["messages"][1]["content"])["candidates"][0]["candidate_id"]
+        if candidate_id in {"candidate_1", "candidate_3"}:
+            raise TimeoutError("timed out")
+        return FakeResponse(chat_response(review_content(candidate_id=candidate_id)))
+
+    reviewer = StepFunChatReviewer(
+        {
+            "topic_review_api_key": "sk-test",
+            "topic_review_concurrency": 4,
+            "topic_review_retry_attempts": 1,
+        },
+        request_func=fake_request,
+    )
+
+    result = reviewer.review_batches(batches)
+
+    assert result.success is False
+    # 并发路径不短路：成功批次的评审被保留，全部失败批次都被汇总。
+    assert set(result.reviews.keys()) == {0, 2}
+    failed_ranges = sorted(item["candidate_range"] for item in result.failed_batches)
+    assert failed_ranges == ["candidate_1", "candidate_3"]
 
 
 def test_stepfun_chat_reviewer_rejects_non_https_base_url_without_request():
