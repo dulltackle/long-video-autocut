@@ -63,6 +63,35 @@ def test_clip_segment_builds_existing_ffmpeg_command(monkeypatch):
     ]
 
 
+def test_clip_segment_burns_subtitles_with_input_side_seek(monkeypatch):
+    calls = []
+    segment = Segment(index=1, start_time=2.0, end_time=8.0, duration=6.0)
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return completed(0)
+
+    monkeypatch.setattr(media.subprocess, "run", fake_run)
+
+    assert media.clip_segment("input.mov", segment, "out.mp4", subtitle_path="subs/001.srt") is True
+    cmd = calls[0]
+    # 输入侧 seek：-ss 在 -i 之前，并以 -t 限定时长。
+    assert cmd[:7] == ["ffmpeg", "-y", "-ss", "1.0", "-i", "input.mov", "-t"]
+    assert cmd[7] == "10.0"  # duration = (8+3) - (2-1) = 11 - 1 = 10
+    # 烧录滤镜含 subtitles= 与 force_style。
+    vf_index = cmd.index("-vf")
+    vf_value = cmd[vf_index + 1]
+    assert vf_value.startswith("subtitles=subs/001.srt")
+    assert "force_style=" in vf_value
+    assert "Alignment=2" in vf_value
+    assert cmd[-1] == "out.mp4"
+
+
+def test_clip_segment_escapes_subtitle_path_special_chars():
+    escaped = media._escape_subtitles_path("a:b'c\\d")
+    assert escaped == "a\\:b\\'c\\\\d"
+
+
 def test_clip_segment_rejects_invalid_time_range(monkeypatch):
     def fail_if_called(*args, **kwargs):
         raise AssertionError("subprocess.run should not be called")
