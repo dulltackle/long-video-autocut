@@ -84,6 +84,33 @@ def test_export_live_clips_writes_safe_paths_metadata_and_shifted_srt(monkeypatc
     )
 
 
+def test_export_live_clips_filters_fillers_and_caps_line_length(monkeypatch, tmp_path):
+    def fake_clip(video_path, candidate, output_path, config=None):
+        Path(output_path).write_text("clip", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(export, "clip_segment", fake_clip)
+
+    result = export.export_live_clips(
+        "live.mp4",
+        [make_candidate()],  # start 10 end 20 -> clip [9, 23]
+        [
+            TranscriptChunk(10, 13, "嗯，今天我们讲愉悦技术"),
+            TranscriptChunk(14, 19, "甲" * 20),
+        ],
+        str(tmp_path),
+        live_config(),
+    )
+
+    srt = Path(result[0].subtitle_path).read_text(encoding="utf-8")
+    assert "嗯" not in srt
+    assert "今天我们讲愉悦技术" in srt
+    for line in srt.splitlines():
+        if "-->" in line or line.strip().isdigit() or not line.strip():
+            continue
+        assert len(line) <= 15
+
+
 def test_export_live_clips_carries_selection_boundary_and_series(monkeypatch, tmp_path):
     def fake_clip(video_path, candidate, output_path, config=None):
         Path(output_path).write_text("clip", encoding="utf-8")

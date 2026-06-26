@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from video_auto_editor.config import CONFIG
 from video_auto_editor.media import clip_segment
 from video_auto_editor.models import LiveClipInfo, TranscriptChunk
+from video_auto_editor.subtitle import filter_filler_words, resegment_chunks
 from video_auto_editor.transcript import export_srt
 
 
@@ -115,7 +116,7 @@ def _run_single_clip_job(job, video_path, chunks, config, export_subtitles):
             paths.append(subtitle_path)
             clip_start = max(0.0, candidate.start_time - float(config["buffer_start"]))
             clip_end = candidate.end_time + float(config["buffer_end"])
-            export_srt(_slice_chunks_for_clip(chunks, clip_start, clip_end), subtitle_path)
+            export_srt(_prepare_clip_subtitle_chunks(chunks, clip_start, clip_end, config), subtitle_path)
 
         info = _build_clip_info(candidate, job["output_index"], output_path, subtitle_path)
         return {"index": job["output_index"], "ok": True, "paths": paths, "info": info}
@@ -150,6 +151,24 @@ def _build_clip_info(candidate, output_index, output_path, subtitle_path):
         series_key=selection.series_key if selection else "",
         needs_human_review=selection.needs_human_review if selection else False,
     )
+
+
+def _prepare_clip_subtitle_chunks(chunks, clip_start, clip_end, config):
+    """生成短视频字幕块：切片 → 语气词过滤（丢空块）→ 显示块重切。
+
+    仅作用于短视频旁挂/烧录 SRT；transcript.srt 仍由全量 chunk 忠实导出，不经此路径。
+    """
+    sliced = _slice_chunks_for_clip(chunks, clip_start, clip_end)
+    filler_words = config.get("filler_words") or []
+    filtered = []
+    for chunk in sliced:
+        text = filter_filler_words(chunk.text, filler_words)
+        if not text:
+            continue
+        filtered.append(TranscriptChunk(start=chunk.start, end=chunk.end, text=text))
+    max_chars = int(config.get("subtitle_max_chars_per_line", 15))
+    max_lines = int(config.get("subtitle_max_lines", 2))
+    return resegment_chunks(filtered, max_chars, max_lines)
 
 
 def _slice_chunks_for_clip(chunks, clip_start, clip_end):
