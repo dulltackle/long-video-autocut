@@ -1033,7 +1033,9 @@ def _ensure_parent_dir(path):
 
 
 def _normalize_subtitle_text(text):
-    return re.sub(r"\s+", " ", str(text).strip())
+    # 仅折叠行内空白，保留显示块重切产生的换行（libass 据此渲染多行）。
+    lines = [re.sub(r"[^\S\n]+", " ", line).strip() for line in str(text).strip().split("\n")]
+    return "\n".join(line for line in lines if line)
 
 
 def _build_stepaudio_request(video_path, config):

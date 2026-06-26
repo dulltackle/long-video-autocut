@@ -1651,5 +1651,5 @@ def test_export_srt_writes_timestamped_subtitles(tmp_path):
         "第一段\n\n"
         "2\n"
         "00:01:05,000 --> 00:01:06,789\n"
-        "第二段 第二行 第三行\n\n"
+        "第二段\n第二行 第三行\n\n"
     )
