@@ -65,6 +65,14 @@ CONFIG = {
     "whisper_output_format": "txt",
     "whisper_sample_rate": 16000,
     "whisper_channels": 1,
+    "burn_subtitles": True,
+    "filler_words": ["嗯", "啊", "呃", "哦", "唉", "呐", "嘛", "咯", "呀", "哎", "欸", "噢", "唔"],
+    "subtitle_max_chars_per_line": 15,
+    "subtitle_max_lines": 2,
+    "subtitle_font": "Noto Sans CJK SC",
+    "subtitle_font_size": 18,
+    "subtitle_outline": 2,
+    "subtitle_margin_v": 40,
 }
 
 

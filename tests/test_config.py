@@ -111,3 +111,45 @@ def test_load_config_file_accepts_integer_for_float_field(tmp_path):
     write_json(config_path, {"topic_review_temperature": 0})
 
     assert load_config_file(str(config_path)) == {"topic_review_temperature": 0}
+
+
+def test_subtitle_config_defaults():
+    assert CONFIG["burn_subtitles"] is True
+    assert CONFIG["filler_words"] == ["嗯", "啊", "呃", "哦", "唉", "呐", "嘛", "咯", "呀", "哎", "欸", "噢", "唔"]
+    assert CONFIG["subtitle_max_chars_per_line"] == 15
+    assert CONFIG["subtitle_max_lines"] == 2
+    assert CONFIG["subtitle_font"] == "Noto Sans CJK SC"
+    assert CONFIG["subtitle_font_size"] == 18
+    assert CONFIG["subtitle_outline"] == 2
+    assert CONFIG["subtitle_margin_v"] == 40
+
+
+def test_load_config_file_accepts_filler_words_override(tmp_path):
+    config_path = tmp_path / "config.json"
+    write_json(config_path, {"filler_words": ["嗯", "啊"]})
+
+    assert load_config_file(str(config_path)) == {"filler_words": ["嗯", "啊"]}
+
+
+def test_load_config_file_rejects_filler_words_non_list(tmp_path):
+    config_path = tmp_path / "config.json"
+    write_json(config_path, {"filler_words": "嗯啊"})
+
+    with pytest.raises(ValueError, match=f"配置文件 {config_path}：配置项 filler_words 类型不匹配"):
+        load_config_file(str(config_path))
+
+
+def test_load_config_file_rejects_burn_subtitles_non_bool(tmp_path):
+    config_path = tmp_path / "config.json"
+    write_json(config_path, {"burn_subtitles": 1})
+
+    with pytest.raises(ValueError, match=f"配置文件 {config_path}：配置项 burn_subtitles 必须是 boolean"):
+        load_config_file(str(config_path))
+
+
+def test_load_config_file_rejects_subtitle_max_chars_non_int(tmp_path):
+    config_path = tmp_path / "config.json"
+    write_json(config_path, {"subtitle_max_chars_per_line": "15"})
+
+    with pytest.raises(ValueError, match=f"配置文件 {config_path}：配置项 subtitle_max_chars_per_line 必须是 integer"):
+        load_config_file(str(config_path))
