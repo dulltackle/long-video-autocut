@@ -139,7 +139,8 @@ def generate_live_report(
             file.write(f"- Selected clips: {len(selected)}\n")
             file.write("- Exported clips: 0 (dry-run)\n\n")
         else:
-            file.write(f"- Exported clips: {len(exports)}\n\n")
+            file.write(f"- Exported clips: {len(exports)}\n")
+            file.write(f"- 字幕烧录: {_burn_subtitles_status(config)}\n\n")
 
         file.write("## 导出清单\n\n")
         file.write("| # | Title | Topic | Ready | Final Range | Video | Subtitle |\n")
@@ -237,6 +238,15 @@ def generate_live_report(
 
 def _live_candidate_score(candidate):
     return candidate.adjusted_score if candidate.adjusted_score is not None else candidate.base_score
+
+
+def _burn_subtitles_status(config):
+    config = config or {}
+    if not config.get("export_subtitles", True):
+        return "关（未导出字幕）"
+    if config.get("burn_subtitles", True):
+        return "开（白字黑描边·底部居中）"
+    return "关（仅旁挂 SRT）"
 
 
 def _live_report_mode(reviewed, dry_run, selected, config):

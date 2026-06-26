@@ -268,6 +268,7 @@ def test_generate_live_report_lists_exports_rejections_human_review_series_and_d
 
     content = Path(report_path).read_text(encoding="utf-8")
     assert "Reviewed 非 dry-run 交付包" in content
+    assert "- 字幕烧录: 开（白字黑描边·底部居中）" in content
     assert "## 导出清单" in content
     assert "| 0 | 入选标题 | 主题 A | 92 | 12.0-68.0s | `clips/001_入选标题.mp4` | `subtitles/001_入选标题.srt` |" in content
     assert "## 未导出候选" in content
@@ -279,6 +280,29 @@ def test_generate_live_report_lists_exports_rejections_human_review_series_and_d
     assert "| topic-a | 主题 A | candidate_0 |" in content
     assert "## 标准交付物" in content
     assert "| `metadata.json` | yes |" in content
+
+
+def test_generate_live_report_marks_burn_disabled(tmp_path):
+    candidate = ClipCandidate(0, 12, 68, 56, "入选文本", title="入选标题", base_score=90, adjusted_score=95)
+    export_info = LiveClipInfo(
+        1, "入选标题", 12, 68, 56, 95, "入选文本",
+        str(tmp_path / "clips" / "001_入选标题.mp4"),
+        str(tmp_path / "subtitles" / "001_入选标题.srt"),
+    )
+
+    report_path = generate_live_report(
+        "live",
+        str(tmp_path),
+        total_duration=200,
+        silences=[],
+        candidates=[candidate],
+        selected=[candidate],
+        exports=[export_info],
+        config={"export_subtitles": True, "burn_subtitles": False},
+    )
+
+    content = Path(report_path).read_text(encoding="utf-8")
+    assert "- 字幕烧录: 关（仅旁挂 SRT）" in content
 
 
 def test_main_dispatches_batch_subcommand(monkeypatch, tmp_path):
