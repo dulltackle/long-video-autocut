@@ -112,7 +112,7 @@ def _select_reviewed_live_exports(candidates, max_clips, config):
         if candidate.index in selected_indexes:
             original_start = candidate.start_time
             original_end = candidate.end_time
-            _apply_final_boundary(candidate)
+            boundary_fix_applied = _apply_final_boundary(candidate, config)
             decision = _decision_payload(
                 candidate,
                 True,
@@ -122,6 +122,7 @@ def _select_reviewed_live_exports(candidates, max_clips, config):
                 export_rank=rank_by_index[candidate.index],
                 original_start=original_start,
                 original_end=original_end,
+                boundary_fix_applied=boundary_fix_applied,
             )
         elif rejection_reason is None:
             decision = _decision_payload(candidate, False, "skip", "max_clips_limit", "reviewed")
@@ -182,23 +183,47 @@ def _reviewed_quality_key(candidate):
     return (ready_score, live_score, candidate.base_score, candidate.duration, -candidate.index)
 
 
-def _apply_final_boundary(candidate):
+def _apply_final_boundary(candidate, config):
+    """校验并应用评审返回的显式边界修复，返回是否实际应用。
+
+    边界修复契约：补救窗口需与原候选窗口重叠（允许向相邻/静音小幅扩展），
+    且补救后时长落在 [min_clip_duration, max_clip_duration]。非法时弃用补救、
+    保留原始候选边界并返回 False。
+    """
     review = candidate.review
     if review is None or not _has_explicit_boundary_fix(review):
-        return
+        return False
     final_start = float(review.boundary_fix_start)
     final_end = float(review.boundary_fix_end)
+    orig_start = candidate.start_time
+    orig_end = candidate.end_time
+    min_duration = float(config["min_clip_duration"])
+    max_duration = float(config["max_clip_duration"])
+    fixed_duration = final_end - final_start
     if final_start < 0 or final_end <= final_start:
+        reject_reason = "起止非法"
+    elif final_end <= orig_start or final_start >= orig_end:
+        reject_reason = "与原候选窗口无重叠"
+    elif fixed_duration < min_duration or fixed_duration > max_duration:
+        reject_reason = "补救后时长越界"
+    else:
+        reject_reason = None
+    if reject_reason is not None:
         logger.warning(
-            "忽略候选 %s 的非法边界修复：boundary_fix_start=%s, boundary_fix_end=%s",
+            "弃用候选 %s 的非法边界修复（%s）：boundary_fix_start=%s, boundary_fix_end=%s，"
+            "保留原始边界 %s-%s",
             candidate.index,
+            reject_reason,
             review.boundary_fix_start,
             review.boundary_fix_end,
+            orig_start,
+            orig_end,
         )
-        return
+        return False
     candidate.start_time = final_start
     candidate.end_time = final_end
-    candidate.duration = final_end - final_start
+    candidate.duration = fixed_duration
+    return True
 
 
 def _has_explicit_boundary_fix(review):
@@ -214,9 +239,9 @@ def _decision_payload(
     export_rank=None,
     original_start=None,
     original_end=None,
+    boundary_fix_applied=False,
 ):
     review = candidate.review
-    boundary_fix_applied = bool(review is not None and _has_explicit_boundary_fix(review) and selected)
     topic_name = review.topic_name if review is not None else ""
     return LiveExportDecision(
         candidate_index=candidate.index,

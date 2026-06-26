@@ -231,6 +231,65 @@ def test_select_live_exports_applies_explicit_boundary_fix():
     assert decisions[0].boundary_fix_applied is True
 
 
+def test_select_live_exports_discards_out_of_range_boundary_fix():
+    candidate = make_candidate(0, 100, 190, adjusted=90)
+    candidate.review = review(boundary_start=0.0, boundary_end=3.0)
+
+    selected, decisions = select_live_exports([candidate], None, live_config(), review_status="reviewed")
+
+    assert selected == [candidate]
+    assert candidate.start_time == 100
+    assert candidate.end_time == 190
+    assert decisions[0].reason == "publish_ready"
+    assert decisions[0].final_start == 100
+    assert decisions[0].final_end == 190
+    assert decisions[0].boundary_fix_applied is False
+
+
+def test_select_live_exports_discards_boundary_fix_below_min_duration():
+    candidate = make_candidate(0, 100, 190, adjusted=90)
+    candidate.review = review(boundary_start=150.0, boundary_end=160.0)
+
+    selected, decisions = select_live_exports([candidate], None, live_config(), review_status="reviewed")
+
+    assert selected == [candidate]
+    assert candidate.start_time == 100
+    assert candidate.end_time == 190
+    assert decisions[0].final_start == 100
+    assert decisions[0].final_end == 190
+    assert decisions[0].boundary_fix_applied is False
+
+
+def test_select_live_exports_applies_valid_in_range_boundary_fix():
+    candidate = make_candidate(0, 100, 200, adjusted=90)
+    candidate.review = review(boundary_start=110.0, boundary_end=180.0)
+
+    selected, decisions = select_live_exports([candidate], None, live_config(), review_status="reviewed")
+
+    assert selected == [candidate]
+    assert candidate.start_time == 110.0
+    assert candidate.end_time == 180.0
+    assert candidate.duration == 70.0
+    assert decisions[0].reason == "publish_ready"
+    assert decisions[0].final_start == 110.0
+    assert decisions[0].final_end == 180.0
+    assert decisions[0].boundary_fix_applied is True
+
+
+def test_select_live_exports_discards_boundary_fix_above_max_duration():
+    candidate = make_candidate(0, 100, 190, adjusted=90)
+    candidate.review = review(boundary_start=0.0, boundary_end=200.0)
+
+    selected, decisions = select_live_exports([candidate], None, live_config(), review_status="reviewed")
+
+    assert selected == [candidate]
+    assert candidate.start_time == 100
+    assert candidate.end_time == 190
+    assert decisions[0].final_start == 100
+    assert decisions[0].final_end == 190
+    assert decisions[0].boundary_fix_applied is False
+
+
 def test_select_live_exports_does_not_parse_natural_language_boundary_suggestion():
     candidate = make_candidate(0, 10, 70, adjusted=90)
     candidate.review = review(suggestion="建议向后补足结束句到 75 秒。")

@@ -75,11 +75,15 @@ class TopicReviewBatch:
     batch_index: int
     course_context_summary: dict = field(default_factory=dict)
     candidates: List[TopicReviewCandidateInput] = field(default_factory=list)
+    min_clip_duration: float = 0.0
+    max_clip_duration: float = 0.0
 
     def to_payload(self):
         return {
             "batch_index": self.batch_index,
             "course_context_summary": dict(self.course_context_summary),
+            "min_clip_duration": self.min_clip_duration,
+            "max_clip_duration": self.max_clip_duration,
             "candidates": [candidate.to_payload() for candidate in self.candidates],
         }
 
@@ -383,7 +387,11 @@ class StepFunChatReviewer:
                         "- needs_human_review: 布尔，是否需要人工复核；\n"
                         "- reject_reason: 字符串，若不建议发布则给出原因，否则空字符串；\n"
                         "- boundary_fix_suggestion: 字符串，边界修正建议，无则空字符串；\n"
-                        "可选字段 boundary_fix_start / boundary_fix_end 为数字（秒），用于建议裁剪边界。\n"
+                        "可选字段 boundary_fix_start / boundary_fix_end 为数字，表示建议裁剪边界，"
+                        "必须是与输入候选一致的绝对时间轴秒，且补救窗口需与原候选片段 [start_time, end_time] 重叠"
+                        "（可向相邻内容或静音边界小幅扩展），"
+                        "补救后时长须落在输入 batch 的 min_clip_duration~max_clip_duration 之间；"
+                        "不确定或无需修正时请省略这两个字段。\n"
                         "不要输出除该 JSON object 以外的任何文字。"
                     ),
                 },
@@ -421,6 +429,8 @@ def build_topic_review_batches(candidates, course_context=None, config=None):
 
     config = config or CONFIG
     batch_size = _topic_review_batch_size(config)
+    min_clip_duration = float(config.get("min_clip_duration", CONFIG["min_clip_duration"]))
+    max_clip_duration = float(config.get("max_clip_duration", CONFIG["max_clip_duration"]))
     ordered = sorted(candidates, key=lambda candidate: (candidate.start_time, candidate.end_time, candidate.index))
     context_summary = course_context.summary() if course_context is not None else {}
 
@@ -434,6 +444,8 @@ def build_topic_review_batches(candidates, course_context=None, config=None):
             batch_index=batch_index,
             course_context_summary=context_summary,
             candidates=review_inputs[start:start + batch_size],
+            min_clip_duration=min_clip_duration,
+            max_clip_duration=max_clip_duration,
         )
         for batch_index, start in enumerate(range(0, len(review_inputs), batch_size))
     ]
