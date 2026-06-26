@@ -109,14 +109,18 @@ def _run_single_clip_job(job, video_path, chunks, config, export_subtitles):
     subtitle_path = job["subtitle_path"]
     paths = [output_path]
     try:
-        if not clip_segment(video_path, candidate, output_path, config):
-            return {"index": job["output_index"], "ok": False, "paths": paths, "info": None}
-
+        # 先生成（已过滤、已重切的）旁挂 SRT，再据 burn_subtitles 决定是否烧录进画面。
+        burn_path = None
         if export_subtitles and subtitle_path:
             paths.append(subtitle_path)
             clip_start = max(0.0, candidate.start_time - float(config["buffer_start"]))
             clip_end = candidate.end_time + float(config["buffer_end"])
             export_srt(_prepare_clip_subtitle_chunks(chunks, clip_start, clip_end, config), subtitle_path)
+            if config.get("burn_subtitles", True):
+                burn_path = subtitle_path
+
+        if not clip_segment(video_path, candidate, output_path, config, subtitle_path=burn_path):
+            return {"index": job["output_index"], "ok": False, "paths": paths, "info": None}
 
         info = _build_clip_info(candidate, job["output_index"], output_path, subtitle_path)
         return {"index": job["output_index"], "ok": True, "paths": paths, "info": info}

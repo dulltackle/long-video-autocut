@@ -39,7 +39,7 @@ def make_named_candidate(index, title):
 def test_export_live_clips_writes_safe_paths_metadata_and_shifted_srt(monkeypatch, tmp_path):
     calls = []
 
-    def fake_clip(video_path, candidate, output_path, config=None):
+    def fake_clip(video_path, candidate, output_path, config=None, subtitle_path=None):
         calls.append((video_path, candidate.index, output_path))
         Path(output_path).write_text("clip", encoding="utf-8")
         return True
@@ -85,7 +85,7 @@ def test_export_live_clips_writes_safe_paths_metadata_and_shifted_srt(monkeypatc
 
 
 def test_export_live_clips_filters_fillers_and_caps_line_length(monkeypatch, tmp_path):
-    def fake_clip(video_path, candidate, output_path, config=None):
+    def fake_clip(video_path, candidate, output_path, config=None, subtitle_path=None):
         Path(output_path).write_text("clip", encoding="utf-8")
         return True
 
@@ -111,8 +111,53 @@ def test_export_live_clips_filters_fillers_and_caps_line_length(monkeypatch, tmp
         assert len(line) <= 15
 
 
+def test_export_live_clips_burns_subtitles_by_default(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_clip(video_path, candidate, output_path, config=None, subtitle_path=None):
+        calls.append(subtitle_path)
+        Path(output_path).write_text("clip", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(export, "clip_segment", fake_clip)
+
+    result = export.export_live_clips(
+        "live.mp4",
+        [make_candidate()],
+        [TranscriptChunk(10, 13, "今天讲技术")],
+        str(tmp_path),
+        live_config(burn_subtitles=True),
+    )
+
+    assert len(calls) == 1
+    assert calls[0] == result[0].subtitle_path
+    assert Path(result[0].subtitle_path).exists()
+
+
+def test_export_live_clips_skips_burn_when_disabled_but_keeps_sidecar_srt(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_clip(video_path, candidate, output_path, config=None, subtitle_path=None):
+        calls.append(subtitle_path)
+        Path(output_path).write_text("clip", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(export, "clip_segment", fake_clip)
+
+    result = export.export_live_clips(
+        "live.mp4",
+        [make_candidate()],
+        [TranscriptChunk(10, 13, "今天讲技术")],
+        str(tmp_path),
+        live_config(burn_subtitles=False),
+    )
+
+    assert calls == [None]
+    assert Path(result[0].subtitle_path).exists()
+
+
 def test_export_live_clips_carries_selection_boundary_and_series(monkeypatch, tmp_path):
-    def fake_clip(video_path, candidate, output_path, config=None):
+    def fake_clip(video_path, candidate, output_path, config=None, subtitle_path=None):
         Path(output_path).write_text("clip", encoding="utf-8")
         return True
 
@@ -161,7 +206,7 @@ def test_export_live_clips_carries_selection_boundary_and_series(monkeypatch, tm
 
 
 def test_export_live_clips_writes_not_exported_and_human_review_summary(monkeypatch, tmp_path):
-    def fake_clip(video_path, candidate, output_path, config=None):
+    def fake_clip(video_path, candidate, output_path, config=None, subtitle_path=None):
         Path(output_path).write_text("clip", encoding="utf-8")
         return True
 
@@ -220,7 +265,7 @@ def test_export_live_clips_returns_none_and_skips_metadata_on_clip_failure(monke
 
 
 def test_export_live_clips_cleans_previous_outputs_on_later_clip_failure(monkeypatch, tmp_path):
-    def fake_clip(video_path, candidate, output_path, config=None):
+    def fake_clip(video_path, candidate, output_path, config=None, subtitle_path=None):
         Path(output_path).write_text("clip", encoding="utf-8")
         return candidate.index == 0
 
@@ -245,7 +290,7 @@ def test_export_live_clips_runs_clips_concurrently(monkeypatch, tmp_path):
     # BrokenBarrierError 使测试失败，精确证明并发确实发生。
     barrier = threading.Barrier(3, timeout=5)
 
-    def fake_clip(video_path, candidate, output_path, config=None):
+    def fake_clip(video_path, candidate, output_path, config=None, subtitle_path=None):
         barrier.wait()
         Path(output_path).write_text("clip", encoding="utf-8")
         return True
@@ -268,7 +313,7 @@ def test_export_live_clips_runs_clips_concurrently(monkeypatch, tmp_path):
 def test_export_live_clips_concurrency_one_preserves_order_and_numbering(monkeypatch, tmp_path):
     calls = []
 
-    def fake_clip(video_path, candidate, output_path, config=None):
+    def fake_clip(video_path, candidate, output_path, config=None, subtitle_path=None):
         calls.append(candidate.index)
         Path(output_path).write_text("clip", encoding="utf-8")
         return True
@@ -292,7 +337,7 @@ def test_export_live_clips_concurrency_one_preserves_order_and_numbering(monkeyp
 
 
 def test_export_live_clips_concurrent_failure_cleans_all_outputs(monkeypatch, tmp_path):
-    def fake_clip(video_path, candidate, output_path, config=None):
+    def fake_clip(video_path, candidate, output_path, config=None, subtitle_path=None):
         Path(output_path).write_text("clip", encoding="utf-8")
         return candidate.index != 1
 
@@ -314,7 +359,7 @@ def test_export_live_clips_concurrent_failure_cleans_all_outputs(monkeypatch, tm
 
 
 def test_export_live_clips_cleans_outputs_on_srt_failure(monkeypatch, tmp_path):
-    def fake_clip(video_path, candidate, output_path, config=None):
+    def fake_clip(video_path, candidate, output_path, config=None, subtitle_path=None):
         Path(output_path).write_text("clip", encoding="utf-8")
         return True
 
