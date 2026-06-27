@@ -36,8 +36,7 @@ def write_standard_deliverables(output_dir, *, subtitle_text=None, report_burn_s
         or (
             "1\n"
             "00:00:01,000 --> 00:00:04,000\n"
-            "今天我们讲愉悦\n"
-            "技术\n\n"
+            "今天我们讲愉悦技术\n\n"
         ),
         encoding="utf-8",
     )
