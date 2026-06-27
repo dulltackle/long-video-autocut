@@ -30,9 +30,11 @@ def test_transcript_chunk_char_spans_defaults_none():
     chunk = TranscriptChunk(1.0, 3.5, "你好")
 
     assert chunk.char_spans is None
-    # 既有相等断言不受新字段影响：两个默认块仍相等。
+    # char_spans 为附带元数据、不参与相等判定：既有按 (start,end,text) 比较的断言不受影响。
     assert chunk == TranscriptChunk(1.0, 3.5, "你好")
-    assert TranscriptChunk(1.0, 3.5, "你好", [(1.0, 2.0), (2.0, 3.5)]) != TranscriptChunk(1.0, 3.5, "你好")
+    assert TranscriptChunk(1.0, 3.5, "你好", [(1.0, 2.0), (2.0, 3.5)]) == TranscriptChunk(1.0, 3.5, "你好")
+    # 但逐字时间确实作为属性被携带。
+    assert TranscriptChunk(1.0, 3.5, "你好", [(1.0, 2.0), (2.0, 3.5)]).char_spans == [(1.0, 2.0), (2.0, 3.5)]
 
 
 def completed(returncode=0, stderr="", stdout=""):
@@ -877,6 +879,41 @@ def test_stepaudio_aggregates_per_character_deltas_into_sentences(monkeypatch, t
         TranscriptChunk(0.0, 2.0, "今天好。"),
         TranscriptChunk(2.0, 4.0, "明天见！"),
     ]
+
+
+def test_aggregate_stepaudio_deltas_preserves_char_spans():
+    deltas = [
+        (0.0, 0.5, "今"),
+        (0.5, 1.0, "天"),
+        (1.0, 1.5, "好"),
+        (1.5, 2.0, "。"),
+        (2.0, 2.5, "明"),
+        (2.5, 3.0, "天"),
+        (3.0, 3.5, "见"),
+        (3.5, 4.0, "！"),
+    ]
+
+    chunks = transcript._aggregate_stepaudio_deltas(deltas)
+
+    assert [chunk.text for chunk in chunks] == ["今天好。", "明天见！"]
+    for chunk in chunks:
+        # 每个显示字符都有一段逐字时间。
+        assert len(chunk.char_spans) == len(chunk.text)
+        # 区间单调不减。
+        flat = [value for span in chunk.char_spans for value in span]
+        assert flat == sorted(flat)
+        # 首尾逐字时间对齐 chunk 的 start/end。
+        assert chunk.char_spans[0][0] == chunk.start
+        assert chunk.char_spans[-1][1] == chunk.end
+    assert chunks[0].char_spans == [(0.0, 0.5), (0.5, 1.0), (1.0, 1.5), (1.5, 2.0)]
+
+
+def test_aggregate_stepaudio_deltas_splits_multichar_delta_evenly():
+    chunks = transcript._aggregate_stepaudio_deltas([(0.0, 2.0, "今天好。")])
+
+    assert len(chunks) == 1
+    assert chunks[0].text == "今天好。"
+    assert chunks[0].char_spans == [(0.0, 0.5), (0.5, 1.0), (1.0, 1.5), (1.5, 2.0)]
 
 
 def test_stepaudio_transcribe_video_offsets_and_sorts_shard_chunks(monkeypatch, tmp_path):

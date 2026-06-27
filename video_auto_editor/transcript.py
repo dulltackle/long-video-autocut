@@ -821,24 +821,62 @@ def _aggregate_stepaudio_deltas(deltas):
     且标点不在 delta 末尾，end 可能越界并与下一段重叠，届时需改为按字符级跟踪边界。
     """
     chunks = []
-    start = None
-    end = None
-    buffer = ""
+    char_entries = []  # 当前句缓冲的逐字 (char, start, end)，多字符 delta 按字符均分区间。
     for delta_start, delta_end, delta in deltas:
-        if start is None:
-            start = delta_start
-        end = delta_end
-        buffer += delta
-        buffer_stripped = buffer.strip()
+        char_entries.extend(_split_delta_chars(delta_start, delta_end, delta))
+        buffer_stripped = "".join(char for char, _, _ in char_entries).strip()
         last_char = delta.strip()[-1:]
         if last_char in _STEPAUDIO_SENTENCE_ENDINGS or len(buffer_stripped) >= _STEPAUDIO_MAX_CHUNK_CHARS:
-            chunks.append(TranscriptChunk(start=start, end=end, text=buffer_stripped))
-            start = None
-            end = None
-            buffer = ""
-    if buffer.strip():
-        chunks.append(TranscriptChunk(start=start, end=end, text=buffer.strip()))
+            chunk = _chunk_from_char_entries(char_entries)
+            if chunk is not None:
+                chunks.append(chunk)
+            char_entries = []
+    tail = _chunk_from_char_entries(char_entries)
+    if tail is not None:
+        chunks.append(tail)
     return chunks
+
+
+def _split_delta_chars(delta_start, delta_end, delta):
+    """把一个 delta 拆成逐字 (char, start, end)；多字符 delta 在 [start,end] 上按字符均分。"""
+    chars = list(delta)
+    count = len(chars)
+    if count == 0:
+        return []
+    span = (delta_end - delta_start) / count
+    entries = []
+    for position, char in enumerate(chars):
+        char_start = delta_start + span * position
+        char_end = delta_end if position == count - 1 else delta_start + span * (position + 1)
+        entries.append((char, char_start, char_end))
+    return entries
+
+
+def _chunk_from_char_entries(char_entries):
+    """从逐字缓冲生成 TranscriptChunk。
+
+    chunk 的 start/end 沿用缓冲整体 delta 边界（不因首尾空白被切窄，保持既有时间语义）；
+    char_spans 则对齐剥离首尾空白后的文本，逐字一一对应。
+    """
+    if not char_entries:
+        return None
+    start_index = 0
+    end_index = len(char_entries)
+    while start_index < end_index and char_entries[start_index][0].isspace():
+        start_index += 1
+    while end_index > start_index and char_entries[end_index - 1][0].isspace():
+        end_index -= 1
+    trimmed = char_entries[start_index:end_index]
+    if not trimmed:
+        return None
+    text = "".join(char for char, _, _ in trimmed)
+    char_spans = [(char_start, char_end) for _, char_start, char_end in trimmed]
+    return TranscriptChunk(
+        start=char_entries[0][1],
+        end=char_entries[-1][2],
+        text=text,
+        char_spans=char_spans,
+    )
 
 
 def _stepaudio_ms_to_seconds(value):

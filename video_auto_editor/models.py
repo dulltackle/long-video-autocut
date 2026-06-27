@@ -11,7 +11,8 @@ class TranscriptChunk:
     start: float
     end: float
     text: str
-    char_spans: Optional[List[Tuple[float, float]]] = None
+    # 逐字时间区间为附带元数据，不参与相等判定：既有按 (start,end,text) 比较的断言不受影响。
+    char_spans: Optional[List[Tuple[float, float]]] = field(default=None, compare=False)
 
 
 @dataclass
