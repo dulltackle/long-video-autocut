@@ -445,6 +445,56 @@ def test_save_transcript_cache_writes_asr_signature(tmp_path):
     ]
 
 
+def test_transcript_cache_roundtrips_char_spans(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    cache_path = tmp_path / "work" / "transcript.json"
+    config = {"asr_provider": "whisper", "whisper_model": "tiny", "whisper_language": "zh"}
+    chunks = [TranscriptChunk(0.0, 2.0, "你好", char_spans=[(0.0, 1.0), (1.0, 2.0)])]
+
+    transcript.save_transcript_cache(str(video_path), chunks, str(cache_path), config=config)
+
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload["chunks"][0]["char_spans"] == [[0.0, 1.0], [1.0, 2.0]]
+
+    loaded = transcript.load_transcript_cache(str(video_path), str(cache_path), config=config)
+    assert loaded[0].char_spans == [(0.0, 1.0), (1.0, 2.0)]
+
+
+def test_transcript_cache_omits_char_spans_when_absent(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    cache_path = tmp_path / "work" / "transcript.json"
+    config = {"asr_provider": "whisper", "whisper_model": "tiny", "whisper_language": "zh"}
+
+    transcript.save_transcript_cache(
+        str(video_path), [TranscriptChunk(0.0, 2.0, "你好")], str(cache_path), config=config
+    )
+
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    # char_spans 为 None 时不写入键，保持缓存最小且对旧读取方兼容。
+    assert "char_spans" not in payload["chunks"][0]
+
+
+def test_load_transcript_cache_tolerates_legacy_without_char_spans(tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    cache_path = tmp_path / "work" / "transcript.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    config = {"asr_provider": "whisper", "whisper_model": "tiny", "whisper_language": "zh"}
+    legacy_payload = {
+        "source": transcript._source_signature(str(video_path)),
+        "asr": transcript._asr_cache_signature(config),
+        "chunks": [{"start": 0.0, "end": 2.0, "text": "旧缓存"}],
+    }
+    cache_path.write_text(json.dumps(legacy_payload, ensure_ascii=False), encoding="utf-8")
+
+    loaded = transcript.load_transcript_cache(str(video_path), str(cache_path), config=config)
+
+    assert loaded == [TranscriptChunk(0.0, 2.0, "旧缓存")]
+    assert loaded[0].char_spans is None
+
+
 def test_stepaudio_cache_signature_includes_sharding_audio_config(tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_text("video", encoding="utf-8")

@@ -346,10 +346,7 @@ class StepAudioTranscriber:
                         }
                         for shard in shard_result
                     ],
-                    "chunks": [
-                        {"start": chunk.start, "end": chunk.end, "text": chunk.text}
-                        for chunk in chunks
-                    ],
+                    "chunks": [_chunk_to_dict(chunk) for chunk in chunks],
                 },
                 transcript_file,
                 ensure_ascii=False,
@@ -617,10 +614,7 @@ def save_transcript_cache(video_path, chunks, cache_path, config=None):
     payload = {
         "source": source,
         "asr": _asr_cache_signature(config),
-        "chunks": [
-            {"start": chunk.start, "end": chunk.end, "text": chunk.text}
-            for chunk in chunks
-        ],
+        "chunks": [_chunk_to_dict(chunk) for chunk in chunks],
     }
     with open(cache_path, "w", encoding="utf-8") as cache_file:
         json.dump(payload, cache_file, ensure_ascii=False, indent=2)
@@ -658,10 +652,7 @@ def save_stepaudio_shard_cache(video_path, shard, chunks, config):
     payload = {
         "source": source,
         "asr": _stepaudio_shard_cache_signature(config, shard),
-        "chunks": [
-            {"start": chunk.start, "end": chunk.end, "text": chunk.text}
-            for chunk in chunks
-        ],
+        "chunks": [_chunk_to_dict(chunk) for chunk in chunks],
     }
     with open(shard.cache_path, "w", encoding="utf-8") as cache_file:
         json.dump(payload, cache_file, ensure_ascii=False, indent=2)
@@ -1009,15 +1000,31 @@ def _merge_chunk_text(left, right):
     return f"{left} {right}"
 
 
+def _chunk_to_dict(chunk):
+    """序列化单个 chunk；char_spans 作为新可选键，仅在存在时写入以兼容旧缓存读取方。"""
+    item = {"start": chunk.start, "end": chunk.end, "text": chunk.text}
+    if chunk.char_spans is not None:
+        item["char_spans"] = [[span_start, span_end] for span_start, span_end in chunk.char_spans]
+    return item
+
+
 def _chunk_from_dict(item):
     try:
         return TranscriptChunk(
             start=float(item["start"]),
             end=float(item["end"]),
             text=str(item.get("text", "")).strip(),
+            char_spans=_char_spans_from_payload(item.get("char_spans")),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"Invalid transcript chunk: {exc}") from exc
+
+
+def _char_spans_from_payload(raw):
+    """读取缓存里的 char_spans；旧缓存无该键时返回 None。"""
+    if raw is None:
+        return None
+    return [(float(span[0]), float(span[1])) for span in raw]
 
 
 def _source_signature(video_path):
