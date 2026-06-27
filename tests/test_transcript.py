@@ -26,6 +26,15 @@ from video_auto_editor.transcript import (
 )
 
 
+def test_transcript_chunk_char_spans_defaults_none():
+    chunk = TranscriptChunk(1.0, 3.5, "你好")
+
+    assert chunk.char_spans is None
+    # 既有相等断言不受新字段影响：两个默认块仍相等。
+    assert chunk == TranscriptChunk(1.0, 3.5, "你好")
+    assert TranscriptChunk(1.0, 3.5, "你好", [(1.0, 2.0), (2.0, 3.5)]) != TranscriptChunk(1.0, 3.5, "你好")
+
+
 def completed(returncode=0, stderr="", stdout=""):
     return SimpleNamespace(returncode=returncode, stderr=stderr, stdout=stdout)
 

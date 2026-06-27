@@ -7,6 +7,22 @@ from video_auto_editor.config import CONFIG
 from video_auto_editor.models import ClipCandidate, LiveClipInfo, LiveExportDecision, TranscriptChunk
 
 
+def test_live_clip_info_subtitle_optimization_defaults():
+    info = LiveClipInfo(
+        index=0,
+        title="标题",
+        start_time=0.0,
+        end_time=1.0,
+        duration=1.0,
+        score=90,
+        text="文本",
+        output_path="out.mp4",
+    )
+
+    assert info.subtitle_optimized is True
+    assert info.subtitle_optimization_note == ""
+
+
 def live_config(**overrides):
     config = CONFIG.copy()
     config.update({"buffer_start": 1, "buffer_end": 3, "export_subtitles": True})

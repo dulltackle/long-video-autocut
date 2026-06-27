@@ -11,6 +11,7 @@ class TranscriptChunk:
     start: float
     end: float
     text: str
+    char_spans: Optional[List[Tuple[float, float]]] = None
 
 
 @dataclass
@@ -105,6 +106,8 @@ class LiveClipInfo:
     boundary_fix_suggestion: str = ""
     series_key: str = ""
     needs_human_review: bool = False
+    subtitle_optimized: bool = True
+    subtitle_optimization_note: str = ""
 
 
 @dataclass
