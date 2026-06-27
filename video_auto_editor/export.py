@@ -172,7 +172,17 @@ def _prepare_clip_subtitle_chunks(chunks, clip_start, clip_end, config):
         filtered.append(TranscriptChunk(start=chunk.start, end=chunk.end, text=text))
     max_chars = int(config.get("subtitle_max_chars_per_line", 15))
     max_lines = int(config.get("subtitle_max_lines", 2))
-    return resegment_chunks(filtered, max_chars, max_lines)
+    blocks = resegment_chunks(filtered, max_chars, max_lines)
+    # 重切按字符数硬切，可能把黏连在多字 token 里的尾随语气词（如「呢呃？」）
+    # 单独切成一个显示块「呃？」。这类纯语气词块只有在切分后才暴露，需再过一次
+    # 语气词过滤丢弃清理后为空的块，保证旁挂/烧录 SRT 不出现纯语气词 cue。
+    cleaned = []
+    for block in blocks:
+        text = filter_filler_words(block.text, filler_words)
+        if not text:
+            continue
+        cleaned.append(TranscriptChunk(start=block.start, end=block.end, text=text))
+    return cleaned
 
 
 def _slice_chunks_for_clip(chunks, clip_start, clip_end):

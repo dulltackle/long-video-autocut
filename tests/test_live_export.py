@@ -111,6 +111,34 @@ def test_export_live_clips_filters_fillers_and_caps_line_length(monkeypatch, tmp
         assert len(line) <= 15
 
 
+def test_export_live_clips_drops_pure_filler_block_after_resegment(monkeypatch, tmp_path):
+    # 单行重切按字符硬切，会把黏在多字 token 尾部的语气词（首遍过滤无法剥离）切成
+    # 独立显示块「呃？」。重切后的第二遍过滤应丢弃这种纯语气词块，避免 SRT 出现纯语气词 cue。
+    def fake_clip(video_path, candidate, output_path, config=None, subtitle_path=None):
+        Path(output_path).write_text("clip", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(export, "clip_segment", fake_clip)
+
+    # 文本 17 字 > block_cap(15)，硬切在第 15 字（呢）后，尾段「呃？」为纯语气词块。
+    result = export.export_live_clips(
+        "live.mp4",
+        [make_candidate()],  # start 10 end 20 -> clip [9, 23]
+        [TranscriptChunk(10, 13, "一定要注意的那个还有就是什么呢呃？")],
+        str(tmp_path),
+        live_config(subtitle_max_lines=1),
+    )
+
+    srt = Path(result[0].subtitle_path).read_text(encoding="utf-8")
+    assert "呃" not in srt
+    assert "一定要注意的那个还有就是什么呢" in srt
+    # 不得出现空的字幕正文行（被丢弃的块不应残留空 cue）。
+    for index, block in enumerate(srt.strip().split("\n\n")):
+        lines = block.split("\n")
+        body = lines[2:]
+        assert body and all(line.strip() for line in body), f"block {index} 存在空正文行"
+
+
 def test_export_live_clips_burns_subtitles_by_default(monkeypatch, tmp_path):
     calls = []
 

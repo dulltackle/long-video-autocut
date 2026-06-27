@@ -117,11 +117,11 @@ def test_subtitle_config_defaults():
     assert CONFIG["burn_subtitles"] is True
     assert CONFIG["filler_words"] == ["嗯", "啊", "呃", "哦", "唉", "呐", "嘛", "咯", "呀", "哎", "欸", "噢", "唔"]
     assert CONFIG["subtitle_max_chars_per_line"] == 15
-    assert CONFIG["subtitle_max_lines"] == 2
+    assert CONFIG["subtitle_max_lines"] == 1
     assert CONFIG["subtitle_font"] == "Noto Sans CJK SC"
     assert CONFIG["subtitle_font_size"] == 18
     assert CONFIG["subtitle_outline"] == 2
-    assert CONFIG["subtitle_margin_v"] == 40
+    assert CONFIG["subtitle_margin_v"] == 20
 
 
 def test_load_config_file_accepts_filler_words_override(tmp_path):
