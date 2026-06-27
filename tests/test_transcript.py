@@ -916,6 +916,52 @@ def test_aggregate_stepaudio_deltas_splits_multichar_delta_evenly():
     assert chunks[0].char_spans == [(0.0, 0.5), (0.5, 1.0), (1.0, 1.5), (1.5, 2.0)]
 
 
+def test_offset_shard_chunks_shifts_char_spans():
+    shard = AudioShard(index=1, start=30.0, end=60.0, audio_path="a", cache_path="c")
+    chunks = [TranscriptChunk(0.0, 2.0, "你好", char_spans=[(0.0, 1.0), (1.0, 2.0)])]
+
+    offset = transcript._offset_shard_chunks(shard, chunks)
+
+    assert offset[0].start == 30.0
+    assert offset[0].end == 32.0
+    assert offset[0].char_spans == [(30.0, 31.0), (31.0, 32.0)]
+
+
+def test_offset_shard_chunks_keeps_none_char_spans():
+    shard = AudioShard(index=0, start=10.0, end=20.0, audio_path="a", cache_path="c")
+    chunks = [TranscriptChunk(0.0, 2.0, "你好", char_spans=None)]
+
+    offset = transcript._offset_shard_chunks(shard, chunks)
+
+    assert offset[0].char_spans is None
+
+
+def test_merge_overlapping_chunks_drops_char_spans_on_merge():
+    chunks = [
+        TranscriptChunk(0.0, 15.0, "第一段", char_spans=[(0.0, 5.0), (5.0, 10.0), (10.0, 15.0)]),
+        TranscriptChunk(14.0, 20.0, "第二段", char_spans=[(14.0, 16.0), (16.0, 18.0), (18.0, 20.0)]),
+    ]
+
+    merged = transcript._merge_overlapping_chunks(chunks)
+
+    assert len(merged) == 1
+    assert merged[0].text == "第一段 第二段"
+    assert merged[0].char_spans is None
+
+
+def test_merge_overlapping_chunks_keeps_non_overlapping_char_spans():
+    spans = [(0.0, 1.0), (1.0, 2.0)]
+    chunks = [
+        TranscriptChunk(0.0, 2.0, "你好", char_spans=spans),
+        TranscriptChunk(5.0, 7.0, "再见", char_spans=[(5.0, 6.0), (6.0, 7.0)]),
+    ]
+
+    merged = transcript._merge_overlapping_chunks(chunks)
+
+    assert len(merged) == 2
+    assert merged[0].char_spans == spans
+
+
 def test_stepaudio_transcribe_video_offsets_and_sorts_shard_chunks(monkeypatch, tmp_path):
     video_path = tmp_path / "live.mp4"
     video_path.write_bytes(b"video")

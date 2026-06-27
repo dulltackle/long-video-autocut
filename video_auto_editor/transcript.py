@@ -966,9 +966,17 @@ def _offset_shard_chunks(shard, chunks):
                 start=shard.start + chunk.start,
                 end=shard.start + chunk.end,
                 text=text,
+                char_spans=_offset_char_spans(chunk.char_spans, shard.start),
             )
         )
     return offset_chunks
+
+
+def _offset_char_spans(char_spans, offset):
+    """把逐字时间整体平移 offset；无逐字时间则保持 None。"""
+    if char_spans is None:
+        return None
+    return [(span_start + offset, span_end + offset) for span_start, span_end in char_spans]
 
 
 def _merge_overlapping_chunks(chunks):
@@ -979,10 +987,12 @@ def _merge_overlapping_chunks(chunks):
             continue
 
         previous = merged[-1]
+        # 合并块的文本经裁剪去重，逐字时间无法可靠对齐，置 None 让下游走比例兜底。
         merged[-1] = TranscriptChunk(
             start=previous.start,
             end=max(previous.end, chunk.end),
             text=_merge_chunk_text(previous.text, chunk.text),
+            char_spans=None,
         )
     return merged
 
