@@ -166,3 +166,99 @@ def test_build_request_targets_chat_completions_without_json_format():
     # 纯文本分块契约：不应使用 JSON response_format。
     assert "response_format" not in captured["body"]
     assert captured["body"]["messages"][1]["content"] == "今天天气真好啊我们出门吧"
+
+
+def test_cache_hit_avoids_second_request(tmp_path):
+    calls = []
+
+    def fake_request(request, timeout):
+        calls.append(1)
+        return FakeResponse(chat_response("今天天气真好\n我们出门吧"))
+
+    config = optimizer_config(subtitle_optimization_cache_dir=str(tmp_path / "sub_cache"))
+    first = StepFunChatSubtitleOptimizer(config, request_func=fake_request)
+    blocks_first = first.optimize_window(window_chunks())
+    assert blocks_first is not None
+    assert len(calls) == 1
+
+    # 新实例复用缓存目录：命中缓存，不再发起请求。
+    second = StepFunChatSubtitleOptimizer(config, request_func=fake_request)
+    blocks_second = second.optimize_window(window_chunks())
+    assert blocks_second is not None
+    assert len(calls) == 1
+    assert [b.text for b in blocks_second] == [b.text for b in blocks_first]
+
+
+def test_cache_recomputes_time_from_current_char_times(tmp_path):
+    def fake_request(request, timeout):
+        return FakeResponse(chat_response("今天天气真好\n我们出门吧"))
+
+    config = optimizer_config(subtitle_optimization_cache_dir=str(tmp_path / "sub_cache"))
+    StepFunChatSubtitleOptimizer(config, request_func=fake_request).optimize_window(window_chunks())
+
+    # 命中缓存但喂入平移后的逐字时间，块时间应随之重算。
+    text = "今天天气真好啊我们出门吧"
+    shifted = [TranscriptChunk(100.0, 100.0 + len(text), text, char_spans=[(100.0 + i, 101.0 + i) for i in range(len(text))])]
+
+    def fail_request(request, timeout):
+        raise AssertionError("命中缓存不应再请求")
+
+    blocks = StepFunChatSubtitleOptimizer(config, request_func=fail_request).optimize_window(shifted)
+    assert blocks is not None
+    assert blocks[0].start == 100.0
+    assert blocks[1].end == 112.0
+
+
+def test_cache_misses_when_model_changes(tmp_path):
+    calls = []
+
+    def fake_request(request, timeout):
+        calls.append(1)
+        return FakeResponse(chat_response("今天天气真好\n我们出门吧"))
+
+    cache_dir = str(tmp_path / "sub_cache")
+    StepFunChatSubtitleOptimizer(
+        optimizer_config(subtitle_optimization_cache_dir=cache_dir, subtitle_optimization_model="model-a"),
+        request_func=fake_request,
+    ).optimize_window(window_chunks())
+
+    StepFunChatSubtitleOptimizer(
+        optimizer_config(subtitle_optimization_cache_dir=cache_dir, subtitle_optimization_model="model-b"),
+        request_func=fake_request,
+    ).optimize_window(window_chunks())
+
+    assert len(calls) == 2
+
+
+def test_cache_misses_when_max_chars_changes(tmp_path):
+    calls = []
+
+    def fake_request(request, timeout):
+        calls.append(1)
+        return FakeResponse(chat_response("今天天气真好\n我们出门吧"))
+
+    cache_dir = str(tmp_path / "sub_cache")
+    StepFunChatSubtitleOptimizer(
+        optimizer_config(subtitle_optimization_cache_dir=cache_dir, subtitle_max_chars_per_line=15),
+        request_func=fake_request,
+    ).optimize_window(window_chunks())
+
+    StepFunChatSubtitleOptimizer(
+        optimizer_config(subtitle_optimization_cache_dir=cache_dir, subtitle_max_chars_per_line=8),
+        request_func=fake_request,
+    ).optimize_window(window_chunks())
+
+    assert len(calls) == 2
+
+
+def test_cache_dir_isolated_from_review_and_asr(tmp_path):
+    def fake_request(request, timeout):
+        return FakeResponse(chat_response("今天天气真好\n我们出门吧"))
+
+    cache_dir = tmp_path / "sub_cache"
+    config = optimizer_config(subtitle_optimization_cache_dir=str(cache_dir))
+    StepFunChatSubtitleOptimizer(config, request_func=fake_request).optimize_window(window_chunks())
+
+    # 仅在字幕优化缓存目录落盘，不写入其它目录。
+    assert cache_dir.exists()
+    assert list(cache_dir.glob("*.json"))

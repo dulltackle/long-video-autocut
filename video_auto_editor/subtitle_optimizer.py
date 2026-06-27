@@ -6,6 +6,7 @@
 - 校验失败（非子序列）、HTTP/超时、无 API Key 时一律「失败」（返回 None / is_available False），交由导出侧规则兜底，不抛异常。
 """
 
+import hashlib
 import json
 import os
 import time
@@ -18,6 +19,7 @@ from video_auto_editor.subtitle_align import build_window, validate_and_align
 
 
 PROMPT_VERSION = "stepfun_chat_subtitle_optimization_v1"
+SUBTITLE_OPTIMIZATION_CACHE_SCHEMA_VERSION = "subtitle_optimization_cache_v1"
 
 _SYSTEM_PROMPT = (
     "你是短视频字幕优化器。输入是一段连续的口语转写文本，你要把它整理成适合短视频画面的字幕显示块。\n"
@@ -71,9 +73,13 @@ class StepFunChatSubtitleOptimizer:
         text, char_times = build_window(window_chunks)
         if not text:
             return None
-        block_lines = self._resolve_block_lines(text)
+        block_lines = self._read_cache(text)
         if block_lines is None:
-            return None
+            block_lines = self._resolve_block_lines(text)
+            if block_lines is None:
+                return None
+            # 只缓存块字符串；时间在每次对齐时按当前逐字时间重算，不入缓存。
+            self._write_cache(text, block_lines)
         return validate_and_align(text, char_times, block_lines, self.max_chars_per_line, self.max_lines)
 
     def _resolve_block_lines(self, text):
@@ -125,6 +131,61 @@ class StepFunChatSubtitleOptimizer:
             },
             method="POST",
         )
+
+    def _cache_signature(self, text):
+        """按字幕输入签名：窗口文本 + 模型 + base_url + 提示版本（含删词尺度）+ 切分参数。"""
+        payload = {
+            "schema_version": SUBTITLE_OPTIMIZATION_CACHE_SCHEMA_VERSION,
+            "prompt_version": PROMPT_VERSION,
+            "provider": self.provider_name,
+            "model": self.model,
+            "base_url": self.base_url,
+            "max_chars_per_line": self.max_chars_per_line,
+            "max_lines": self.max_lines,
+            "text": text,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _cache_path(self, text):
+        if not self.cache_dir:
+            return ""
+        return os.path.join(self.cache_dir, f"{self._cache_signature(text)}.json")
+
+    def _read_cache(self, text):
+        cache_path = self._cache_path(text)
+        if not cache_path or not os.path.exists(cache_path):
+            return None
+        try:
+            with open(cache_path, "r", encoding="utf-8") as cache_file:
+                payload = json.load(cache_file)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if payload.get("schema_version") != SUBTITLE_OPTIMIZATION_CACHE_SCHEMA_VERSION:
+            return None
+        if payload.get("signature") != self._cache_signature(text):
+            return None
+        blocks = payload.get("blocks")
+        if not isinstance(blocks, list) or not all(isinstance(block, str) for block in blocks):
+            return None
+        return blocks
+
+    def _write_cache(self, text, block_lines):
+        cache_path = self._cache_path(text)
+        if not cache_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            payload = {
+                "schema_version": SUBTITLE_OPTIMIZATION_CACHE_SCHEMA_VERSION,
+                "signature": self._cache_signature(text),
+                "blocks": list(block_lines),
+            }
+            with open(cache_path, "w", encoding="utf-8") as cache_file:
+                json.dump(payload, cache_file, ensure_ascii=False, indent=2, sort_keys=True)
+                cache_file.write("\n")
+        except OSError:
+            return
 
 
 def create_subtitle_optimizer(config=None, request_func=None):
