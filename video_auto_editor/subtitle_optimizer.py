@@ -1,0 +1,219 @@
+"""字幕优化模型 provider：在子序列约束下对 clip 窗口文本做语义删词与断句。
+
+复用评审模型的 Chat Completions 形态与凭据配置（见 ADR 0011），但：
+- 输出契约是「纯文本分块」（每块一行），不走 JSON（flash 类模型返回不合规 JSON 是已知痛点）；
+- 子序列约束下只能删字、断句，不可增改字；解析得到的显示块再用 subtitle_align 两指针校验并对齐回逐字时间；
+- 校验失败（非子序列）、HTTP/超时、无 API Key 时一律「失败」（返回 None / is_available False），交由导出侧规则兜底，不抛异常。
+"""
+
+import json
+import os
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from video_auto_editor.config import CONFIG
+from video_auto_editor.subtitle_align import build_window, validate_and_align
+
+
+PROMPT_VERSION = "stepfun_chat_subtitle_optimization_v1"
+
+_SYSTEM_PROMPT = (
+    "你是短视频字幕优化器。输入是一段连续的口语转写文本，你要把它整理成适合短视频画面的字幕显示块。\n"
+    "硬约束（必须严格遵守）：\n"
+    "1. 你的输出必须是输入文本的子序列：只能删字和断句，不能新增、修改、替换任何字符，连标点都不能加。\n"
+    "2. 删词尺度：删掉语气词（嗯、啊、呃、哦等），并结合语境删掉口头禅、口吃重复、无意义填充；"
+    "但必须保留所有承载语义的词，不要删成残句。\n"
+    "3. 断句：把被切断的半句合回完整语义后，按语义重新切成自然的显示块。\n"
+    "输出契约：每个显示块占一行，块与块之间用换行分隔。"
+    "只输出这些显示块文本，不要输出任何编号、解释、引号或 Markdown 代码块。"
+)
+
+
+class StepFunChatSubtitleOptimizer:
+    """以 OpenAI-compatible Chat Completions 形态调用字幕优化模型。"""
+
+    def __init__(self, config=None, request_func=None):
+        self.config = config or CONFIG
+        self.api_key = _resolve_api_key(self.config)
+        self.base_url = _resolve_base_url(self.config)
+        # model 留空则继承主题评审模型。
+        self.model = (
+            str(_config_get(self.config, "subtitle_optimization_model", "")).strip()
+            or str(_config_get(self.config, "topic_review_model", "step-2-mini")).strip()
+        )
+        self.timeout = int(_config_get(self.config, "subtitle_optimization_timeout", 180))
+        self.retry_attempts = _positive_int_config(self.config, "subtitle_optimization_retry_attempts", 1)
+        self.retry_backoff_seconds = _non_negative_float_config(
+            self.config, "subtitle_optimization_retry_backoff_seconds", 0.0
+        )
+        self.temperature = float(_config_get(self.config, "subtitle_optimization_temperature", 0.2))
+        self.reasoning_effort = str(_config_get(self.config, "subtitle_optimization_reasoning_effort", "")).strip()
+        self.provider_name = str(_config_get(self.config, "subtitle_optimization_provider", "stepfun_chat"))
+        self.cache_dir = str(_config_get(self.config, "subtitle_optimization_cache_dir", "") or "")
+        self.max_chars_per_line = int(_config_get(self.config, "subtitle_max_chars_per_line", 15))
+        self.max_lines = int(_config_get(self.config, "subtitle_max_lines", 1))
+        self.request_func = request_func or urllib.request.urlopen
+
+    def is_available(self):
+        """只检查 API Key，不发起网络请求。"""
+        return bool(self.api_key)
+
+    def optimize_window(self, window_chunks):
+        """对一条 clip 窗口的 chunk 做字幕优化，返回对齐后的显示块或 None。
+
+        成功：返回 TranscriptChunk 列表（每块经子序列校验并对齐回逐字时间）。
+        失败（无 key / 无文本 / HTTP / 超时 / 非子序列）：返回 None，调用方走规则兜底。
+        """
+        if not self.api_key:
+            return None
+        text, char_times = build_window(window_chunks)
+        if not text:
+            return None
+        block_lines = self._resolve_block_lines(text)
+        if block_lines is None:
+            return None
+        return validate_and_align(text, char_times, block_lines, self.max_chars_per_line, self.max_lines)
+
+    def _resolve_block_lines(self, text):
+        """请求字幕优化模型并解析为显示块文本行；失败返回 None。"""
+        for attempt in range(1, self.retry_attempts + 1):
+            block_lines = self._request_once(text)
+            if block_lines is not None:
+                return block_lines
+            if attempt < self.retry_attempts:
+                self._sleep_before_retry(attempt)
+        return None
+
+    def _request_once(self, text):
+        try:
+            request = self._build_request(text)
+            with self.request_func(request, timeout=self.timeout) as response:
+                raw_response = response.read().decode("utf-8")
+        except (ValueError, urllib.error.HTTPError, TimeoutError, urllib.error.URLError, OSError):
+            return None
+        except Exception:
+            return None
+        return _parse_block_lines(raw_response)
+
+    def _sleep_before_retry(self, failed_attempt):
+        delay = self.retry_backoff_seconds * failed_attempt
+        if delay > 0:
+            time.sleep(delay)
+
+    def _build_request(self, text):
+        _validate_https_base_url(self.base_url)
+        endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
+        body = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "messages": [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+        }
+        if self.reasoning_effort:
+            body["reasoning_effort"] = self.reasoning_effort
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        return urllib.request.Request(
+            endpoint,
+            data=data,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+
+def create_subtitle_optimizer(config=None, request_func=None):
+    """按配置创建字幕优化 provider。"""
+    config = config or CONFIG
+    provider = str(_config_get(config, "subtitle_optimization_provider", "stepfun_chat")).strip().lower()
+    if provider in {"stepfun_chat", "openai_compatible"}:
+        return StepFunChatSubtitleOptimizer(config, request_func=request_func)
+    raise ValueError(f"Unknown subtitle optimization provider: {provider}")
+
+
+def _parse_block_lines(raw_response):
+    """从 Chat Completions 响应里提取显示块文本行；无内容返回 None。"""
+    try:
+        payload = json.loads(raw_response)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    content = _extract_chat_content(payload)
+    if content is None:
+        return None
+    lines = []
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        # 容忍模型偶发包裹的 Markdown 代码块围栏。
+        if line.startswith("```"):
+            continue
+        lines.append(line)
+    if not lines:
+        return None
+    return lines
+
+
+def _extract_chat_content(payload):
+    if not isinstance(payload, dict):
+        return None
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    return content if isinstance(content, str) else None
+
+
+def _resolve_api_key(config):
+    api_key = _config_get(config, "subtitle_optimization_api_key", None)
+    if api_key:
+        return str(api_key)
+    env_name = _config_get(config, "subtitle_optimization_api_key_env", "STEPFUN_API_KEY")
+    return os.environ.get(str(env_name), "")
+
+
+def _resolve_base_url(config):
+    base_url = _config_get(config, "subtitle_optimization_base_url", None)
+    if base_url:
+        return str(base_url)
+    return "https://api.stepfun.com/v1"
+
+
+def _validate_https_base_url(base_url):
+    parsed = urllib.parse.urlparse(str(base_url))
+    if parsed.scheme.lower() != "https":
+        raise ValueError("Subtitle optimization base_url must use HTTPS for credential safety")
+
+
+def _positive_int_config(config, key, default):
+    raw_value = _config_get(config, key, default)
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return int(default)
+    return max(1, value)
+
+
+def _non_negative_float_config(config, key, default):
+    raw_value = _config_get(config, key, default)
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return float(default)
+    return max(0.0, value)
+
+
+def _config_get(config, key, default=None):
+    if config is not None and key in config:
+        return config[key]
+    if key in CONFIG:
+        return CONFIG[key]
+    return default
