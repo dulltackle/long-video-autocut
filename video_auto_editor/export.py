@@ -21,6 +21,7 @@ def export_live_clips(
     candidates=None,
     review_status="reviewed",
     review_provider=None,
+    subtitle_optimizer=None,
 ):
     """批量导出直播短视频、字幕和 metadata；任一视频失败时返回 None。
 
@@ -39,7 +40,7 @@ def export_live_clips(
             os.makedirs(subtitles_dir, exist_ok=True)
 
         jobs = _build_clip_jobs(selected, clips_dir, subtitles_dir, export_subtitles)
-        results = _run_clip_jobs(jobs, video_path, chunks, config, export_subtitles)
+        results = _run_clip_jobs(jobs, video_path, chunks, config, export_subtitles, subtitle_optimizer)
 
         # 先汇总所有实际写出的路径（含失败 clip），保证失败时能清理干净。
         for result in results:
@@ -84,13 +85,13 @@ def _build_clip_jobs(selected, clips_dir, subtitles_dir, export_subtitles):
     return jobs
 
 
-def _run_clip_jobs(jobs, video_path, chunks, config, export_subtitles):
+def _run_clip_jobs(jobs, video_path, chunks, config, export_subtitles, subtitle_optimizer=None):
     """并发执行各 clip 裁剪与字幕切片，返回与输入同序的结果列表。"""
     if not jobs:
         return []
 
     def worker(job):
-        return _run_single_clip_job(job, video_path, chunks, config, export_subtitles)
+        return _run_single_clip_job(job, video_path, chunks, config, export_subtitles, subtitle_optimizer)
 
     workers = max(1, min(int(config.get("export_concurrency", 1)), len(jobs)))
     if workers == 1:
@@ -102,20 +103,23 @@ def _run_clip_jobs(jobs, video_path, chunks, config, export_subtitles):
         return list(executor.map(worker, jobs))
 
 
-def _run_single_clip_job(job, video_path, chunks, config, export_subtitles):
+def _run_single_clip_job(job, video_path, chunks, config, export_subtitles, subtitle_optimizer=None):
     """裁剪单条 clip（subprocess I/O）及其字幕；返回成功标记与已写出路径。"""
     candidate = job["candidate"]
     output_path = job["output_path"]
     subtitle_path = job["subtitle_path"]
     paths = [output_path]
+    status = OPTIMIZE_DISABLED
     try:
-        # 先生成（已过滤、已重切的）旁挂 SRT，再据 burn_subtitles 决定是否烧录进画面。
+        # 先生成旁挂 SRT（优化成功用优化块，否则规则兜底），再据状态与 burn_subtitles 决定是否烧录。
         burn_path = None
         if export_subtitles and subtitle_path:
             paths.append(subtitle_path)
             clip_start = max(0.0, candidate.start_time - float(config["buffer_start"]))
             clip_end = candidate.end_time + float(config["buffer_end"])
-            export_srt(_prepare_clip_subtitle_chunks(chunks, clip_start, clip_end, config), subtitle_path)
+            window_chunks = _slice_chunks_for_clip(chunks, clip_start, clip_end)
+            blocks, status = optimize_clip_subtitle_chunks(window_chunks, config, subtitle_optimizer)
+            export_srt(blocks, subtitle_path)
             if config.get("burn_subtitles", True):
                 burn_path = subtitle_path
 
@@ -157,15 +161,40 @@ def _build_clip_info(candidate, output_index, output_path, subtitle_path):
     )
 
 
+OPTIMIZE_OK = "OK"
+OPTIMIZE_DISABLED = "DISABLED"
+OPTIMIZE_FAILED = "FAILED"
+
+
+def optimize_clip_subtitle_chunks(window_chunks, config, optimizer):
+    """生成短视频字幕显示块并标注来源状态。
+
+    返回 (blocks, status)：
+    - OK：字幕优化模型在子序列约束下成功删词断句并对齐回逐字时间；
+    - DISABLED：优化关闭、无 provider 或 provider 不可用，走规则兜底（同既有行为）；
+    - FAILED：调用失败/超时/非子序列，走规则兜底，由上层抑制烧录并标人工复核。
+    """
+    if not config.get("subtitle_optimization_enabled", True) or optimizer is None or not optimizer.is_available():
+        return _rule_subtitle_chunks(window_chunks, config), OPTIMIZE_DISABLED
+    blocks = optimizer.optimize_window(window_chunks)
+    if blocks is None:
+        return _rule_subtitle_chunks(window_chunks, config), OPTIMIZE_FAILED
+    return blocks, OPTIMIZE_OK
+
+
 def _prepare_clip_subtitle_chunks(chunks, clip_start, clip_end, config):
-    """生成短视频字幕块：切片 → 语气词过滤（丢空块）→ 显示块重切。
+    """切片到 clip 窗口后生成规则字幕块（语气词过滤 + 显示块重切）。"""
+    return _rule_subtitle_chunks(_slice_chunks_for_clip(chunks, clip_start, clip_end), config)
+
+
+def _rule_subtitle_chunks(window_chunks, config):
+    """规则兜底字幕块：语气词过滤（丢空块）→ 显示块重切 → 二次过滤纯语气词块。
 
     仅作用于短视频旁挂/烧录 SRT；transcript.srt 仍由全量 chunk 忠实导出，不经此路径。
     """
-    sliced = _slice_chunks_for_clip(chunks, clip_start, clip_end)
     filler_words = config.get("filler_words") or []
     filtered = []
-    for chunk in sliced:
+    for chunk in window_chunks:
         text = filter_filler_words(chunk.text, filler_words)
         if not text:
             continue
@@ -200,9 +229,23 @@ def _slice_chunks_for_clip(chunks, clip_start, clip_end):
                 start=start - clip_start,
                 end=end - clip_start,
                 text=text,
+                char_spans=_sliced_char_spans(chunk, clip_start, clip_end, text),
             )
         )
     return sliced
+
+
+def _sliced_char_spans(chunk, clip_start, clip_end, text):
+    """clip 内完整包含的 chunk 平移逐字时间到 clip 相对时间；被裁剪或缺失则置 None。
+
+    边界被裁剪的 chunk 文本未截断而时间被夹紧，逐字时间无法可靠对齐，交给比例兜底。
+    """
+    spans = chunk.char_spans
+    if spans is None or len(spans) != len(text):
+        return None
+    if float(chunk.start) < clip_start or float(chunk.end) > clip_end:
+        return None
+    return [(span_start - clip_start, span_end - clip_start) for span_start, span_end in spans]
 
 
 def _write_metadata(video_path, exports, output_dir, config=None, candidates=None, review_status="reviewed", review_provider=None):
