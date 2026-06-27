@@ -1016,7 +1016,7 @@ def _chunk_from_dict(item):
             text=str(item.get("text", "")).strip(),
             char_spans=_char_spans_from_payload(item.get("char_spans")),
         )
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise ValueError(f"Invalid transcript chunk: {exc}") from exc
 
 
