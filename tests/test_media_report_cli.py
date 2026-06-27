@@ -985,6 +985,88 @@ def test_process_live_video_passes_clean_review_provider_to_export_after_review_
     assert plan["failed_review_batch_count"] == 1
 
 
+def test_process_live_video_injects_subtitle_optimizer_and_cache_dir(monkeypatch, tmp_path):
+    video_path = tmp_path / "live.mp4"
+    video_path.write_text("video", encoding="utf-8")
+    output_dir = tmp_path / "out"
+    work_dir = tmp_path / "work"
+    chunks = [TranscriptChunk(10, 70, "直播文本。")]
+    candidates = [ClipCandidate(0, 10, 70, 60, "直播文本。", base_score=90, title="直播候选")]
+    captured = {}
+
+    class FakeReviewer:
+        provider_name = "stepfun_chat"
+        model = "fake-review"
+        base_url = "https://api.example/v1"
+
+        def is_available(self):
+            return True
+
+        def review_batches(self, batches):
+            return TopicReviewProviderResult(
+                success=True,
+                reviews={
+                    0: TopicReviewResult(
+                        topic_name="直播主题",
+                        topic_complete=True,
+                        learning_value=9,
+                        share_value=8,
+                        publish_ready_score=92,
+                        export_decision="publish_ready",
+                        title="评审标题",
+                        summary="评审摘要",
+                        keywords=["评审"],
+                        needs_human_review=False,
+                        reject_reason="",
+                        boundary_fix_suggestion="",
+                    )
+                },
+            )
+
+    sentinel_optimizer = object()
+
+    def fake_create_subtitle_optimizer(config):
+        captured["cache_dir"] = config.get("subtitle_optimization_cache_dir")
+        return sentinel_optimizer
+
+    def fake_export(*args, **kwargs):
+        captured["subtitle_optimizer"] = kwargs.get("subtitle_optimizer")
+        return [
+            LiveClipInfo(
+                1, "直播候选", 10, 70, 60, 92, "直播文本。",
+                str(output_dir / "clips" / "001.mp4"),
+            )
+        ]
+
+    monkeypatch.setattr(cli, "get_video_duration", lambda video_path_arg: 120.0)
+    monkeypatch.setattr(cli, "detect_silence", lambda video_path_arg, config=None: [])
+    monkeypatch.setattr(
+        cli,
+        "transcribe_video",
+        lambda *args, **kwargs: VideoTranscriptionResult(success=True, chunks=chunks, cache_path="cache.json"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "generate_clip_candidates",
+        lambda chunks_arg, silences, total_duration, config=None: candidates,
+    )
+    monkeypatch.setattr(cli, "create_topic_reviewer", lambda config: FakeReviewer())
+    monkeypatch.setattr(cli, "create_subtitle_optimizer", fake_create_subtitle_optimizer)
+    monkeypatch.setattr(cli, "export_live_clips", fake_export)
+
+    result = cli.process_live_video(
+        str(video_path),
+        str(output_dir),
+        str(work_dir),
+        config=cli.CONFIG.copy(),
+        dry_run=False,
+    )
+
+    assert result
+    assert captured["subtitle_optimizer"] is sentinel_optimizer
+    assert captured["cache_dir"] == os.path.join(str(work_dir), "live", "subtitle_optimization_cache")
+
+
 def test_review_live_candidates_degrades_on_invalid_batch_size(monkeypatch):
     candidate = ClipCandidate(0, 10, 70, 60, "直播文本。", base_score=90)
 

@@ -16,6 +16,7 @@ from video_auto_editor.plan import write_plan
 from video_auto_editor.report import generate_batch_report, generate_live_report, generate_single_report
 from video_auto_editor.review import build_topic_review_batches, create_topic_reviewer
 from video_auto_editor.scoring import analyze_fluency, calculate_adjusted_score, score_segment
+from video_auto_editor.subtitle_optimizer import create_subtitle_optimizer
 from video_auto_editor.selection import select_best_segment, select_live_exports
 from video_auto_editor.silence import detect_silence, identify_segments
 from video_auto_editor.transcript import export_srt, transcribe_candidates, transcribe_video
@@ -251,6 +252,8 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
         print("\n✂️  Step 8: No selected live clips; skipping export")
     else:
         print("\n✂️  Step 8: Exporting live clips...")
+        config["subtitle_optimization_cache_dir"] = os.path.join(video_work, "subtitle_optimization_cache")
+        subtitle_optimizer = _create_subtitle_optimizer(config)
         exports = export_live_clips(
             video_path,
             selected,
@@ -260,6 +263,7 @@ def process_live_video(video_path, output_dir, work_dir, config=None, course_con
             candidates=candidates,
             review_status=review_status,
             review_provider=plan_review_provider,
+            subtitle_optimizer=subtitle_optimizer,
         )
         if exports is None:
             print("   ❌ Failed to export live clips")
@@ -361,6 +365,15 @@ def _can_remove_work_dir(work_dir, output_dir):
 
 def _live_candidate_score(candidate):
     return candidate.adjusted_score if candidate.adjusted_score is not None else candidate.base_score
+
+
+def _create_subtitle_optimizer(config):
+    """按配置创建字幕优化 provider；配置非法则降级为不优化（None），不阻塞导出。"""
+    try:
+        return create_subtitle_optimizer(config)
+    except ValueError as exc:
+        print(f"   ⚠️  字幕优化 provider 配置错误，回退规则字幕：{exc}")
+        return None
 
 
 def _review_live_candidates(candidates, course_context, config, video_work=None):
