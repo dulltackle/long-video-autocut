@@ -151,7 +151,7 @@ fi
 # 6. 校验标准交付物
 echo
 echo "🧪 校验标准交付物..."
-"${PY}" tests/e2e/verify_live_deliverables.py "${E2E_OUT}"
+"${PY}" tests/e2e/verify_live_deliverables.py "${E2E_OUT}" --config-file "${E2E_CONFIG}"
 
 echo
 echo "✅ 全流程端到端跑通完成：交付物位于 ${E2E_OUT}/"
