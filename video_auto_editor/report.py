@@ -163,6 +163,19 @@ def generate_live_report(
         if not selected:
             file.write("| - | - | - | - | - | - | - |\n")
 
+        if not dry_run and exports:
+            file.write("\n## 字幕优化\n\n")
+            file.write("| # | Title | 字幕优化状态 |\n")
+            file.write("|---|-------|--------------|\n")
+            for candidate in selected:
+                export = export_by_index.get(candidate.index)
+                if export is None:
+                    continue
+                file.write(
+                    f"| {candidate.index} | {_escape_markdown_cell(candidate.title)} | "
+                    f"{_escape_markdown_cell(_subtitle_optimization_status(export))} |\n"
+                )
+
         reviewed_candidates = [candidate for candidate in candidates if candidate.review is not None]
         if reviewed_candidates:
             file.write("\n## 主题评审\n\n")
@@ -238,6 +251,14 @@ def generate_live_report(
 
 def _live_candidate_score(candidate):
     return candidate.adjusted_score if candidate.adjusted_score is not None else candidate.base_score
+
+
+def _subtitle_optimization_status(export):
+    """逐条 clip 字幕优化状态：成功标已优化烧录，失败标旁挂规则字幕待人工复核。"""
+    if getattr(export, "subtitle_optimized", True):
+        return "已优化烧录"
+    note = getattr(export, "subtitle_optimization_note", "")
+    return f"未优化·旁挂规则字幕·待人工复核（{note}）" if note else "未优化·旁挂规则字幕·待人工复核"
 
 
 def _burn_subtitles_status(config):

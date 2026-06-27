@@ -282,6 +282,41 @@ def test_generate_live_report_lists_exports_rejections_human_review_series_and_d
     assert "| `metadata.json` | yes |" in content
 
 
+def test_generate_live_report_marks_subtitle_optimization_per_clip(tmp_path):
+    ok_candidate = ClipCandidate(0, 12, 68, 56, "成功文本", title="成功标题", base_score=90, adjusted_score=95)
+    failed_candidate = ClipCandidate(1, 70, 120, 50, "失败文本", title="失败标题", base_score=88, adjusted_score=89)
+    ok_export = LiveClipInfo(
+        1, "成功标题", 12, 68, 56, 95, "成功文本",
+        str(tmp_path / "clips" / "001_成功标题.mp4"),
+        str(tmp_path / "subtitles" / "001_成功标题.srt"),
+        subtitle_optimized=True,
+    )
+    failed_export = LiveClipInfo(
+        2, "失败标题", 70, 120, 50, 89, "失败文本",
+        str(tmp_path / "clips" / "002_失败标题.mp4"),
+        str(tmp_path / "subtitles" / "002_失败标题.srt"),
+        subtitle_optimized=False,
+        subtitle_optimization_note="字幕优化失败，已回退规则字幕、未烧录，待人工复核",
+    )
+
+    report_path = generate_live_report(
+        "live",
+        str(tmp_path),
+        total_duration=200,
+        silences=[],
+        candidates=[ok_candidate, failed_candidate],
+        selected=[ok_candidate, failed_candidate],
+        exports=[ok_export, failed_export],
+        config={"export_subtitles": True},
+    )
+
+    content = Path(report_path).read_text(encoding="utf-8")
+    assert "## 字幕优化" in content
+    assert "| 0 | 成功标题 | 已优化烧录 |" in content
+    assert "未优化·旁挂规则字幕·待人工复核" in content
+    assert "失败标题" in content
+
+
 def test_generate_live_report_marks_burn_disabled(tmp_path):
     candidate = ClipCandidate(0, 12, 68, 56, "入选文本", title="入选标题", base_score=90, adjusted_score=95)
     export_info = LiveClipInfo(
