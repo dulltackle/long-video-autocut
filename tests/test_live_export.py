@@ -246,6 +246,82 @@ def test_export_live_clips_skips_optimizer_when_disabled(monkeypatch, tmp_path):
     assert "今天我们讲愉悦技术" in srt
 
 
+def test_export_live_clips_burns_and_marks_optimized_on_success(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_clip(video_path, candidate, output_path, config=None, subtitle_path=None):
+        calls.append(subtitle_path)
+        Path(output_path).write_text("clip", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(export, "clip_segment", fake_clip)
+
+    optimizer = FakeOptimizer(blocks=[TranscriptChunk(0.0, 2.0, "今天我们讲技术")])
+
+    result = export.export_live_clips(
+        "live.mp4",
+        [make_candidate()],
+        [TranscriptChunk(10, 13, "今天我们讲技术")],
+        str(tmp_path),
+        live_config(burn_subtitles=True),
+        subtitle_optimizer=optimizer,
+    )
+
+    assert calls == [result[0].subtitle_path]  # 已烧录
+    assert result[0].subtitle_optimized is True
+    assert result[0].subtitle_optimization_note == ""
+
+
+def test_export_live_clips_suppresses_burn_and_marks_human_review_on_failure(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_clip(video_path, candidate, output_path, config=None, subtitle_path=None):
+        calls.append(subtitle_path)
+        Path(output_path).write_text("clip", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(export, "clip_segment", fake_clip)
+
+    optimizer = FakeOptimizer(blocks=None)  # 优化失败
+
+    result = export.export_live_clips(
+        "live.mp4",
+        [make_candidate()],
+        [TranscriptChunk(10, 13, "今天我们讲技术")],
+        str(tmp_path),
+        live_config(burn_subtitles=True),
+        subtitle_optimizer=optimizer,
+    )
+
+    assert calls == [None]  # 抑制烧录
+    assert Path(result[0].subtitle_path).exists()  # 旁挂规则 SRT 仍在
+    assert result[0].subtitle_optimized is False
+    assert result[0].subtitle_optimization_note
+
+
+def test_export_live_clips_disabled_still_burns_without_regression(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_clip(video_path, candidate, output_path, config=None, subtitle_path=None):
+        calls.append(subtitle_path)
+        Path(output_path).write_text("clip", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(export, "clip_segment", fake_clip)
+
+    result = export.export_live_clips(
+        "live.mp4",
+        [make_candidate()],
+        [TranscriptChunk(10, 13, "今天我们讲技术")],
+        str(tmp_path),
+        live_config(burn_subtitles=True, subtitle_optimization_enabled=False),
+    )
+
+    assert calls == [result[0].subtitle_path]  # DISABLED 仍烧录
+    assert result[0].subtitle_optimized is True
+    assert result[0].subtitle_optimization_note == ""
+
+
 def test_export_live_clips_burns_subtitles_by_default(monkeypatch, tmp_path):
     calls = []
 

@@ -12,6 +12,11 @@ from video_auto_editor.subtitle import filter_filler_words, resegment_chunks
 from video_auto_editor.transcript import export_srt
 
 
+OPTIMIZE_OK = "OK"
+OPTIMIZE_DISABLED = "DISABLED"
+OPTIMIZE_FAILED = "FAILED"
+
+
 def export_live_clips(
     video_path,
     selected,
@@ -120,20 +125,26 @@ def _run_single_clip_job(job, video_path, chunks, config, export_subtitles, subt
             window_chunks = _slice_chunks_for_clip(chunks, clip_start, clip_end)
             blocks, status = optimize_clip_subtitle_chunks(window_chunks, config, subtitle_optimizer)
             export_srt(blocks, subtitle_path)
-            if config.get("burn_subtitles", True):
+            # 优化失败（FAILED）抑制烧录：仍导出视频 + 旁挂规则 SRT，标人工复核；
+            # OK/DISABLED 维持既有烧录行为。
+            if config.get("burn_subtitles", True) and status in {OPTIMIZE_OK, OPTIMIZE_DISABLED}:
                 burn_path = subtitle_path
 
         if not clip_segment(video_path, candidate, output_path, config, subtitle_path=burn_path):
             return {"index": job["output_index"], "ok": False, "paths": paths, "info": None}
 
-        info = _build_clip_info(candidate, job["output_index"], output_path, subtitle_path)
+        info = _build_clip_info(candidate, job["output_index"], output_path, subtitle_path, status)
         return {"index": job["output_index"], "ok": True, "paths": paths, "info": info}
     except (OSError, ValueError):
         return {"index": job["output_index"], "ok": False, "paths": paths, "info": None}
 
 
-def _build_clip_info(candidate, output_index, output_path, subtitle_path):
+def _build_clip_info(candidate, output_index, output_path, subtitle_path, status=OPTIMIZE_DISABLED):
     selection = candidate.export_selection
+    subtitle_optimized = status != OPTIMIZE_FAILED
+    subtitle_optimization_note = (
+        "字幕优化失败，已回退规则字幕、未烧录，待人工复核" if status == OPTIMIZE_FAILED else ""
+    )
     return LiveClipInfo(
         index=output_index,
         title=candidate.title or f"直播片段_{output_index:03d}",
@@ -158,12 +169,9 @@ def _build_clip_info(candidate, output_index, output_path, subtitle_path):
         boundary_fix_suggestion=selection.boundary_fix_suggestion if selection else "",
         series_key=selection.series_key if selection else "",
         needs_human_review=selection.needs_human_review if selection else False,
+        subtitle_optimized=subtitle_optimized,
+        subtitle_optimization_note=subtitle_optimization_note,
     )
-
-
-OPTIMIZE_OK = "OK"
-OPTIMIZE_DISABLED = "DISABLED"
-OPTIMIZE_FAILED = "FAILED"
 
 
 def optimize_clip_subtitle_chunks(window_chunks, config, optimizer):
