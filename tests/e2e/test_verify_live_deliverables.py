@@ -20,7 +20,16 @@ def e2e_config(**overrides):
     return config
 
 
-def write_standard_deliverables(output_dir, *, subtitle_text=None, report_burn_status="开（白字黑描边·底部居中）"):
+def write_standard_deliverables(
+    output_dir,
+    *,
+    subtitle_text=None,
+    report_burn_status="开（白字黑描边·底部居中）",
+    subtitle_optimized=True,
+    subtitle_optimization_note="",
+    optimization_report_status="已优化烧录",
+    include_optimization_section=True,
+):
     output_dir.mkdir(exist_ok=True)
     (output_dir / "clips").mkdir()
     (output_dir / "subtitles").mkdir()
@@ -74,6 +83,8 @@ def write_standard_deliverables(output_dir, *, subtitle_text=None, report_burn_s
                         "duration": 10,
                         "output_path": "clips/001_直播标题.mp4",
                         "subtitle_path": "subtitles/001_直播标题.srt",
+                        "subtitle_optimized": subtitle_optimized,
+                        "subtitle_optimization_note": subtitle_optimization_note,
                     }
                 ],
             },
@@ -81,10 +92,19 @@ def write_standard_deliverables(output_dir, *, subtitle_text=None, report_burn_s
         ),
         encoding="utf-8",
     )
+    optimization_section = (
+        "## 字幕优化\n\n"
+        "| # | Title | 字幕优化状态 |\n"
+        "|---|-------|--------------|\n"
+        f"| 1 | 直播标题 | {optimization_report_status} |\n\n"
+        if include_optimization_section
+        else ""
+    )
     (output_dir / "拆条报告.md").write_text(
         "## 视频信息\n\n"
         f"- 字幕烧录: {report_burn_status}\n\n"
         "> Reviewed 非 dry-run 交付包：包含实际导出文件和字幕文件。\n\n"
+        f"{optimization_section}"
         "## 标准交付物\n\n"
         "| `metadata.json` | yes |\n",
         encoding="utf-8",
@@ -187,6 +207,57 @@ def test_verify_uses_custom_subtitle_line_limit(tmp_path):
     )
 
     verify_live_deliverables.verify(tmp_path, config=e2e_config(subtitle_max_chars_per_line=20))
+
+
+def test_verify_accepts_failed_optimization_with_human_review_note(tmp_path):
+    write_standard_deliverables(
+        tmp_path,
+        subtitle_optimized=False,
+        subtitle_optimization_note="字幕优化失败，已回退规则字幕、未烧录，待人工复核",
+        optimization_report_status="未优化·旁挂规则字幕·待人工复核（超时）",
+    )
+
+    verify_live_deliverables.verify(tmp_path, config=e2e_config())
+
+
+def test_verify_rejects_missing_optimization_section(tmp_path):
+    write_standard_deliverables(tmp_path, include_optimization_section=False)
+
+    with pytest.raises(verify_live_deliverables.VerifyError, match="缺少『## 字幕优化』段落"):
+        verify_live_deliverables.verify(tmp_path, config=e2e_config())
+
+
+def test_verify_rejects_non_boolean_subtitle_optimized(tmp_path):
+    write_standard_deliverables(tmp_path)
+    metadata = json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8"))
+    metadata["clips"][0]["subtitle_optimized"] = "yes"
+    (tmp_path / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(verify_live_deliverables.VerifyError, match="subtitle_optimized 必须是布尔值"):
+        verify_live_deliverables.verify(tmp_path, config=e2e_config())
+
+
+def test_verify_rejects_failed_optimization_without_note(tmp_path):
+    write_standard_deliverables(
+        tmp_path,
+        subtitle_optimized=False,
+        subtitle_optimization_note="",
+        optimization_report_status="未优化·旁挂规则字幕·待人工复核",
+    )
+
+    with pytest.raises(verify_live_deliverables.VerifyError, match="必须给出 subtitle_optimization_note"):
+        verify_live_deliverables.verify(tmp_path, config=e2e_config())
+
+
+def test_verify_rejects_optimization_status_count_mismatch(tmp_path):
+    write_standard_deliverables(
+        tmp_path,
+        subtitle_optimized=True,
+        optimization_report_status="未优化·旁挂规则字幕·待人工复核",
+    )
+
+    with pytest.raises(verify_live_deliverables.VerifyError, match="字幕优化状态计数与 metadata.json 不一致"):
+        verify_live_deliverables.verify(tmp_path, config=e2e_config())
 
 
 def test_main_loads_config_file_for_subtitle_contract(tmp_path, capsys):

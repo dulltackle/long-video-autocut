@@ -159,6 +159,25 @@ def _check_plan(output_dir):
     return plan
 
 
+_OPTIMIZED_STATUS = "已优化烧录"
+_UNOPTIMIZED_PREFIX = "未优化"
+
+
+def _check_clip_optimization_fields(clip, idx):
+    optimized = clip.get("subtitle_optimized")
+    if not isinstance(optimized, bool):
+        raise VerifyError(
+            f"metadata.json clips[{idx}] 的 subtitle_optimized 必须是布尔值，实际为 {optimized!r}"
+        )
+    note = clip.get("subtitle_optimization_note", "")
+    if not isinstance(note, str):
+        raise VerifyError(f"metadata.json clips[{idx}] 的 subtitle_optimization_note 必须是字符串")
+    if optimized is False and not note.strip():
+        raise VerifyError(
+            f"metadata.json clips[{idx}] 字幕优化失败必须给出 subtitle_optimization_note 供人工复核"
+        )
+
+
 def _check_metadata(output_dir):
     metadata = _load_json(output_dir / "metadata.json")
     if metadata.get("status") != "reviewed":
@@ -176,6 +195,7 @@ def _check_metadata(output_dir):
         subtitle_file = _output_child_path(output_dir, clip["subtitle_path"], f"metadata.json clips[{idx}] subtitle_path")
         if not subtitle_file.exists() or subtitle_file.stat().st_size == 0:
             raise VerifyError(f"metadata.json clips[{idx}] 指向的字幕不存在或为空：{clip['subtitle_path']}")
+        _check_clip_optimization_fields(clip, idx)
     if metadata.get("export_count") != len(clips):
         raise VerifyError(
             f"metadata.json export_count({metadata.get('export_count')}) 与 clips 数({len(clips)})不一致"
@@ -335,6 +355,72 @@ def _check_report(output_dir, config):
     expected_burn_status = _expected_burn_status(config)
     if f"- 字幕烧录: {expected_burn_status}" not in report:
         raise VerifyError(f"拆条报告.md 字幕烧录状态应为：{expected_burn_status}")
+    return report
+
+
+def _extract_report_section(report, heading):
+    """返回 ``heading`` 段落正文（到下一个 ``## `` 标题或文末）；段落不存在返回 None。"""
+    collected = []
+    capturing = False
+    for line in report.splitlines():
+        if line.strip() == heading:
+            capturing = True
+            continue
+        if capturing and line.startswith("## "):
+            break
+        if capturing:
+            collected.append(line)
+    return "\n".join(collected) if capturing else None
+
+
+def _parse_markdown_table_rows(section):
+    """解析 Markdown 表格数据行，跳过分隔行（``|---|``）；按未转义竖线切分单元格。"""
+    rows = []
+    for line in section.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in re.split(r"(?<!\\)\|", stripped)[1:-1]]
+        if not cells:
+            continue
+        if all(cell and set(cell) <= {"-", ":"} for cell in cells):
+            continue
+        rows.append(cells)
+    return rows
+
+
+def _check_subtitle_optimization_report(metadata, report):
+    """非 dry-run 交付包应逐条标注字幕优化状态，且与 metadata 计数一致。"""
+    section = _extract_report_section(report, "## 字幕优化")
+    if section is None:
+        raise VerifyError("拆条报告.md 缺少『## 字幕优化』段落（非 dry-run 交付包应逐条标注字幕优化状态）")
+
+    rows = [row for row in _parse_markdown_table_rows(section) if row[-1] != "字幕优化状态"]
+    clips = metadata["clips"]
+    if len(rows) != len(clips):
+        raise VerifyError(
+            f"拆条报告.md 字幕优化表行数({len(rows)})与 metadata.json clips 数({len(clips)})不一致"
+        )
+
+    report_optimized = 0
+    report_unoptimized = 0
+    for row in rows:
+        status = row[-1]
+        if status == _OPTIMIZED_STATUS:
+            report_optimized += 1
+        elif status.startswith(_UNOPTIMIZED_PREFIX):
+            report_unoptimized += 1
+        else:
+            raise VerifyError(f"拆条报告.md 字幕优化状态文案不合法：{status!r}")
+
+    metadata_optimized = sum(1 for clip in clips if clip.get("subtitle_optimized"))
+    metadata_unoptimized = len(clips) - metadata_optimized
+    if report_optimized != metadata_optimized or report_unoptimized != metadata_unoptimized:
+        raise VerifyError(
+            "拆条报告.md 字幕优化状态计数与 metadata.json 不一致："
+            f"报告(已优化={report_optimized}, 未优化={report_unoptimized}) "
+            f"metadata(已优化={metadata_optimized}, 未优化={metadata_unoptimized})"
+        )
 
 
 def verify(output_dir, config=None):
@@ -348,7 +434,8 @@ def verify(output_dir, config=None):
     _check_plan_metadata_consistency(plan, metadata)
     _check_clip_files(output_dir, metadata)
     _check_subtitle_files(output_dir, metadata, config)
-    _check_report(output_dir, config)
+    report = _check_report(output_dir, config)
+    _check_subtitle_optimization_report(metadata, report)
 
 
 def main(argv=None):

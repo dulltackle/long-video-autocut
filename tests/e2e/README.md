@@ -75,7 +75,8 @@ bash tests/e2e/run_live_e2e.sh
 | `subtitles/*.srt` | 数量 >= 1，且与 `metadata.json` / `plan.json` 引用路径完全一致 |
 | 短视频字幕内容 | 每个 SRT 可解析、cue 序号连续、时间轴不倒退、时间上界不超过带 buffer 的片段时长 |
 | 字幕后处理 | `subtitles/*.srt` 不含纯语气词 token；每条 cue 的行数和单行长度符合 `subtitle_max_lines` / `subtitle_max_chars_per_line` |
-| `拆条报告.md` | 含「非 dry-run 交付包」、`metadata.json` 交付物 yes 行，以及与配置一致的「字幕烧录」状态 |
+| 字幕优化状态 | `metadata.json` 每个 clip 含布尔 `subtitle_optimized`；优化失败（`false`）必须给出 `subtitle_optimization_note`；报告「## 字幕优化」逐条状态计数与之一致 |
+| `拆条报告.md` | 含「非 dry-run 交付包」、`metadata.json` 交付物 yes 行、与配置一致的「字幕烧录」状态，以及「## 字幕优化」逐条状态段落 |
 | 计数一致 | `metadata.clips` 数 == `clips/*.mp4` 数 == `subtitles/*.srt` 数；不允许陈旧 `clips/*.mp4` / `subtitles/*.srt` 混入 |
 
 也可单独跑校验器（针对已存在的产物目录）：

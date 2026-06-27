@@ -302,6 +302,8 @@ def _clip_metadata(item, output_dir):
         "boundary_fix_suggestion": item.boundary_fix_suggestion,
         "series_key": item.series_key,
         "needs_human_review": item.needs_human_review,
+        "subtitle_optimized": item.subtitle_optimized,
+        "subtitle_optimization_note": item.subtitle_optimization_note,
         "output_path": os.path.relpath(item.output_path, output_dir),
         "subtitle_path": os.path.relpath(item.subtitle_path, output_dir) if item.subtitle_path else "",
     }
