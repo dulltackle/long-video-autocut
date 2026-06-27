@@ -5,6 +5,9 @@
 字幕优化模型在子序列约束下返回显示块文本后，再用两指针对齐回这些逐字时间。
 """
 
+from video_auto_editor.models import TranscriptChunk
+from video_auto_editor.subtitle import _wrap_lines
+
 
 def build_window(window_chunks):
     """把窗口内 chunk 拼成 (text, char_times)。
@@ -21,6 +24,42 @@ def build_window(window_chunks):
         text_parts.append(chunk_text)
         char_times.extend(_chunk_char_times(chunk, chunk_text))
     return "".join(text_parts), char_times
+
+
+def validate_and_align(text, char_times, block_lines, max_chars_per_line, max_lines):
+    """校验显示块整体是否为窗口文本的子序列，合法则对齐回逐字时间。
+
+    block_lines 为字幕优化模型按行返回的显示块（每行一块）。用单调推进的两指针做
+    贪心最早匹配：跨所有块共享一个指针，既保证顺序、又保证子序列。任一字符无法匹配
+    （增字/改字/乱序）即返回 None；合法则每块取首/末匹配字的时间，并复用 _wrap_lines 折行。
+    """
+    pointer = 0
+    blocks = []
+    for line in block_lines:
+        block_text = str(line).strip()
+        if not block_text:
+            continue
+        start_index = None
+        end_index = None
+        for char in block_text:
+            while pointer < len(text) and text[pointer] != char:
+                pointer += 1
+            if pointer >= len(text):
+                return None
+            if start_index is None:
+                start_index = pointer
+            end_index = pointer
+            pointer += 1
+        if start_index is None:
+            continue
+        blocks.append(
+            TranscriptChunk(
+                start=char_times[start_index][0],
+                end=char_times[end_index][1],
+                text=_wrap_lines(block_text, max_chars_per_line, max_lines),
+            )
+        )
+    return blocks
 
 
 def _chunk_char_times(chunk, chunk_text):
