@@ -55,6 +55,7 @@ CONFIG = {
     "subtitle_optimization_retry_backoff_seconds": 2.0,
     "subtitle_optimization_temperature": 0.2,
     "subtitle_optimization_reasoning_effort": "",
+    "subtitle_optimization_window_max_chars": 100,
     "subtitle_optimization_cache_dir": "",
     "asr_provider": "stepaudio",
     "asr_model": "stepaudio-2.5-asr",

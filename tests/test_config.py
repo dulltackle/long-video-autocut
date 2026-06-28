@@ -166,6 +166,7 @@ def test_subtitle_optimization_config_defaults():
     assert CONFIG["subtitle_optimization_retry_backoff_seconds"] == 2.0
     assert CONFIG["subtitle_optimization_temperature"] == 0.2
     assert CONFIG["subtitle_optimization_reasoning_effort"] == ""
+    assert CONFIG["subtitle_optimization_window_max_chars"] == 100
     assert CONFIG["subtitle_optimization_cache_dir"] == ""
 
 
@@ -207,5 +208,23 @@ def test_load_config_file_rejects_subtitle_optimization_timeout_non_int(tmp_path
     with pytest.raises(
         ValueError,
         match=f"配置文件 {config_path}：配置项 subtitle_optimization_timeout 必须是 integer",
+    ):
+        load_config_file(str(config_path))
+
+
+def test_load_config_file_accepts_subtitle_optimization_window_max_chars_override(tmp_path):
+    config_path = tmp_path / "config.json"
+    write_json(config_path, {"subtitle_optimization_window_max_chars": 60})
+
+    assert load_config_file(str(config_path)) == {"subtitle_optimization_window_max_chars": 60}
+
+
+def test_load_config_file_rejects_subtitle_optimization_window_max_chars_non_int(tmp_path):
+    config_path = tmp_path / "config.json"
+    write_json(config_path, {"subtitle_optimization_window_max_chars": "100"})
+
+    with pytest.raises(
+        ValueError,
+        match=f"配置文件 {config_path}：配置项 subtitle_optimization_window_max_chars 必须是 integer",
     ):
         load_config_file(str(config_path))
