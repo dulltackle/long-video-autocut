@@ -168,6 +168,44 @@ def test_build_request_targets_chat_completions_without_json_format():
     assert captured["body"]["messages"][1]["content"] == "今天天气真好啊我们出门吧"
 
 
+def test_system_prompt_enforces_deletion_only_and_forbids_spaces():
+    captured = {}
+
+    def fake_request(request, timeout):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(chat_response("今天天气真好\n我们出门吧"))
+
+    optimizer = StepFunChatSubtitleOptimizer(optimizer_config(), request_func=fake_request)
+    optimizer.optimize_window(window_chunks())
+
+    system_prompt = captured["body"]["messages"][0]["content"]
+    # 抽取式提示：显式「只做删除」与「禁止空格」约束。
+    assert "只做删除" in system_prompt
+    assert "禁止空格" in system_prompt
+
+
+def test_cache_misses_when_prompt_version_changes(tmp_path, monkeypatch):
+    import video_auto_editor.subtitle_optimizer as subtitle_optimizer
+
+    calls = []
+
+    def fake_request(request, timeout):
+        calls.append(1)
+        return FakeResponse(chat_response("今天天气真好\n我们出门吧"))
+
+    cache_dir = str(tmp_path / "sub_cache")
+    config = optimizer_config(subtitle_optimization_cache_dir=cache_dir)
+
+    monkeypatch.setattr(subtitle_optimizer, "PROMPT_VERSION", "prompt-version-a")
+    StepFunChatSubtitleOptimizer(config, request_func=fake_request).optimize_window(window_chunks())
+    assert len(calls) == 1
+
+    # 提示版本变更后旧签名缓存判 miss，重新发起请求。
+    monkeypatch.setattr(subtitle_optimizer, "PROMPT_VERSION", "prompt-version-b")
+    StepFunChatSubtitleOptimizer(config, request_func=fake_request).optimize_window(window_chunks())
+    assert len(calls) == 2
+
+
 def test_cache_hit_avoids_second_request(tmp_path):
     calls = []
 
