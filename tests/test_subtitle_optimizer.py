@@ -6,6 +6,7 @@ from video_auto_editor.models import TranscriptChunk
 from video_auto_editor.subtitle_optimizer import (
     StepFunChatSubtitleOptimizer,
     create_subtitle_optimizer,
+    _split_window,
 )
 
 
@@ -300,3 +301,101 @@ def test_cache_dir_isolated_from_review_and_asr(tmp_path):
     # 仅在字幕优化缓存目录落盘，不写入其它目录。
     assert cache_dir.exists()
     assert list(cache_dir.glob("*.json"))
+
+
+def _chunk(text, start):
+    """构造带逐字时间的单 chunk，逐字时间从 start 起每字 1 秒。"""
+    spans = [(float(start + i), float(start + i + 1)) for i in range(len(text))]
+    return TranscriptChunk(float(start), float(start + len(text)), text, char_spans=spans)
+
+
+def test_split_window_groups_within_char_budget():
+    chunks = [_chunk("今天天气真好", 0), _chunk("我们出门吧", 6)]
+
+    # 预算恰好容纳第一组、第二组超额 → 各自成组。
+    groups = _split_window(chunks, 6)
+    assert [[c.text for c in g] for g in groups] == [["今天天气真好"], ["我们出门吧"]]
+
+    # 预算充裕 → 单组。
+    assert len(_split_window(chunks, 100)) == 1
+
+
+def test_split_window_single_chunk_over_budget_gets_own_group():
+    chunks = [_chunk("今天天气真好", 0), _chunk("我们出门吧", 6)]
+
+    # 每个 chunk 都超预算：不拆 chunk，各自独占一组。
+    groups = _split_window(chunks, 3)
+    assert [[c.text for c in g] for g in groups] == [["今天天气真好"], ["我们出门吧"]]
+
+
+def test_optimize_window_segments_and_concatenates_blocks():
+    chunks = [_chunk("今天天气真好", 0), _chunk("我们出门吧", 6)]
+    responses = {
+        "今天天气真好": "今天天气\n真好",
+        "我们出门吧": "我们\n出门吧",
+    }
+    seen = []
+
+    def fake_request(request, timeout):
+        text = json.loads(request.data.decode("utf-8"))["messages"][1]["content"]
+        seen.append(text)
+        return FakeResponse(chat_response(responses[text]))
+
+    optimizer = StepFunChatSubtitleOptimizer(
+        optimizer_config(subtitle_optimization_window_max_chars=6), request_func=fake_request
+    )
+    blocks = optimizer.optimize_window(chunks)
+
+    # 两组各请求一次，且只喂入本组文本。
+    assert seen == ["今天天气真好", "我们出门吧"]
+    assert [b.text for b in blocks] == ["今天天气", "真好", "我们", "出门吧"]
+    # 拼接后时间单调不减。
+    starts = [b.start for b in blocks]
+    assert starts == sorted(starts)
+    assert blocks[0].start == 0.0
+    assert blocks[-1].end == 11.0
+
+
+def test_optimize_window_fails_when_any_group_non_subsequence():
+    chunks = [_chunk("今天天气真好", 0), _chunk("我们出门吧", 6)]
+
+    def fake_request(request, timeout):
+        text = json.loads(request.data.decode("utf-8"))["messages"][1]["content"]
+        if text == "今天天气真好":
+            return FakeResponse(chat_response("今天天气\n真好"))
+        # 第二组造词「出去玩」违反子序列。
+        return FakeResponse(chat_response("我们出去玩"))
+
+    optimizer = StepFunChatSubtitleOptimizer(
+        optimizer_config(subtitle_optimization_window_max_chars=6), request_func=fake_request
+    )
+
+    assert optimizer.optimize_window(chunks) is None
+
+
+def test_optimize_window_caches_each_subwindow_independently(tmp_path):
+    chunks = [_chunk("今天天气真好", 0), _chunk("我们出门吧", 6)]
+    responses = {
+        "今天天气真好": "今天天气\n真好",
+        "我们出门吧": "我们\n出门吧",
+    }
+    calls = []
+
+    def fake_request(request, timeout):
+        text = json.loads(request.data.decode("utf-8"))["messages"][1]["content"]
+        calls.append(text)
+        return FakeResponse(chat_response(responses[text]))
+
+    cache_dir = tmp_path / "sub_cache"
+    config = optimizer_config(
+        subtitle_optimization_cache_dir=str(cache_dir), subtitle_optimization_window_max_chars=6
+    )
+
+    StepFunChatSubtitleOptimizer(config, request_func=fake_request).optimize_window(chunks)
+    # 两个子窗口各请求一次、各落一份缓存。
+    assert len(calls) == 2
+    assert len(list(cache_dir.glob("*.json"))) == 2
+
+    # 新实例复用缓存：两组都命中，不再请求。
+    StepFunChatSubtitleOptimizer(config, request_func=fake_request).optimize_window(chunks)
+    assert len(calls) == 2

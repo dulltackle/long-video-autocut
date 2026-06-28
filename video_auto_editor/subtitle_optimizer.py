@@ -67,6 +67,7 @@ class StepFunChatSubtitleOptimizer:
         self.cache_dir = str(_config_get(self.config, "subtitle_optimization_cache_dir", "") or "")
         self.max_chars_per_line = int(_config_get(self.config, "subtitle_max_chars_per_line", 15))
         self.max_lines = int(_config_get(self.config, "subtitle_max_lines", 1))
+        self.window_max_chars = _positive_int_config(self.config, "subtitle_optimization_window_max_chars", 100)
         self.request_func = request_func or urllib.request.urlopen
 
     def is_available(self):
@@ -76,22 +77,44 @@ class StepFunChatSubtitleOptimizer:
     def optimize_window(self, window_chunks):
         """对一条 clip 窗口的 chunk 做字幕优化，返回对齐后的显示块或 None。
 
+        窗口按字符预算（`window_max_chars`）贪心分组、逐组请求：文本越短，模型重组语序、
+        造词、塞空格的空间越小，子序列通过率越高（见 ADR 0012）。各子窗口按文本签名独立
+        缓存与对齐，跨组时间天然连续，拼接后即整条 clip 的显示块。
+
         成功：返回 TranscriptChunk 列表（每块经子序列校验并对齐回逐字时间）。
-        失败（无 key / 无文本 / HTTP / 超时 / 非子序列）：返回 None，调用方走规则兜底。
+        失败（无 key / 无文本 / 任一组 HTTP / 超时 / 非子序列）：返回 None，调用方走规则兜底。
         """
         if not self.api_key:
             return None
-        text, char_times = build_window(window_chunks)
-        if not text:
+        full_text, _ = build_window(window_chunks)
+        if not full_text:
             return None
+        all_blocks = []
+        for group in _split_window(window_chunks, self.window_max_chars):
+            text, char_times = build_window(group)
+            if not text:
+                continue
+            block_lines = self._block_lines_cached(text)
+            if block_lines is None:
+                return None
+            aligned = validate_and_align(text, char_times, block_lines, self.max_chars_per_line, self.max_lines)
+            if aligned is None:
+                return None
+            all_blocks.extend(aligned)
+        return all_blocks
+
+    def _block_lines_cached(self, text):
+        """读缓存命中即返回；否则请求模型、成功后落盘。失败返回 None。
+
+        只缓存块字符串；时间在每次对齐时按当前逐字时间重算，不入缓存。
+        """
         block_lines = self._read_cache(text)
         if block_lines is None:
             block_lines = self._resolve_block_lines(text)
             if block_lines is None:
                 return None
-            # 只缓存块字符串；时间在每次对齐时按当前逐字时间重算，不入缓存。
             self._write_cache(text, block_lines)
-        return validate_and_align(text, char_times, block_lines, self.max_chars_per_line, self.max_lines)
+        return block_lines
 
     def _resolve_block_lines(self, text):
         """请求字幕优化模型并解析为显示块文本行；失败返回 None。"""
@@ -206,6 +229,30 @@ def create_subtitle_optimizer(config=None, request_func=None):
     if provider in {"stepfun_chat", "openai_compatible"}:
         return StepFunChatSubtitleOptimizer(config, request_func=request_func)
     raise ValueError(f"Unknown subtitle optimization provider: {provider}")
+
+
+def _split_window(window_chunks, max_chars):
+    """把窗口 chunk 按字符预算贪心分组：累计文本长度超额则起新组。
+
+    单个 chunk 文本本身超过预算时独占一组（不再拆 chunk，保留 chunk 内连续性）。
+    `max_chars` 非正数时视为不限，全部归一组。
+    """
+    if max_chars <= 0:
+        return [list(window_chunks)]
+    groups = []
+    current = []
+    current_len = 0
+    for chunk in window_chunks:
+        chunk_len = len(str(chunk.text))
+        if current and current_len + chunk_len > max_chars:
+            groups.append(current)
+            current = []
+            current_len = 0
+        current.append(chunk)
+        current_len += chunk_len
+    if current:
+        groups.append(current)
+    return groups
 
 
 def _parse_block_lines(raw_response):
