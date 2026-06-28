@@ -43,7 +43,7 @@ def test_get_video_duration_returns_none_on_invalid_json(monkeypatch):
     assert media.get_video_duration("input.mov") is None
 
 
-def test_clip_segment_builds_existing_ffmpeg_command(monkeypatch):
+def test_clip_segment_uses_input_side_seek_without_subtitles(monkeypatch):
     calls = []
     segment = Segment(index=1, start_time=2.0, end_time=8.0, duration=6.0)
 
@@ -54,9 +54,11 @@ def test_clip_segment_builds_existing_ffmpeg_command(monkeypatch):
     monkeypatch.setattr(media.subprocess, "run", fake_run)
 
     assert media.clip_segment("input.mov", segment, "out.mp4") is True
+    # 不烧字幕分支也用输入侧 seek（-ss 在 -i 前 + -t 限定时长），避免输出侧 -ss 从 0
+    # 解码到 start 带来的随位置增长的耗时。duration = (8+3) - (2-1) = 10.0。
     assert calls[0] == [
-        "ffmpeg", "-y", "-i", "input.mov",
-        "-ss", "1.0", "-to", "11.0",
+        "ffmpeg", "-y",
+        "-ss", "1.0", "-i", "input.mov", "-t", "10.0",
         "-c:v", "libx264", "-crf", "18", "-preset", "fast",
         "-c:a", "aac", "-b:a", "192k",
         "out.mp4",

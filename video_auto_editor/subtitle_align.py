@@ -6,7 +6,7 @@
 """
 
 from video_auto_editor.models import TranscriptChunk
-from video_auto_editor.subtitle import _wrap_lines
+from video_auto_editor.subtitle import resegment_chunk
 
 
 def build_window(window_chunks):
@@ -31,7 +31,8 @@ def validate_and_align(text, char_times, block_lines, max_chars_per_line, max_li
 
     block_lines 为字幕优化模型按行返回的显示块（每行一块）。用单调推进的两指针做
     贪心最早匹配：跨所有块共享一个指针，既保证顺序、又保证子序列。任一字符无法匹配
-    （增字/改字/乱序）即返回 None；合法则每块取首/末匹配字的时间，并复用 _wrap_lines 折行。
+    （增字/改字/乱序）即返回 None；合法则每块取首/末匹配字的时间，并复用 resegment_chunk
+    将超出 max_lines×max_chars_per_line 画面预算的块拆成多个符合契约的 cue。
     """
     pointer = 0
     blocks = []
@@ -52,13 +53,15 @@ def validate_and_align(text, char_times, block_lines, max_chars_per_line, max_li
             pointer += 1
         if start_index is None:
             continue
-        blocks.append(
-            TranscriptChunk(
-                start=char_times[start_index][0],
-                end=char_times[end_index][1],
-                text=_wrap_lines(block_text, max_chars_per_line, max_lines),
-            )
+        # 模型按语义返回的显示块可能超出「max_lines 行 × max_chars_per_line 字」的画面预算
+        # （尤其 max_lines=1 时无法靠折行收纳），这里复用规则重切器把超长块拆成符合契约的
+        # 多个显示块，既保留模型的删词与语义分句，又保证每个 cue 不破单行字数上限。
+        aligned = TranscriptChunk(
+            start=char_times[start_index][0],
+            end=char_times[end_index][1],
+            text=block_text,
         )
+        blocks.extend(resegment_chunk(aligned, max_chars_per_line, max_lines))
     return blocks
 
 

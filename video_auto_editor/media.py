@@ -43,9 +43,12 @@ def clip_segment(video_path, seg, output_path, config=None, subtitle_path=None):
             output_path,
         ]
     else:
+        # 同样用输入侧 seek（-ss 在 -i 之前 + -t 限定时长），避免输出侧 -ss 从视频 0
+        # 解码到 start：越靠后的片段解码越久（实测末段可达数百秒），是导出耗时的主因。
+        duration = end - start
         cmd = [
-            "ffmpeg", "-y", "-i", video_path,
-            "-ss", str(start), "-to", str(end),
+            "ffmpeg", "-y",
+            "-ss", str(start), "-i", video_path, "-t", str(duration),
             "-c:v", "libx264", "-crf", str(config["crf"]), "-preset", config["preset"],
             "-c:a", "aac", "-b:a", config["audio_bitrate"],
             output_path,
