@@ -76,7 +76,7 @@ def test_live_reviewed_non_dry_run_generates_export_deliverables(monkeypatch, tm
             body = json.loads(request.data.decode("utf-8"))
             system_content = body["messages"][0]["content"]
             # 评审与字幕优化现在共用 /chat/completions，按 system prompt 区分两类请求。
-            if "字幕优化器" in system_content:
+            if "从下面给出的口语转写原文里【删除】" in system_content:
                 subtitle_optimization_calls.append(body)
                 # 字幕优化在子序列约束下工作：原样回显窗口文本即为合法子序列，命中成功路径。
                 window_text = body["messages"][1]["content"]
@@ -253,7 +253,7 @@ def test_live_subtitle_optimization_failure_degrades_without_burn(monkeypatch, t
         if request.full_url.endswith("/chat/completions"):
             body = json.loads(request.data.decode("utf-8"))
             system_content = body["messages"][0]["content"]
-            if "字幕优化器" in system_content:
+            if "从下面给出的口语转写原文里【删除】" in system_content:
                 # 返回带新增字符的文本，违反子序列约束，触发优化失败降级。
                 window_text = body["messages"][1]["content"]
                 return FakeResponse(

@@ -6,7 +6,7 @@
 """
 
 from video_auto_editor.models import TranscriptChunk
-from video_auto_editor.subtitle import resegment_chunk
+from video_auto_editor.subtitle import _split_into_blocks, _wrap_lines
 
 
 def build_window(window_chunks):
@@ -31,37 +31,63 @@ def validate_and_align(text, char_times, block_lines, max_chars_per_line, max_li
 
     block_lines 为字幕优化模型按行返回的显示块（每行一块）。用单调推进的两指针做
     贪心最早匹配：跨所有块共享一个指针，既保证顺序、又保证子序列。任一字符无法匹配
-    （增字/改字/乱序）即返回 None；合法则每块取首/末匹配字的时间，并复用 resegment_chunk
-    将超出 max_lines×max_chars_per_line 画面预算的块拆成多个符合契约的 cue。
+    （增字/改字/乱序）即返回 None；合法则记录每个保留字的逐字时间，并把超出
+    max_lines×max_chars_per_line 画面预算的块拆成多个符合契约的 cue。
     """
+    if len(char_times) != len(text):
+        raise ValueError(
+            f"char_times 长度（{len(char_times)}）必须与 text 长度（{len(text)}）一致"
+        )
     pointer = 0
     blocks = []
     for line in block_lines:
         block_text = str(line).strip()
         if not block_text:
             continue
-        start_index = None
-        end_index = None
+        # 记录块内每个保留字命中的逐字时间，与 block_text 逐字一一对应。
+        matched_times = []
         for char in block_text:
             while pointer < len(text) and text[pointer] != char:
                 pointer += 1
             if pointer >= len(text):
                 return None
-            if start_index is None:
-                start_index = pointer
-            end_index = pointer
+            matched_times.append(char_times[pointer])
             pointer += 1
-        if start_index is None:
+        if not matched_times:
             continue
-        # 模型按语义返回的显示块可能超出「max_lines 行 × max_chars_per_line 字」的画面预算
-        # （尤其 max_lines=1 时无法靠折行收纳），这里复用规则重切器把超长块拆成符合契约的
-        # 多个显示块，既保留模型的删词与语义分句，又保证每个 cue 不破单行字数上限。
-        aligned = TranscriptChunk(
-            start=char_times[start_index][0],
-            end=char_times[end_index][1],
-            text=block_text,
+        blocks.extend(_align_block(block_text, matched_times, max_chars_per_line, max_lines))
+    return blocks
+
+
+def _align_block(block_text, block_char_times, max_chars_per_line, max_lines):
+    """把单个显示块按其逐字时间切成符合画面预算的 cue，保留逐字精度。
+
+    模型按语义返回的显示块可能超出「max_lines 行 × max_chars_per_line 字」的画面预算
+    （尤其 max_lines=1 时无法靠折行收纳）。块内（≤ block_cap）只折行、整块取首/末字时间；
+    超容量时复用规则切分的句末/逗号/硬切策略切段，每段 start/end 直接取自该段首/末字符的
+    真实逐字时间——不再按整块 [start,end] 比例重分，从而不丢失逐字对齐精度。
+    """
+    block_cap = max(1, int(max_chars_per_line) * int(max_lines))
+    if len(block_text) <= block_cap:
+        return [
+            TranscriptChunk(
+                block_char_times[0][0],
+                block_char_times[-1][1],
+                _wrap_lines(block_text, max_chars_per_line, max_lines),
+            )
+        ]
+    blocks = []
+    offset = 0
+    for segment in _split_into_blocks(block_text, block_cap):
+        seg_times = block_char_times[offset:offset + len(segment)]
+        blocks.append(
+            TranscriptChunk(
+                seg_times[0][0],
+                seg_times[-1][1],
+                _wrap_lines(segment, max_chars_per_line, max_lines),
+            )
         )
-        blocks.extend(resegment_chunk(aligned, max_chars_per_line, max_lines))
+        offset += len(segment)
     return blocks
 
 

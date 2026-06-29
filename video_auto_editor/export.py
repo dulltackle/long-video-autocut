@@ -190,11 +190,6 @@ def optimize_clip_subtitle_chunks(window_chunks, config, optimizer):
     return blocks, OPTIMIZE_OK
 
 
-def _prepare_clip_subtitle_chunks(chunks, clip_start, clip_end, config):
-    """切片到 clip 窗口后生成规则字幕块（语气词过滤 + 显示块重切）。"""
-    return _rule_subtitle_chunks(_slice_chunks_for_clip(chunks, clip_start, clip_end), config)
-
-
 def _rule_subtitle_chunks(window_chunks, config):
     """规则兜底字幕块：语气词过滤（丢空块）→ 显示块重切 → 二次过滤纯语气词块。
 
