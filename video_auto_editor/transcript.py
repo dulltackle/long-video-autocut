@@ -311,7 +311,7 @@ class StepAudioTranscriber:
         for shard in shard_result:
             shard_chunks = load_stepaudio_shard_cache(video_path, shard, self.config)
             if shard_chunks is None:
-                result = self.transcribe_audio_shard(shard.audio_path, shard.index)
+                result = self._transcribe_shard_with_coverage(shard)
                 if not result.success:
                     result.transcript_path = transcript_path
                     return result
@@ -1182,6 +1182,9 @@ def _stepaudio_shard_cache_signature(config, shard):
         "language": str(config.language),
         "shard_start_ms": _cache_time_milliseconds(shard.start),
         "shard_end_ms": _cache_time_milliseconds(shard.end),
+        "shard_overlap_ms": _cache_time_milliseconds(getattr(config, "shard_overlap_seconds", 0.0)),
+        "coverage_gap_ms": _cache_time_milliseconds(getattr(config, "coverage_gap_seconds", 0.0)),
+        "coverage_max_passes": int(getattr(config, "coverage_max_passes", 0)),
         "audio_sample_rate": int(config.audio_sample_rate),
         "audio_channels": int(config.audio_channels),
         "audio_format": _sanitize_audio_format(config.audio_format),
