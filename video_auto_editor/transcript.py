@@ -454,6 +454,103 @@ class StepAudioTranscriber:
 
         return VideoTranscriptionResult(success=True, chunks=chunks)
 
+    def _transcribe_shard_with_coverage(self, shard):
+        """转写单分片并对尾部缺口做覆盖度兜底补转。
+
+        StepAudio 对长/密分片存在确定性的尾部输出截断：分片首轮转写可能只覆盖到分片
+        内某处，之后的连续语音被静默丢弃。这里先取首轮结果，再把「已覆盖末端到分片末端」
+        的缺口单独切出补转，循环直到缺口收敛、补转为空或达到轮次上限；补转在分片内闭环，
+        返回的分片内 chunks 交由上层做 shard.start 偏移与全局合并去重。
+        """
+        result = self.transcribe_audio_shard(shard.audio_path, shard.index)
+        if not result.success:
+            return result
+
+        chunks = list(result.chunks)
+        shard_audio_duration = float(shard.end) - float(shard.start)
+        gap_threshold = max(0.0, float(getattr(self.config, "coverage_gap_seconds", 0.0)))
+        max_passes = max(0, int(getattr(self.config, "coverage_max_passes", 0)))
+
+        covered_end = max((chunk.end for chunk in chunks), default=0.0)
+        pass_index = 0
+        while (
+            pass_index < max_passes
+            and shard_audio_duration - covered_end > gap_threshold
+        ):
+            tail_path = self._cut_shard_tail_audio(shard, covered_end, shard_audio_duration, pass_index)
+            if tail_path is None:
+                break
+            tail_result = self.transcribe_audio_shard(tail_path, shard.index)
+            if not tail_result.success or not tail_result.chunks:
+                # 补转失败或该段确为静音：停止补转，残余缺口由下方告警兜底。
+                break
+            appended = self._offset_within_shard(tail_result.chunks, covered_end)
+            if not appended:
+                break
+            chunks.extend(appended)
+            new_covered_end = max(chunk.end for chunk in appended)
+            if new_covered_end <= covered_end:
+                # 补转未推进已覆盖末端，避免病态死循环。
+                break
+            covered_end = new_covered_end
+            pass_index += 1
+
+        remaining_gap = shard_audio_duration - covered_end
+        if remaining_gap > gap_threshold:
+            print(
+                f"[asr] shard {shard.index} 尾部仍有约 {remaining_gap:.1f}s 未覆盖"
+                f"（已补转 {pass_index} 轮），请人工核查",
+                file=sys.stderr,
+            )
+
+        chunks.sort(key=lambda chunk: (chunk.start, chunk.end, chunk.text))
+        return VideoTranscriptionResult(success=True, chunks=chunks)
+
+    def _cut_shard_tail_audio(self, shard, covered_end, shard_audio_duration, pass_index):
+        """从分片 wav 切出 [covered_end, shard_audio_duration] 尾部子段，返回临时 wav 路径。
+
+        切失败或未生成文件时返回 None，交由调用方停止补转（不中断整片转写）。
+        """
+        audio_format = _sanitize_audio_format(self.config.audio_format)
+        base, _ = os.path.splitext(shard.audio_path)
+        tail_path = f"{base}.tail_{pass_index}.{audio_format}"
+        cut_result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", _format_ffmpeg_seconds(covered_end),
+                "-to", _format_ffmpeg_seconds(shard_audio_duration),
+                "-i", shard.audio_path,
+                "-vn",
+                "-ar", str(self.config.audio_sample_rate),
+                "-ac", str(self.config.audio_channels),
+                "-f", audio_format,
+                tail_path,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if cut_result.returncode != 0 or not os.path.exists(tail_path):
+            return None
+        return tail_path
+
+    @staticmethod
+    def _offset_within_shard(chunks, offset):
+        """把尾部子段的分片内时间整体平移 offset，过滤空文本与非法时间戳。"""
+        offset_chunks = []
+        for chunk in chunks:
+            text = str(chunk.text).strip()
+            if not text or chunk.end < chunk.start:
+                continue
+            offset_chunks.append(
+                TranscriptChunk(
+                    start=offset + chunk.start,
+                    end=offset + chunk.end,
+                    text=text,
+                    char_spans=_offset_char_spans(chunk.char_spans, offset),
+                )
+            )
+        return offset_chunks
+
     def _sleep_before_retry(self, attempt_index):
         backoff = max(0.0, float(self.config.retry_backoff_seconds))
         if backoff > 0:
