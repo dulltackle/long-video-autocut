@@ -922,8 +922,19 @@ def _effective_shard_seconds(config):
     return min(shard_seconds, float(int(max_shard_seconds)))
 
 
+def _effective_shard_overlap(config, shard_seconds):
+    """把相邻分片重叠秒数夹紧到 [0, shard_seconds*0.5]。
+
+    上限取分片时长的一半，保证步进 ``shard_seconds - overlap > 0``、分片不退化为
+    原地打转；``overlap`` 过大（含配置超过 shard_seconds）时收敛到安全值。
+    """
+    overlap = max(0.0, float(getattr(config, "shard_overlap_seconds", 0.0)))
+    return min(overlap, float(shard_seconds) * 0.5)
+
+
 def _build_audio_shard_plan(duration, work_dir, config):
     shard_seconds = _effective_shard_seconds(config)
+    overlap = _effective_shard_overlap(config, shard_seconds)
     audio_format = _sanitize_audio_format(config.audio_format)
     shard_dir = os.path.join(work_dir, "asr_shards")
     cache_dir = os.path.join(work_dir, "asr_shard_cache")
@@ -944,7 +955,11 @@ def _build_audio_shard_plan(duration, work_dir, config):
             )
         )
         index += 1
-        start = end
+        # 收口于时长末端即停，避免重叠回退产生零长/重复的末分片。
+        if end >= duration:
+            break
+        # 相邻分片重叠 overlap 秒：下一片头部覆盖上一片可能被截断的尾部。
+        start = end - overlap
     return shards
 
 
