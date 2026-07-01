@@ -40,6 +40,10 @@ class StepAudioConfig:
     timeout: int = 120
     max_upload_bytes: int = 10 * 1024 * 1024
     shard_seconds: int = 600
+    # 默认 0 表示不重叠、不兜底补转，等价历史行为；生产默认值由 config.py 透传。
+    shard_overlap_seconds: float = 0.0
+    coverage_gap_seconds: float = 3.0
+    coverage_max_passes: int = 0
     audio_sample_rate: int = 16000
     audio_channels: int = 1
     audio_format: str = "wav"
@@ -479,6 +483,9 @@ def create_stepaudio_transcriber(config=None):
             timeout=_config_get(config, "asr_timeout"),
             max_upload_bytes=int(_config_get(config, "asr_max_upload_bytes")),
             shard_seconds=int(_config_get(config, "asr_shard_seconds")),
+            shard_overlap_seconds=float(_config_get(config, "asr_shard_overlap_seconds")),
+            coverage_gap_seconds=float(_config_get(config, "asr_coverage_gap_seconds")),
+            coverage_max_passes=int(_config_get(config, "asr_coverage_max_passes")),
             audio_sample_rate=int(_config_get(config, "asr_audio_sample_rate")),
             audio_channels=int(_config_get(config, "asr_audio_channels")),
             audio_format=str(_config_get(config, "asr_audio_format")),
