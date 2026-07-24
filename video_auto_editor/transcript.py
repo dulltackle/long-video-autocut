@@ -1309,9 +1309,8 @@ def _config_get(config, key, default=None):
 
 
 def _resolve_stepfun_api_key(config):
-    api_key = _config_get(config, "stepfun_api_key", None)
-    if api_key:
-        return api_key
+    if config is not None and "stepfun_api_key" in config:
+        return str(config["stepfun_api_key"] or "")
     env_name = _config_get(config, "stepfun_api_key_env", "STEPFUN_API_KEY")
     return os.environ.get(env_name, "")
 
