@@ -408,7 +408,7 @@ def _review_live_candidates(candidates, course_context, config, video_work=None)
     if not result.reviews:
         provider_info = dict(provider_info)
         provider_info["review_diagnostics"] = _review_failure_diagnostics(result)
-        return "unreviewed", provider_info, [f"主题评审失败：{result.error}"]
+        return "unreviewed", provider_info, [f"主题评审不可用：主题评审失败：{result.error}"]
 
     for candidate in candidates:
         review = result.reviews.get(candidate.index)

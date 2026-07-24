@@ -148,6 +148,10 @@ def test_live_reviewed_non_dry_run_generates_export_deliverables(monkeypatch, tm
     monkeypatch.setattr(transcript.urllib.request, "urlopen", fake_request)
     monkeypatch.setenv("STEPFUN_API_KEY", "test-key")
     monkeypatch.setitem(cli.CONFIG, "asr_shard_seconds", 90)
+    # 本管线 e2e 固定分片场景：关闭重叠/兜底补转（其行为由 test_transcript 专项单测覆盖），
+    # 使 ASR 分片序列与 asr_responses 一一对应，保持确定性。
+    monkeypatch.setitem(cli.CONFIG, "asr_shard_overlap_seconds", 0.0)
+    monkeypatch.setitem(cli.CONFIG, "asr_coverage_max_passes", 0)
     monkeypatch.setitem(cli.CONFIG, "asr_retry_backoff_seconds", 0)
     monkeypatch.setitem(cli.CONFIG, "min_clip_duration", 30)
     monkeypatch.setitem(cli.CONFIG, "max_clip_duration", 80)
@@ -323,6 +327,10 @@ def test_live_subtitle_optimization_failure_degrades_without_burn(monkeypatch, t
     monkeypatch.setattr(transcript.urllib.request, "urlopen", fake_request)
     monkeypatch.setenv("STEPFUN_API_KEY", "test-key")
     monkeypatch.setitem(cli.CONFIG, "asr_shard_seconds", 90)
+    # 本管线 e2e 固定分片场景：关闭重叠/兜底补转（其行为由 test_transcript 专项单测覆盖），
+    # 使 ASR 分片序列与 asr_responses 一一对应，保持确定性。
+    monkeypatch.setitem(cli.CONFIG, "asr_shard_overlap_seconds", 0.0)
+    monkeypatch.setitem(cli.CONFIG, "asr_coverage_max_passes", 0)
     monkeypatch.setitem(cli.CONFIG, "asr_retry_backoff_seconds", 0)
     monkeypatch.setitem(cli.CONFIG, "subtitle_optimization_retry_backoff_seconds", 0)
     monkeypatch.setitem(cli.CONFIG, "min_clip_duration", 30)

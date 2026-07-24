@@ -119,6 +119,10 @@ def test_live_dry_run_generates_plan_report_and_transcript_without_exports(monke
     monkeypatch.setattr(transcript.urllib.request, "urlopen", fake_request)
     monkeypatch.setenv("STEPFUN_API_KEY", "test-key")
     monkeypatch.setitem(cli.CONFIG, "asr_shard_seconds", 60)
+    # 本管线 e2e 固定分片场景：关闭重叠/兜底补转（其行为由 test_transcript 专项单测覆盖），
+    # 使 ASR 分片序列与 asr_responses 一一对应，保持确定性。
+    monkeypatch.setitem(cli.CONFIG, "asr_shard_overlap_seconds", 0.0)
+    monkeypatch.setitem(cli.CONFIG, "asr_coverage_max_passes", 0)
     monkeypatch.setitem(cli.CONFIG, "asr_retry_backoff_seconds", 0)
     monkeypatch.setitem(cli.CONFIG, "min_clip_duration", 30)
     monkeypatch.setitem(cli.CONFIG, "max_clip_duration", 80)

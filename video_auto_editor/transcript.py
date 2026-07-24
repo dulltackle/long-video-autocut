@@ -40,6 +40,10 @@ class StepAudioConfig:
     timeout: int = 120
     max_upload_bytes: int = 10 * 1024 * 1024
     shard_seconds: int = 600
+    # 默认 0 表示不重叠、不兜底补转，等价历史行为；生产默认值由 config.py 透传。
+    shard_overlap_seconds: float = 0.0
+    coverage_gap_seconds: float = 3.0
+    coverage_max_passes: int = 0
     audio_sample_rate: int = 16000
     audio_channels: int = 1
     audio_format: str = "wav"
@@ -307,7 +311,7 @@ class StepAudioTranscriber:
         for shard in shard_result:
             shard_chunks = load_stepaudio_shard_cache(video_path, shard, self.config)
             if shard_chunks is None:
-                result = self.transcribe_audio_shard(shard.audio_path, shard.index)
+                result = self._transcribe_shard_with_coverage(shard)
                 if not result.success:
                     result.transcript_path = transcript_path
                     return result
@@ -450,6 +454,103 @@ class StepAudioTranscriber:
 
         return VideoTranscriptionResult(success=True, chunks=chunks)
 
+    def _transcribe_shard_with_coverage(self, shard):
+        """转写单分片并对尾部缺口做覆盖度兜底补转。
+
+        StepAudio 对长/密分片存在确定性的尾部输出截断：分片首轮转写可能只覆盖到分片
+        内某处，之后的连续语音被静默丢弃。这里先取首轮结果，再把「已覆盖末端到分片末端」
+        的缺口单独切出补转，循环直到缺口收敛、补转为空或达到轮次上限；补转在分片内闭环，
+        返回的分片内 chunks 交由上层做 shard.start 偏移与全局合并去重。
+        """
+        result = self.transcribe_audio_shard(shard.audio_path, shard.index)
+        if not result.success:
+            return result
+
+        chunks = list(result.chunks)
+        shard_audio_duration = float(shard.end) - float(shard.start)
+        gap_threshold = max(0.0, float(getattr(self.config, "coverage_gap_seconds", 0.0)))
+        max_passes = max(0, int(getattr(self.config, "coverage_max_passes", 0)))
+
+        covered_end = max((chunk.end for chunk in chunks), default=0.0)
+        pass_index = 0
+        while (
+            pass_index < max_passes
+            and shard_audio_duration - covered_end > gap_threshold
+        ):
+            tail_path = self._cut_shard_tail_audio(shard, covered_end, shard_audio_duration, pass_index)
+            if tail_path is None:
+                break
+            tail_result = self.transcribe_audio_shard(tail_path, shard.index)
+            if not tail_result.success or not tail_result.chunks:
+                # 补转失败或该段确为静音：停止补转，残余缺口由下方告警兜底。
+                break
+            appended = self._offset_within_shard(tail_result.chunks, covered_end)
+            if not appended:
+                break
+            chunks.extend(appended)
+            new_covered_end = max(chunk.end for chunk in appended)
+            if new_covered_end <= covered_end:
+                # 补转未推进已覆盖末端，避免病态死循环。
+                break
+            covered_end = new_covered_end
+            pass_index += 1
+
+        remaining_gap = shard_audio_duration - covered_end
+        if remaining_gap > gap_threshold:
+            print(
+                f"[asr] shard {shard.index} 尾部仍有约 {remaining_gap:.1f}s 未覆盖"
+                f"（已补转 {pass_index} 轮），请人工核查",
+                file=sys.stderr,
+            )
+
+        chunks.sort(key=lambda chunk: (chunk.start, chunk.end, chunk.text))
+        return VideoTranscriptionResult(success=True, chunks=chunks)
+
+    def _cut_shard_tail_audio(self, shard, covered_end, shard_audio_duration, pass_index):
+        """从分片 wav 切出 [covered_end, shard_audio_duration] 尾部子段，返回临时 wav 路径。
+
+        切失败或未生成文件时返回 None，交由调用方停止补转（不中断整片转写）。
+        """
+        audio_format = _sanitize_audio_format(self.config.audio_format)
+        base, _ = os.path.splitext(shard.audio_path)
+        tail_path = f"{base}.tail_{pass_index}.{audio_format}"
+        cut_result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", _format_ffmpeg_seconds(covered_end),
+                "-to", _format_ffmpeg_seconds(shard_audio_duration),
+                "-i", shard.audio_path,
+                "-vn",
+                "-ar", str(self.config.audio_sample_rate),
+                "-ac", str(self.config.audio_channels),
+                "-f", audio_format,
+                tail_path,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if cut_result.returncode != 0 or not os.path.exists(tail_path):
+            return None
+        return tail_path
+
+    @staticmethod
+    def _offset_within_shard(chunks, offset):
+        """把尾部子段的分片内时间整体平移 offset，过滤空文本与非法时间戳。"""
+        offset_chunks = []
+        for chunk in chunks:
+            text = str(chunk.text).strip()
+            if not text or chunk.end < chunk.start:
+                continue
+            offset_chunks.append(
+                TranscriptChunk(
+                    start=offset + chunk.start,
+                    end=offset + chunk.end,
+                    text=text,
+                    char_spans=_offset_char_spans(chunk.char_spans, offset),
+                )
+            )
+        return offset_chunks
+
     def _sleep_before_retry(self, attempt_index):
         backoff = max(0.0, float(self.config.retry_backoff_seconds))
         if backoff > 0:
@@ -479,6 +580,9 @@ def create_stepaudio_transcriber(config=None):
             timeout=_config_get(config, "asr_timeout"),
             max_upload_bytes=int(_config_get(config, "asr_max_upload_bytes")),
             shard_seconds=int(_config_get(config, "asr_shard_seconds")),
+            shard_overlap_seconds=float(_config_get(config, "asr_shard_overlap_seconds")),
+            coverage_gap_seconds=float(_config_get(config, "asr_coverage_gap_seconds")),
+            coverage_max_passes=int(_config_get(config, "asr_coverage_max_passes")),
             audio_sample_rate=int(_config_get(config, "asr_audio_sample_rate")),
             audio_channels=int(_config_get(config, "asr_audio_channels")),
             audio_format=str(_config_get(config, "asr_audio_format")),
@@ -915,8 +1019,19 @@ def _effective_shard_seconds(config):
     return min(shard_seconds, float(int(max_shard_seconds)))
 
 
+def _effective_shard_overlap(config, shard_seconds):
+    """把相邻分片重叠秒数夹紧到 [0, shard_seconds*0.5]。
+
+    上限取分片时长的一半，保证步进 ``shard_seconds - overlap > 0``、分片不退化为
+    原地打转；``overlap`` 过大（含配置超过 shard_seconds）时收敛到安全值。
+    """
+    overlap = max(0.0, float(getattr(config, "shard_overlap_seconds", 0.0)))
+    return min(overlap, float(shard_seconds) * 0.5)
+
+
 def _build_audio_shard_plan(duration, work_dir, config):
     shard_seconds = _effective_shard_seconds(config)
+    overlap = _effective_shard_overlap(config, shard_seconds)
     audio_format = _sanitize_audio_format(config.audio_format)
     shard_dir = os.path.join(work_dir, "asr_shards")
     cache_dir = os.path.join(work_dir, "asr_shard_cache")
@@ -937,7 +1052,11 @@ def _build_audio_shard_plan(duration, work_dir, config):
             )
         )
         index += 1
-        start = end
+        # 收口于时长末端即停，避免重叠回退产生零长/重复的末分片。
+        if end >= duration:
+            break
+        # 相邻分片重叠 overlap 秒：下一片头部覆盖上一片可能被截断的尾部。
+        start = end - overlap
     return shards
 
 
@@ -1063,6 +1182,9 @@ def _stepaudio_shard_cache_signature(config, shard):
         "language": str(config.language),
         "shard_start_ms": _cache_time_milliseconds(shard.start),
         "shard_end_ms": _cache_time_milliseconds(shard.end),
+        "shard_overlap_ms": _cache_time_milliseconds(getattr(config, "shard_overlap_seconds", 0.0)),
+        "coverage_gap_ms": _cache_time_milliseconds(getattr(config, "coverage_gap_seconds", 0.0)),
+        "coverage_max_passes": int(getattr(config, "coverage_max_passes", 0)),
         "audio_sample_rate": int(config.audio_sample_rate),
         "audio_channels": int(config.audio_channels),
         "audio_format": _sanitize_audio_format(config.audio_format),
@@ -1187,9 +1309,8 @@ def _config_get(config, key, default=None):
 
 
 def _resolve_stepfun_api_key(config):
-    api_key = _config_get(config, "stepfun_api_key", None)
-    if api_key:
-        return api_key
+    if config is not None and "stepfun_api_key" in config:
+        return str(config["stepfun_api_key"] or "")
     env_name = _config_get(config, "stepfun_api_key_env", "STEPFUN_API_KEY")
     return os.environ.get(env_name, "")
 

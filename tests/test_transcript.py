@@ -201,6 +201,9 @@ def test_create_stepaudio_transcriber_reads_base_url_from_env(monkeypatch):
         timeout=30,
         max_upload_bytes=10 * 1024 * 1024,
         shard_seconds=600,
+        shard_overlap_seconds=5.0,
+        coverage_gap_seconds=3.0,
+        coverage_max_passes=4,
         audio_sample_rate=16000,
         audio_channels=1,
         audio_format="wav",
@@ -1795,3 +1798,243 @@ def test_export_srt_writes_timestamped_subtitles(tmp_path):
         "00:01:05,000 --> 00:01:06,789\n"
         "第二段\n第二行 第三行\n\n"
     )
+
+
+def test_build_audio_shard_plan_overlaps_adjacent_shards(tmp_path):
+    # shard_seconds=100、overlap=10 → 步进 90：相邻分片重叠 10s，末分片收口于时长末端。
+    config = StepAudioConfig(
+        shard_seconds=100,
+        shard_overlap_seconds=10.0,
+        audio_sample_rate=16000,
+        audio_channels=1,
+        audio_format="wav",
+        max_upload_bytes=100 * 1024 * 1024,
+    )
+
+    shards = transcript._build_audio_shard_plan(250.0, str(tmp_path / "work"), config)
+
+    assert [(s.start, s.end) for s in shards] == [(0.0, 100.0), (90.0, 190.0), (180.0, 250.0)]
+    assert shards[0].start == 0.0
+    assert shards[-1].end == 250.0
+    for shard in shards:
+        assert shard.end - shard.start <= 100
+    # 相邻分片重叠 overlap：后片头部落在前片尾部之前，步进恒为 shard_seconds-overlap。
+    for earlier, later in zip(shards, shards[1:]):
+        assert later.start < earlier.end
+        assert later.start == earlier.end - 10.0
+
+
+def test_build_audio_shard_plan_clamps_excessive_overlap(tmp_path):
+    # overlap 超过 shard_seconds 时夹紧到一半（50），步进仍为正（50），不产生零长/原地打转。
+    config = StepAudioConfig(
+        shard_seconds=100,
+        shard_overlap_seconds=999.0,
+        audio_sample_rate=16000,
+        audio_channels=1,
+        audio_format="wav",
+        max_upload_bytes=100 * 1024 * 1024,
+    )
+
+    shards = transcript._build_audio_shard_plan(250.0, str(tmp_path / "work"), config)
+
+    assert [(s.start, s.end) for s in shards] == [(0.0, 100.0), (50.0, 150.0), (100.0, 200.0), (150.0, 250.0)]
+    assert shards[-1].end == 250.0
+
+
+def _stub_shard_transcription(monkeypatch, transcriber, results):
+    """把 transcribe_audio_shard 替换为按序返回预置结果的桩，记录每次入参音频路径。"""
+    calls = []
+
+    def fake_transcribe(audio_path, shard_index=None):
+        calls.append(audio_path)
+        return results[len(calls) - 1]
+
+    monkeypatch.setattr(transcriber, "transcribe_audio_shard", fake_transcribe)
+    monkeypatch.setattr(
+        transcriber,
+        "_cut_shard_tail_audio",
+        lambda shard, covered_end, duration, pass_index: f"/tmp/tail_{pass_index}.wav",
+    )
+    return calls
+
+
+def _coverage_shard():
+    return AudioShard(
+        index=5,
+        start=0.0,
+        end=245.0,
+        audio_path="/tmp/shard_0005.wav",
+        cache_path="/tmp/shard_0005.json",
+    )
+
+
+def test_transcribe_shard_with_coverage_fills_tail_gap(monkeypatch):
+    # 首轮只覆盖到 200/245，尾部 45s 缺口经一次补转按 covered_end 偏移补回。
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", coverage_gap_seconds=3.0, coverage_max_passes=4)
+    )
+    results = [
+        VideoTranscriptionResult(success=True, chunks=[TranscriptChunk(0.0, 200.0, "截断段")]),
+        VideoTranscriptionResult(success=True, chunks=[TranscriptChunk(0.0, 45.0, "尾部段")]),
+    ]
+    calls = _stub_shard_transcription(monkeypatch, transcriber, results)
+
+    result = transcriber._transcribe_shard_with_coverage(_coverage_shard())
+
+    assert result.success is True
+    assert result.chunks == [
+        TranscriptChunk(0.0, 200.0, "截断段"),
+        TranscriptChunk(200.0, 245.0, "尾部段"),
+    ]
+    assert len(calls) == 2
+
+
+def test_transcribe_shard_with_coverage_recovers_large_gap_over_multiple_passes(monkeypatch):
+    # 165s 灾难性截断分多轮补回：首轮 0-80，之后每轮补 80s，直至缺口收敛。
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", coverage_gap_seconds=3.0, coverage_max_passes=4)
+    )
+    results = [
+        VideoTranscriptionResult(success=True, chunks=[TranscriptChunk(0.0, 80.0, "第一段")]),
+        VideoTranscriptionResult(success=True, chunks=[TranscriptChunk(0.0, 80.0, "第二段")]),
+        VideoTranscriptionResult(success=True, chunks=[TranscriptChunk(0.0, 80.0, "第三段")]),
+        VideoTranscriptionResult(success=True, chunks=[TranscriptChunk(0.0, 5.0, "第四段")]),
+    ]
+    calls = _stub_shard_transcription(monkeypatch, transcriber, results)
+
+    result = transcriber._transcribe_shard_with_coverage(_coverage_shard())
+
+    assert result.success is True
+    assert result.chunks == [
+        TranscriptChunk(0.0, 80.0, "第一段"),
+        TranscriptChunk(80.0, 160.0, "第二段"),
+        TranscriptChunk(160.0, 240.0, "第三段"),
+        TranscriptChunk(240.0, 245.0, "第四段"),
+    ]
+    # 时间轴单调不倒退。
+    for earlier, later in zip(result.chunks, result.chunks[1:]):
+        assert later.start >= earlier.end
+    assert len(calls) == 4
+
+
+def test_transcribe_shard_with_coverage_warns_and_stops_at_max_passes(monkeypatch, capsys):
+    # 轮次上限用尽仍有缺口：给出告警、不死循环、不抛错，保留已补回的部分。
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", coverage_gap_seconds=3.0, coverage_max_passes=1)
+    )
+    results = [
+        VideoTranscriptionResult(success=True, chunks=[TranscriptChunk(0.0, 80.0, "第一段")]),
+        VideoTranscriptionResult(success=True, chunks=[TranscriptChunk(0.0, 80.0, "第二段")]),
+    ]
+    calls = _stub_shard_transcription(monkeypatch, transcriber, results)
+
+    result = transcriber._transcribe_shard_with_coverage(_coverage_shard())
+
+    assert result.success is True
+    assert result.chunks == [
+        TranscriptChunk(0.0, 80.0, "第一段"),
+        TranscriptChunk(80.0, 160.0, "第二段"),
+    ]
+    # 仅补转 1 轮（primary + 1 tail），未继续到耗尽内存。
+    assert len(calls) == 2
+    warning = capsys.readouterr().err
+    assert "shard 5" in warning
+    assert "85" in warning
+
+
+def test_transcribe_shard_with_coverage_stops_on_empty_tail(monkeypatch):
+    # 尾部子段返回空/失败（视为静音）：停止补转并告警，不影响首轮成功结果。
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", coverage_gap_seconds=3.0, coverage_max_passes=4)
+    )
+    results = [
+        VideoTranscriptionResult(success=True, chunks=[TranscriptChunk(0.0, 200.0, "截断段")]),
+        VideoTranscriptionResult(success=False, chunks=[], error="StepAudio response missing timestamped segments"),
+    ]
+    calls = _stub_shard_transcription(monkeypatch, transcriber, results)
+
+    result = transcriber._transcribe_shard_with_coverage(_coverage_shard())
+
+    assert result.success is True
+    assert result.chunks == [TranscriptChunk(0.0, 200.0, "截断段")]
+    assert len(calls) == 2
+
+
+def test_transcribe_shard_with_coverage_skips_when_no_gap(monkeypatch):
+    # 正常分片（尾部缺口 <= coverage_gap_seconds）：不触发补转，结果与首轮一致。
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", coverage_gap_seconds=3.0, coverage_max_passes=4)
+    )
+    results = [VideoTranscriptionResult(success=True, chunks=[TranscriptChunk(0.0, 244.0, "完整段")])]
+    calls = _stub_shard_transcription(monkeypatch, transcriber, results)
+
+    result = transcriber._transcribe_shard_with_coverage(_coverage_shard())
+
+    assert result.success is True
+    assert result.chunks == [TranscriptChunk(0.0, 244.0, "完整段")]
+    assert len(calls) == 1
+
+
+def test_create_stepaudio_transcriber_reads_coverage_config(monkeypatch):
+    monkeypatch.setenv("STEPFUN_API_KEY", "test-key")
+
+    default_transcriber = create_stepaudio_transcriber(CONFIG)
+    assert default_transcriber.config.shard_overlap_seconds == 5.0
+    assert default_transcriber.config.coverage_gap_seconds == 3.0
+    assert default_transcriber.config.coverage_max_passes == 4
+
+    override_transcriber = create_stepaudio_transcriber(
+        {
+            "asr_shard_overlap_seconds": 8.0,
+            "asr_coverage_gap_seconds": 1.5,
+            "asr_coverage_max_passes": 2,
+        }
+    )
+    assert override_transcriber.config.shard_overlap_seconds == 8.0
+    assert override_transcriber.config.coverage_gap_seconds == 1.5
+    assert override_transcriber.config.coverage_max_passes == 2
+
+
+def test_stepaudio_transcribe_video_merges_overlap_region_duplicates(monkeypatch, tmp_path):
+    # 分片重叠导致重叠区文本重复，经全局 _merge_overlapping_chunks 去重、时间轴单调。
+    video_path = tmp_path / "live.mp4"
+    video_path.write_bytes(b"video")
+    install_stepaudio_media_success(monkeypatch, duration="40.0")
+    responses = [
+        stepaudio_sse((0, 25, "你好。")),
+        stepaudio_sse((0, 5, "你好。"), (5, 20, "世界。")),
+    ]
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return self.body
+
+    def fake_request(request, timeout):
+        calls.append(request)
+        return FakeResponse(responses[len(calls) - 1])
+
+    transcriber = StepAudioTranscriber(
+        StepAudioConfig(api_key="test-key", shard_seconds=25, shard_overlap_seconds=5.0),
+        request_func=fake_request,
+    )
+
+    result = transcriber.transcribe_video(str(video_path), str(tmp_path))
+
+    assert result.success is True
+    assert result.chunks == [
+        TranscriptChunk(0, 25, "你好。"),
+        TranscriptChunk(25, 40, "世界。"),
+    ]
+    for earlier, later in zip(result.chunks, result.chunks[1:]):
+        assert later.start >= earlier.end
+    assert len(calls) == 2
