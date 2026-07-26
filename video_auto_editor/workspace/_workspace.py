@@ -44,7 +44,8 @@ _MANAGED_FILE_FLAGS: dict[_FileMode, int] = {
     "rb": os.O_RDONLY,
     "wb": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
     "xb": os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-    "ab": os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+    # 追加只允许既有受管文件，防止事件日志丢失后静默创建新时间线。
+    "ab": os.O_WRONLY | os.O_APPEND,
 }
 _Identity = tuple[int, int]
 _CAPABILITY_ISSUER = _claim_workspace_issuer()
@@ -703,6 +704,273 @@ class Workspace:
             if descriptor >= 0:
                 os.close(descriptor)
 
+    def _publish_managed_file_atomically(
+        self,
+        root_descriptor: int,
+        base_parts: tuple[str, ...],
+        base_identities: tuple[_Identity, ...],
+        relative_parts: tuple[str, ...],
+        contents: bytes,
+    ) -> int:
+        if not relative_parts:
+            raise ValueError("原子发布位置必须包含相对文件名")
+        _validate_effect_parts(base_parts, allow_empty=False)
+        _validate_effect_parts(relative_parts, allow_empty=False)
+        self._validate_lease_root(root_descriptor)
+        parent_descriptor = -1
+        file_descriptor = -1
+        temporary_name = ""
+        temporary_identity: _Identity | None = None
+        published = False
+        try:
+            parent_descriptor = _open_bound_directory(
+                root_descriptor,
+                base_parts,
+                base_identities,
+                expected_mount_id=self._layout.mount_id,
+            )
+            for part in relative_parts[:-1]:
+                next_descriptor = _open_managed_directory_at(
+                    parent_descriptor,
+                    part,
+                    expected_mount_id=self._layout.mount_id,
+                )
+                os.close(parent_descriptor)
+                parent_descriptor = next_descriptor
+            target_name = relative_parts[-1]
+            try:
+                target_status = os.stat(
+                    target_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                target_status = None
+            if target_status is not None:
+                if stat.S_ISLNK(target_status.st_mode):
+                    raise _workspace_access_failure(
+                        "workspace.symlink_encountered"
+                    )
+                if (
+                    not stat.S_ISREG(target_status.st_mode)
+                    or target_status.st_nlink != 1
+                ):
+                    raise _workspace_access_failure(
+                        "workspace.ownership_changed"
+                    )
+                raise FileExistsError(
+                    errno.EEXIST,
+                    "受管位置已经存在",
+                )
+
+            for _ in range(16):
+                candidate = f"{_CREATE_PREFIX}{secrets.token_hex(16)}"
+                try:
+                    file_descriptor = os.open(
+                        candidate,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC
+                        | os.O_NONBLOCK,
+                        _SENSITIVE_FILE_MODE,
+                        dir_fd=parent_descriptor,
+                    )
+                except FileExistsError:
+                    continue
+                temporary_name = candidate
+                break
+            if file_descriptor < 0:
+                raise OSError(
+                    errno.EBUSY,
+                    "无法分配受管原子发布文件",
+                )
+
+            temporary_status = os.fstat(file_descriptor)
+            temporary_identity = _identity(temporary_status)
+            if (
+                not stat.S_ISREG(temporary_status.st_mode)
+                or temporary_status.st_nlink != 1
+                or _descriptor_mount_id(file_descriptor)
+                != self._layout.mount_id
+            ):
+                raise _workspace_access_failure(
+                    "workspace.ownership_changed"
+                )
+            os.fchmod(file_descriptor, _SENSITIVE_FILE_MODE)
+            _assert_name_identity(
+                parent_descriptor,
+                temporary_name,
+                temporary_identity,
+                access_failure=True,
+            )
+
+            remaining = memoryview(contents)
+            while remaining:
+                written = os.write(file_descriptor, remaining)
+                if written == 0:
+                    raise OSError(errno.EIO, "无法完整写入受管文件")
+                remaining = remaining[written:]
+            _sync_file_data(file_descriptor)
+
+            self._validate_lease_root(root_descriptor)
+            synced_status = os.fstat(file_descriptor)
+            if (
+                not stat.S_ISREG(synced_status.st_mode)
+                or synced_status.st_nlink != 1
+                or _identity(synced_status) != temporary_identity
+                or _descriptor_mount_id(file_descriptor)
+                != self._layout.mount_id
+            ):
+                raise _workspace_access_failure(
+                    "workspace.ownership_changed"
+                )
+            _assert_name_identity(
+                parent_descriptor,
+                temporary_name,
+                temporary_identity,
+                access_failure=True,
+            )
+            self._revalidate_managed_parent(
+                root_descriptor,
+                base_parts,
+                base_identities,
+                relative_parts[:-1],
+                parent_descriptor,
+            )
+            try:
+                _rename_no_replace(
+                    parent_descriptor,
+                    temporary_name,
+                    parent_descriptor,
+                    target_name,
+                )
+            except OSError as exc:
+                raise _managed_component_failure(
+                    parent_descriptor,
+                    target_name,
+                    exc,
+                ) from exc
+            published = True
+            self._revalidate_managed_parent(
+                root_descriptor,
+                base_parts,
+                base_identities,
+                relative_parts[:-1],
+                parent_descriptor,
+            )
+            _assert_name_identity(
+                parent_descriptor,
+                target_name,
+                temporary_identity,
+                access_failure=True,
+            )
+            os.fsync(parent_descriptor)
+            self._revalidate_managed_parent(
+                root_descriptor,
+                base_parts,
+                base_identities,
+                relative_parts[:-1],
+                parent_descriptor,
+            )
+            _assert_name_identity(
+                parent_descriptor,
+                target_name,
+                temporary_identity,
+                access_failure=True,
+            )
+            return len(contents)
+        except (WorkspaceFailure, FileExistsError):
+            raise
+        except PermissionError as exc:
+            raise _workspace_access_failure(
+                "workspace.permission_denied"
+            ) from exc
+        except OSError as exc:
+            raise _workspace_access_failure("workspace.io_failed") from exc
+        finally:
+            if (
+                temporary_name
+                and temporary_identity is None
+                and file_descriptor >= 0
+            ):
+                try:
+                    fallback_status = os.fstat(file_descriptor)
+                    if (
+                        stat.S_ISREG(fallback_status.st_mode)
+                        and fallback_status.st_nlink == 1
+                    ):
+                        temporary_identity = _identity(fallback_status)
+                except OSError:
+                    pass
+            try:
+                if (
+                    temporary_name
+                    and temporary_identity is not None
+                    and not published
+                    and parent_descriptor >= 0
+                ):
+                    # 清理无法证明仍拥有临时名称时，所有权/耐久性失败
+                    # 必须优先于原始 I/O 错误，不能把未知残留静默当成功。
+                    _remove_atomic_publish_temporary(
+                        parent_descriptor,
+                        temporary_name,
+                        temporary_identity,
+                    )
+            finally:
+                try:
+                    if file_descriptor >= 0:
+                        os.close(file_descriptor)
+                finally:
+                    if parent_descriptor >= 0:
+                        os.close(parent_descriptor)
+
+    def _revalidate_managed_parent(
+        self,
+        root_descriptor: int,
+        base_parts: tuple[str, ...],
+        base_identities: tuple[_Identity, ...],
+        relative_parent_parts: tuple[str, ...],
+        parent_descriptor: int,
+    ) -> None:
+        self._validate_lease_root(root_descriptor)
+        held_status = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(held_status.st_mode)
+            or _descriptor_mount_id(parent_descriptor)
+            != self._layout.mount_id
+        ):
+            raise _workspace_access_failure(
+                "workspace.ownership_changed"
+            )
+        current_descriptor = -1
+        try:
+            current_descriptor = _open_bound_directory(
+                root_descriptor,
+                base_parts,
+                base_identities,
+                expected_mount_id=self._layout.mount_id,
+            )
+            for part in relative_parent_parts:
+                next_descriptor = _open_managed_directory_at(
+                    current_descriptor,
+                    part,
+                    expected_mount_id=self._layout.mount_id,
+                )
+                os.close(current_descriptor)
+                current_descriptor = next_descriptor
+            if _identity(os.fstat(current_descriptor)) != _identity(
+                held_status
+            ):
+                raise _workspace_access_failure(
+                    "workspace.ownership_changed"
+                )
+        finally:
+            if current_descriptor >= 0:
+                os.close(current_descriptor)
+        self._validate_lease_root(root_descriptor)
+
     def _revalidate_managed_open_file(
         self,
         root_descriptor: int,
@@ -1015,6 +1283,20 @@ class _LeaseGuard:
                 )
             )
 
+        def publish_file(
+            relative_parts: tuple[str, ...],
+            contents: bytes,
+        ) -> int:
+            return self._execute(
+                lambda root_descriptor: self._workspace._publish_managed_file_atomically(
+                    root_descriptor,
+                    base_parts,
+                    base_identities,
+                    relative_parts,
+                    contents,
+                )
+            )
+
         def make_directory(relative_parts: tuple[str, ...]) -> None:
             try:
                 self._execute(
@@ -1038,6 +1320,7 @@ class _LeaseGuard:
 
         return _CAPABILITY_ISSUER.operations(
             use_file=use_file,
+            publish_file=publish_file,
             validate_directory=validate_directory,
             make_directory=make_directory,
             workspace_identity=workspace_identity,
@@ -2344,6 +2627,58 @@ def _rename_no_replace(
             os.strerror(error_number),
             target_name,
         )
+
+
+def _sync_file_data(descriptor: int) -> None:
+    sync = getattr(os, "fdatasync", os.fsync)
+    sync(descriptor)
+
+
+def _remove_atomic_publish_temporary(
+    parent_descriptor: int,
+    name: str,
+    expected_identity: _Identity,
+) -> None:
+    try:
+        try:
+            status = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            raise _workspace_access_failure(
+                "workspace.ownership_changed"
+            ) from None
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_nlink != 1
+            or _identity(status) != expected_identity
+        ):
+            raise _workspace_access_failure(
+                "workspace.ownership_changed"
+            )
+        _assert_name_identity(
+            parent_descriptor,
+            name,
+            expected_identity,
+            access_failure=True,
+        )
+        try:
+            os.unlink(name, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            raise _workspace_access_failure(
+                "workspace.ownership_changed"
+            ) from None
+        os.fsync(parent_descriptor)
+    except WorkspaceFailure:
+        raise
+    except PermissionError as exc:
+        raise _workspace_access_failure(
+            "workspace.permission_denied"
+        ) from exc
+    except OSError as exc:
+        raise _workspace_access_failure("workspace.io_failed") from exc
 
 
 def _directory_is_empty(descriptor: int) -> bool:

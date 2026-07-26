@@ -27,6 +27,7 @@ _FileMode = Literal["rb", "wb", "xb", "ab"]
 _ResultT = TypeVar("_ResultT")
 _FileEffect = Callable[[BinaryIO], object]
 _UseFile = Callable[[tuple[str, ...], _FileMode, _FileEffect], object]
+_PublishFile = Callable[[tuple[str, ...], bytes], int]
 _ValidateDirectory = Callable[[tuple[str, ...]], None]
 _MakeDirectory = Callable[[tuple[str, ...]], None]
 _CAPABILITY_SEAL = object()
@@ -84,6 +85,7 @@ def _scoped_binary_effect(
 @dataclass(frozen=True, slots=True)
 class _ManagedAuthority:
     use_file: _UseFile
+    publish_file: _PublishFile
     validate_directory: _ValidateDirectory
     make_directory: _MakeDirectory
     workspace_identity: object
@@ -94,6 +96,7 @@ class _ManagedAuthority:
 @dataclass(frozen=True, init=False, eq=False)
 class _ManagedOperations:
     _use_file: _UseFile = field(repr=False)
+    _publish_file: _PublishFile = field(repr=False)
     _validate_directory: _ValidateDirectory = field(repr=False)
     _make_directory: _MakeDirectory = field(repr=False)
     _seal: object = field(repr=False)
@@ -121,6 +124,16 @@ class _ManagedOperations:
             lambda: self._validate_directory(relative_parts)
         )
 
+    def publish_file(
+        self,
+        relative_parts: tuple[str, ...],
+        contents: bytes,
+    ) -> int:
+        self._assert_authentic()
+        return _without_sensitive_exception_context(
+            lambda: self._publish_file(relative_parts, contents)
+        )
+
     def make_directory(
         self,
         relative_parts: tuple[str, ...],
@@ -135,6 +148,7 @@ class _ManagedOperations:
         if authority is None or (
             self._seal is not _CAPABILITY_SEAL
             or self._use_file is not authority.use_file
+            or self._publish_file is not authority.publish_file
             or self._validate_directory is not authority.validate_directory
             or self._make_directory is not authority.make_directory
         ):
@@ -207,6 +221,21 @@ class ManagedPathCapability:
             return written
 
         return self.use_binary("xb" if exclusive else "wb", write)
+
+    def publish_bytes_atomically(
+        self,
+        contents: bytes | bytearray | memoryview,
+    ) -> int:
+        """同步完整字节后，以 no-replace 语义原子发布到受管位置。"""
+        self._assert_authentic()
+        if not isinstance(contents, (bytes, bytearray, memoryview)):
+            raise TypeError("受管文件内容必须是字节")
+        if not self._relative_parts:
+            raise ValueError("原子发布位置必须包含相对文件名")
+        return self._operations.publish_file(
+            self._relative_parts,
+            bytes(contents),
+        )
 
     def mkdir(self) -> None:
         """在已存在的受管父目录下新建一个 ``0700`` 目录。"""
@@ -311,6 +340,7 @@ class _WorkspaceCapabilityIssuer:
         self,
         *,
         use_file: _UseFile,
+        publish_file: _PublishFile,
         validate_directory: _ValidateDirectory,
         make_directory: _MakeDirectory,
         workspace_identity: object,
@@ -322,6 +352,7 @@ class _WorkspaceCapabilityIssuer:
             raise TypeError("受管目录 capability 必须使用 ManagedDirectoryRole")
         operations = object.__new__(_ManagedOperations)
         object.__setattr__(operations, "_use_file", use_file)
+        object.__setattr__(operations, "_publish_file", publish_file)
         object.__setattr__(
             operations,
             "_validate_directory",
@@ -331,6 +362,7 @@ class _WorkspaceCapabilityIssuer:
         object.__setattr__(operations, "_seal", _CAPABILITY_SEAL)
         _OPERATION_AUTHORITIES[operations] = _ManagedAuthority(
             use_file=use_file,
+            publish_file=publish_file,
             validate_directory=validate_directory,
             make_directory=make_directory,
             workspace_identity=workspace_identity,

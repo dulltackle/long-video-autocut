@@ -118,14 +118,34 @@ class CourseContextProjection:
     excluded_content_count: int
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, init=False, eq=False)
 class ConfigurationDiagnosticProjection:
-    """运行诊断可持久化的配置指纹与白名单投影。"""
+    """只能由 Configuration 签发的配置诊断安全投影。"""
+
+    __slots__ = (
+        "configuration_fingerprint",
+        "result_configuration",
+        "runtime_policy",
+        "course_context",
+        "__weakref__",
+    )
 
     configuration_fingerprint: str
     result_configuration: ResultConfigurationProjection
     runtime_policy: RuntimePolicyProjection
     course_context: CourseContextProjection
+
+    def __new__(
+        cls,
+        *_args: object,
+        **_kwargs: object,
+    ) -> "ConfigurationDiagnosticProjection":
+        raise TypeError(
+            "ConfigurationDiagnosticProjection 只能由 Configuration 创建"
+        )
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("ConfigurationDiagnosticProjection 不能被扩展")
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,4 +154,6 @@ class LoadedConfiguration:
 
     effective: EffectiveConfiguration
     course_context: CourseContext | None
-    diagnostic_projection: ConfigurationDiagnosticProjection
+    diagnostic_projection: ConfigurationDiagnosticProjection = field(
+        compare=False
+    )

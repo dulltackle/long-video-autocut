@@ -1,12 +1,16 @@
 import json
 import re
 from copy import deepcopy
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
+from weakref import ref
 
 import pytest
 
 import video_auto_editor.configuration as configuration_module
 from video_auto_editor.configuration import Configuration, ConfigurationFailure
+from video_auto_editor.configuration._model import (
+    ConfigurationDiagnosticProjection,
+)
 from video_auto_editor.runtime.errors import ErrorCode, RunError
 
 
@@ -675,6 +679,34 @@ def test_diagnostic_projection_is_immutable_and_excludes_credentials_and_content
         changed_config.diagnostic_projection.configuration_fingerprint
         != loaded.diagnostic_projection.configuration_fingerprint
     )
+
+
+def test_diagnostic_projection_can_only_be_issued_by_configuration_load(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"not-inspected-by-configuration")
+    projection = Configuration.load(source).diagnostic_projection
+    same_values = Configuration.load(source).diagnostic_projection
+    credential_canary = "sk-live-credential-canary"
+
+    with pytest.raises(TypeError, match="只能由 Configuration 创建"):
+        ConfigurationDiagnosticProjection(
+            configuration_fingerprint=credential_canary,
+            result_configuration=projection.result_configuration,
+            runtime_policy=projection.runtime_policy,
+            course_context=projection.course_context,
+        )
+
+    with pytest.raises(TypeError, match="只能由 Configuration 创建"):
+        replace(
+            projection,
+            configuration_fingerprint=credential_canary,
+        )
+
+    assert ref(projection)() is projection
+    assert same_values is not projection
+    assert same_values != projection
 
 
 def test_configuration_fingerprint_uses_only_the_persistable_whitelist(

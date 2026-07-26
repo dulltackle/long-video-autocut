@@ -401,6 +401,566 @@ def test_run_lease_issues_role_scoped_capabilities_that_reject_path_escape(
         SourceFileCapability(Path("/tmp/forged.mp4"))
 
 
+def test_managed_path_atomically_publishes_complete_private_bytes_without_replacing(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    payload = b"complete-diagnostic-manifest"
+    original_write = os.write
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        target = (
+            workspace.root
+            / "work"
+            / "runs"
+            / str(run_workspace.run_id)
+            / "run.json"
+        )
+
+        def write_at_most_three_bytes(descriptor, contents):
+            return original_write(descriptor, contents[:3])
+
+        monkeypatch.setattr(os, "write", write_at_most_three_bytes)
+
+        written = run_workspace.diagnostics.location(
+            "run.json"
+        ).publish_bytes_atomically(payload)
+        published_inode = target.stat().st_ino
+
+        with pytest.raises(FileExistsError, match="已经存在"):
+            run_workspace.diagnostics.location(
+                "run.json"
+            ).publish_bytes_atomically(b"replacement")
+
+        assert written == len(payload)
+        assert target.read_bytes() == payload
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+        assert target.stat().st_ino == published_inode
+        assert not list(target.parent.glob(".workspace-create-*"))
+
+
+def test_atomic_publish_cleans_its_temporary_file_when_data_sync_fails(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    original_fsync = os.fsync
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        diagnostic_directory = (
+            workspace.root
+            / "work"
+            / "runs"
+            / str(run_workspace.run_id)
+        )
+        synced_directories = []
+
+        def fail_data_sync(_descriptor):
+            raise OSError(errno.ENOSPC, "injected")
+
+        def observe_cleanup_sync(descriptor):
+            synced_directories.append(
+                Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            )
+            return original_fsync(descriptor)
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_sync_file_data",
+            fail_data_sync,
+        )
+        monkeypatch.setattr(os, "fsync", observe_cleanup_sync)
+
+        with pytest.raises(WorkspaceFailure) as captured:
+            run_workspace.diagnostics.location(
+                "run.json"
+            ).publish_bytes_atomically(b"manifest")
+
+        assert captured.value.diagnostics["reason_code"] == (
+            "workspace.io_failed"
+        )
+        assert not (diagnostic_directory / "run.json").exists()
+        assert not list(
+            diagnostic_directory.glob(".workspace-create-*")
+        )
+        assert synced_directories == [diagnostic_directory]
+
+
+def test_atomic_publish_cleans_a_created_temporary_after_initial_fstat_failure(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    original_fstat = os.fstat
+    injected = False
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        diagnostic_directory = (
+            workspace.root
+            / "work"
+            / "runs"
+            / str(run_workspace.run_id)
+        )
+
+        def fail_first_temporary_fstat(descriptor):
+            nonlocal injected
+            try:
+                name = Path(
+                    os.readlink(f"/proc/self/fd/{descriptor}")
+                ).name
+            except OSError:
+                name = ""
+            if not injected and name.startswith(".workspace-create-"):
+                injected = True
+                raise OSError(errno.EIO, "injected")
+            return original_fstat(descriptor)
+
+        monkeypatch.setattr(os, "fstat", fail_first_temporary_fstat)
+
+        with pytest.raises(WorkspaceFailure) as captured:
+            run_workspace.diagnostics.location(
+                "run.json"
+            ).publish_bytes_atomically(b"manifest")
+
+        assert injected
+        assert captured.value.diagnostics["reason_code"] == (
+            "workspace.io_failed"
+        )
+        assert not (diagnostic_directory / "run.json").exists()
+        assert not list(
+            diagnostic_directory.glob(".workspace-create-*")
+        )
+
+
+def test_atomic_publish_does_not_roll_back_after_parent_sync_failure(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        target = (
+            workspace.root
+            / "work"
+            / "runs"
+            / str(run_workspace.run_id)
+            / "run.json"
+        )
+
+        def fail_parent_sync(_descriptor):
+            raise OSError(errno.EIO, "injected")
+
+        monkeypatch.setattr(os, "fsync", fail_parent_sync)
+
+        with pytest.raises(WorkspaceFailure) as captured:
+            run_workspace.diagnostics.location(
+                "run.json"
+            ).publish_bytes_atomically(b"committed")
+
+        assert captured.value.diagnostics["reason_code"] == (
+            "workspace.io_failed"
+        )
+        assert target.read_bytes() == b"committed"
+        assert not list(target.parent.glob(".workspace-create-*"))
+
+
+def test_atomic_publish_syncs_private_data_before_same_directory_no_replace(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    original_open = os.open
+    original_data_sync = workspace_module._sync_file_data
+    original_rename_no_replace = workspace_module._rename_no_replace
+    original_fsync = os.fsync
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        target = (
+            workspace.root
+            / "work"
+            / "runs"
+            / str(run_workspace.run_id)
+            / "run.json"
+        )
+        temporary_open = {}
+        durability_boundaries = []
+
+        def observe_open(path, flags, *args, **kwargs):
+            if (
+                isinstance(path, str)
+                and path.startswith(".workspace-create-")
+            ):
+                temporary_open.update(
+                    {
+                        "name": path,
+                        "flags": flags,
+                        "mode": args[0],
+                        "parent": Path(
+                            os.readlink(
+                                f"/proc/self/fd/{kwargs['dir_fd']}"
+                            )
+                        ),
+                    }
+                )
+            return original_open(path, flags, *args, **kwargs)
+
+        def observe_data_sync(descriptor):
+            durability_boundaries.append(
+                (
+                    "file_data",
+                    Path(os.readlink(f"/proc/self/fd/{descriptor}")),
+                )
+            )
+            return original_data_sync(descriptor)
+
+        def observe_rename(
+            source_parent,
+            source_name,
+            target_parent,
+            target_name,
+        ):
+            durability_boundaries.append(
+                (
+                    "no_replace",
+                    Path(
+                        os.readlink(f"/proc/self/fd/{source_parent}")
+                    ),
+                )
+            )
+            assert source_parent == target_parent
+            assert source_name == temporary_open["name"]
+            assert target_name == "run.json"
+            return original_rename_no_replace(
+                source_parent,
+                source_name,
+                target_parent,
+                target_name,
+            )
+
+        def observe_parent_sync(descriptor):
+            durability_boundaries.append(
+                (
+                    "parent",
+                    Path(os.readlink(f"/proc/self/fd/{descriptor}")),
+                )
+            )
+            return original_fsync(descriptor)
+
+        monkeypatch.setattr(os, "open", observe_open)
+        monkeypatch.setattr(
+            workspace_module,
+            "_sync_file_data",
+            observe_data_sync,
+        )
+        monkeypatch.setattr(
+            workspace_module,
+            "_rename_no_replace",
+            observe_rename,
+        )
+        monkeypatch.setattr(os, "fsync", observe_parent_sync)
+
+        run_workspace.diagnostics.location(
+            "run.json"
+        ).publish_bytes_atomically(b"manifest")
+
+        required_flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+        )
+        assert temporary_open["flags"] & required_flags == required_flags
+        assert temporary_open["mode"] == 0o600
+        assert temporary_open["parent"] == target.parent
+        assert durability_boundaries == [
+            ("file_data", target.parent / temporary_open["name"]),
+            ("no_replace", target.parent),
+            ("parent", target.parent),
+        ]
+
+
+def test_atomic_publish_never_replaces_a_target_inserted_at_commit_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    original_rename_no_replace = workspace_module._rename_no_replace
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        target = (
+            workspace.root
+            / "work"
+            / "runs"
+            / str(run_workspace.run_id)
+            / "run.json"
+        )
+
+        def occupy_target_before_commit(
+            source_parent,
+            source_name,
+            target_parent,
+            target_name,
+        ):
+            target.write_bytes(b"concurrent-owner")
+            return original_rename_no_replace(
+                source_parent,
+                source_name,
+                target_parent,
+                target_name,
+            )
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_rename_no_replace",
+            occupy_target_before_commit,
+        )
+
+        with pytest.raises(FileExistsError, match="已经存在"):
+            run_workspace.diagnostics.location(
+                "run.json"
+            ).publish_bytes_atomically(b"must-not-replace")
+
+        assert target.read_bytes() == b"concurrent-owner"
+        assert not list(target.parent.glob(".workspace-create-*"))
+
+
+def test_atomic_publish_rejects_a_parent_inode_replaced_after_data_sync(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    original_data_sync = workspace_module._sync_file_data
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        diagnostic_directory = (
+            workspace.root
+            / "work"
+            / "runs"
+            / str(run_workspace.run_id)
+        )
+        displaced = diagnostic_directory.with_name("displaced-diagnostics")
+
+        def replace_parent_after_sync(descriptor):
+            original_data_sync(descriptor)
+            diagnostic_directory.rename(displaced)
+            diagnostic_directory.mkdir(mode=0o700)
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_sync_file_data",
+            replace_parent_after_sync,
+        )
+
+        with pytest.raises(WorkspaceFailure) as captured:
+            run_workspace.diagnostics.location(
+                "run.json"
+            ).publish_bytes_atomically(b"must-stay-bound")
+
+        assert captured.value.diagnostics["reason_code"] == (
+            "workspace.ownership_changed"
+        )
+        assert not (diagnostic_directory / "run.json").exists()
+        assert not list(displaced.glob(".workspace-create-*"))
+
+
+def test_atomic_publish_rejects_parent_replacement_at_commit_boundary_without_removing_published_inode(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    original_rename_no_replace = workspace_module._rename_no_replace
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        diagnostic_directory = (
+            workspace.root
+            / "work"
+            / "runs"
+            / str(run_workspace.run_id)
+        )
+        displaced = diagnostic_directory.with_name("displaced-diagnostics")
+        swapped = False
+
+        def replace_parent_at_commit_boundary(
+            source_parent,
+            source_name,
+            target_parent,
+            target_name,
+        ):
+            nonlocal swapped
+            if target_name == "run.json" and not swapped:
+                swapped = True
+                diagnostic_directory.rename(displaced)
+                diagnostic_directory.mkdir(mode=0o700)
+            return original_rename_no_replace(
+                source_parent,
+                source_name,
+                target_parent,
+                target_name,
+            )
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_rename_no_replace",
+            replace_parent_at_commit_boundary,
+        )
+
+        with pytest.raises(WorkspaceFailure) as captured:
+            run_workspace.diagnostics.location(
+                "run.json"
+            ).publish_bytes_atomically(b"must-stay-bound")
+
+        assert swapped
+        assert captured.value.diagnostics["reason_code"] == (
+            "workspace.ownership_changed"
+        )
+        assert not (diagnostic_directory / "run.json").exists()
+        assert (displaced / "run.json").read_bytes() == b"must-stay-bound"
+        assert not list(displaced.glob(".workspace-create-*"))
+
+
+def test_atomic_publish_rejects_a_symlink_target_without_touching_its_destination(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(b"outside")
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        diagnostic_directory = (
+            workspace.root
+            / "work"
+            / "runs"
+            / str(run_workspace.run_id)
+        )
+        target = diagnostic_directory / "run.json"
+        target.symlink_to(outside)
+
+        with pytest.raises(WorkspaceFailure) as captured:
+            run_workspace.diagnostics.location(
+                "run.json"
+            ).publish_bytes_atomically(b"must-not-follow")
+
+        assert captured.value.diagnostics["reason_code"] == (
+            "workspace.symlink_encountered"
+        )
+        assert target.is_symlink()
+        assert outside.read_bytes() == b"outside"
+        assert not list(
+            diagnostic_directory.glob(".workspace-create-*")
+        )
+
+
+def test_atomic_publish_never_unlinks_an_inode_swapped_into_its_temporary_name(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    original_data_sync = workspace_module._sync_file_data
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        diagnostic_directory = (
+            workspace.root
+            / "work"
+            / "runs"
+            / str(run_workspace.run_id)
+        )
+        swapped_name = None
+        displaced = diagnostic_directory / "displaced-temporary"
+
+        def swap_temporary_before_failure(descriptor):
+            nonlocal swapped_name
+            original_data_sync(descriptor)
+            temporary = Path(
+                os.readlink(f"/proc/self/fd/{descriptor}")
+            )
+            swapped_name = temporary
+            temporary.rename(displaced)
+            temporary.write_bytes(b"foreign")
+            raise OSError(errno.ENOSPC, "injected")
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_sync_file_data",
+            swap_temporary_before_failure,
+        )
+
+        with pytest.raises(WorkspaceFailure) as captured:
+            run_workspace.diagnostics.location(
+                "run.json"
+            ).publish_bytes_atomically(b"owned-temporary")
+
+        assert captured.value.diagnostics["reason_code"] == (
+            "workspace.ownership_changed"
+        )
+        assert swapped_name is not None
+        assert swapped_name.read_bytes() == b"foreign"
+        assert displaced.read_bytes() == b"owned-temporary"
+        assert not (diagnostic_directory / "run.json").exists()
+
+
+def test_atomic_publish_fails_closed_when_its_temporary_name_disappears(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    original_data_sync = workspace_module._sync_file_data
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        diagnostic_directory = (
+            workspace.root
+            / "work"
+            / "runs"
+            / str(run_workspace.run_id)
+        )
+
+        def remove_temporary_before_failure(descriptor):
+            original_data_sync(descriptor)
+            Path(os.readlink(f"/proc/self/fd/{descriptor}")).unlink()
+            raise OSError(errno.ENOSPC, "injected")
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_sync_file_data",
+            remove_temporary_before_failure,
+        )
+
+        with pytest.raises(WorkspaceFailure) as captured:
+            run_workspace.diagnostics.location(
+                "run.json"
+            ).publish_bytes_atomically(b"owned-temporary")
+
+        assert captured.value.diagnostics["reason_code"] == (
+            "workspace.ownership_changed"
+        )
+        assert not (diagnostic_directory / "run.json").exists()
+        assert not list(
+            diagnostic_directory.glob(".workspace-create-*")
+        )
+
+
 def test_run_lease_creates_run_scoped_directories_and_issues_only_fixed_roles(
     tmp_path,
 ):
@@ -983,6 +1543,34 @@ def test_workspace_private_issuer_cannot_be_claimed_or_rebuilt_by_business_code(
         capability_module._claim_workspace_issuer()
 
 
+def test_atomic_publish_rejects_a_tampered_workspace_effect_binding(tmp_path):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        location = run_workspace.diagnostics.location("run.json")
+        operations = location._operations
+        authentic_publish = operations._publish_file
+        object.__setattr__(
+            operations,
+            "_publish_file",
+            lambda _parts, contents: len(contents),
+        )
+        try:
+            with pytest.raises(TypeError, match="由 Workspace 签发"):
+                location.publish_bytes_atomically(b"forged")
+        finally:
+            object.__setattr__(
+                operations,
+                "_publish_file",
+                authentic_publish,
+            )
+
+        with pytest.raises(FileNotFoundError):
+            location.read_bytes()
+
+
 def test_private_capability_effects_remain_bound_and_reject_raw_escape_parts(
     tmp_path,
 ):
@@ -991,15 +1579,18 @@ def test_private_capability_effects_remain_bound_and_reject_raw_escape_parts(
     workspace = Workspace.open(source, tmp_path / "workspace")
     escaped = workspace.root.parent / "escaped.bin"
 
-    with (
-        workspace.acquire_run(RunId.new()) as run_workspace,
-        pytest.raises(ValueError, match="路径段"),
-    ):
-        run_workspace.cache._operations.use_file(
-            ("..", "escaped.bin"),
-            "wb",
-            lambda _stream: None,
-        )
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        with pytest.raises(ValueError, match="路径段"):
+            run_workspace.cache._operations.use_file(
+                ("..", "escaped.bin"),
+                "wb",
+                lambda _stream: None,
+            )
+        with pytest.raises(ValueError, match="路径段"):
+            run_workspace.cache._operations.publish_file(
+                ("..", "escaped.bin"),
+                b"escape",
+            )
 
     assert not escaped.exists()
 
