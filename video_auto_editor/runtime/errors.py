@@ -871,6 +871,8 @@ def _build_diagnostic_value_choices() -> Mapping[
             filesystem.marker_invalid filesystem.permission_denied
             filesystem.write_failed filesystem.file_sync_failed
             filesystem.directory_sync_failed filesystem.lock_failed
+            workspace.ownership_changed workspace.symlink_encountered
+            workspace.permission_denied workspace.io_failed
             """.split()
         ),
         ErrorCode.ENVIRONMENT_ATOMIC_PUBLICATION_UNSUPPORTED: frozenset(
@@ -1210,6 +1212,7 @@ def _build_diagnostic_value_choices() -> Mapping[
                 "workspace.verify",
                 "workspace.lock",
                 "workspace.write_probe",
+                "workspace.access",
             }
         ),
         ErrorCode.ENVIRONMENT_ATOMIC_PUBLICATION_UNSUPPORTED: frozenset(
