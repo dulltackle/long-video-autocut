@@ -1080,18 +1080,18 @@ Superseded by: [ADR 标题](...)
 
 按以下标题和范围创建十二份 ADR，不再讨论替代方案：
 
-1. 认证 Linux 原生生产环境与可复现安装。
-2. 收敛 live-only 公共接口与受管 workspace。
-3. 采用全有或全无的直播拆条运行状态机。
-4. 采用单一组合根与业务能力深模块。
-5. 采用供应商无感知的语音识别模块与覆盖账本。
-6. 采用共享文本模型端口与分层主题评审。
-7. 将字幕优化与烧录设为强制生产路径。
-8. 采用版本化内容寻址处理缓存。
-9. 采用版本化标准交付物与验证后原子发布。
-10. 采用结构化运行诊断与稳定错误分类。
-11. 统一敏感数据、供应商披露与本地留存契约。
-12. 以分层验收证据批准生产版本。
+1. [认证 Linux 原生生产环境与可复现安装](adr/0014-certify-linux-native-production-environment-and-reproducible-installation.md)。
+2. [收敛 live-only 公共接口与受管 workspace](adr/0015-converge-live-only-public-interface-and-managed-workspace.md)。
+3. [采用全有或全无的直播拆条运行状态机](adr/0016-adopt-all-or-nothing-live-run-state-machine.md)。
+4. [采用单一组合根与业务能力深模块](adr/0017-adopt-single-composition-root-and-deep-business-capability-modules.md)。
+5. [采用供应商无感知的语音识别模块与覆盖账本](adr/0018-adopt-provider-agnostic-speech-recognition-and-coverage-ledger.md)。
+6. [采用共享文本模型端口与分层主题评审](adr/0019-adopt-shared-text-model-port-and-layered-topic-review.md)。
+7. [将字幕优化与烧录设为强制生产路径](adr/0020-make-subtitle-optimization-and-burning-mandatory.md)。
+8. [采用版本化内容寻址处理缓存](adr/0021-adopt-versioned-content-addressed-processing-cache.md)。
+9. [采用版本化标准交付物与验证后原子发布](adr/0022-adopt-versioned-standard-delivery-and-atomic-publication-after-verification.md)。
+10. [采用结构化运行诊断与稳定错误分类](adr/0023-adopt-structured-run-diagnostics-and-stable-error-classification.md)。
+11. [统一敏感数据、供应商披露与本地留存契约](adr/0024-unify-sensitive-data-provider-disclosure-and-local-retention-contract.md)。
+12. [以分层验收证据批准生产版本](adr/0025-approve-production-releases-with-layered-acceptance-evidence.md)。
 
 新 ADR 只解释权衡与理由，当前契约引用本文相应章节，不复制整份规格。
 

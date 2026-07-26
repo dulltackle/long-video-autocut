@@ -1,5 +1,9 @@
 # 分段字幕优化窗口以提升子序列通过率
 
+Status: Superseded
+Date: 2026-06-28
+Superseded by: [将字幕优化与烧录设为强制生产路径](0020-make-subtitle-optimization-and-burning-mandatory.md)
+
 字幕优化（见 [ADR 0011](0011-optimize-clip-subtitles-with-llm-under-subsequence-constraint.md)）真实端到端跑通后发现：5 条短视频里 4 条画面无烧录字幕。根因是 `step-3.7-flash` 在子序列约束下大量违规——用空格当显示块分隔符（增字）、改写造词、语序重排——导致 `validate_and_align` 校验失败、回退抑制烧录。本 ADR 修订 0011 的「作用范围」（Q2）与「提示词形态」（Q6），把「每条 clip 窗口跨 chunk 一次调用」改为「按字符预算分段、逐组调用」，并把提示词从「优化/整理」改为「抽取式删减（橡皮擦式：显式禁空格 + 禁同义替换/语序调整 + few-shot）」。
 
 ## 实验数据（已用真实素材验证）

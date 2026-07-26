@@ -1,5 +1,9 @@
 # 短视频默认烧录字幕并过滤纯语气词
 
+Status: Superseded
+Date: 2026-06-26
+Superseded by: [将字幕优化与烧录设为强制生产路径](0020-make-subtitle-optimization-and-burning-mandatory.md)
+
 发布就绪短视频要在静音浏览和不读外挂字幕的平台上仍可阅读，因此我们决定默认把字幕烧录进短视频画面像素（复用既有 libx264 重编码裁剪，加 `subtitles` 滤镜，不引入额外编码环节），样式为 Noto Sans CJK SC 白字黑描边、底部居中，并提供开关关闭。字幕在生成阶段（转写之后、缓存之外）按规则词表删除纯语气词，独立成块整块丢弃、句中夹带按 token 与标点边界删除，并把过长句级字幕重切为约 15 字、最多 2 行的字幕显示块。
 
 ## Considered Options
