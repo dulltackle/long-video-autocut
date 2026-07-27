@@ -577,7 +577,10 @@ class RunDiagnostics:
         fact._assert_authentic()
         with self._lock:
             self._assert_open()
-            if self._postcommit_proof is not None:
+            if (
+                self._postcommit_proof is not None
+                and fact._kind is not _FactKind.INTERRUPTION
+            ):
                 raise RuntimeError("发布提交后不能记录新的诊断事实")
             self._assert_scope_active(scope)
             if fact._kind is _FactKind.CONFIGURATION:
