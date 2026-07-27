@@ -3,6 +3,10 @@
 from dataclasses import dataclass
 from enum import Enum
 
+from video_auto_editor.cache import (
+    CacheNamespace as CacheNamespace,
+)
+from video_auto_editor.cache import CacheOutcome as CacheOutcome
 from video_auto_editor.delivery.capability import PublishedDelivery
 from video_auto_editor.runtime.errors import RunError
 
@@ -48,26 +52,6 @@ class RetryKind(str, Enum):
     TRANSPORT_RETRY = "transport_retry"
     SEMANTIC_RETRY = "semantic_retry"
     COVERAGE_RECOVERY = "coverage_recovery"
-
-
-class CacheNamespace(str, Enum):
-    """处理缓存的四个独立命名空间。"""
-
-    TRANSCRIPT = "transcript"
-    TRANSCRIPTION_SHARD = "transcription_shard"
-    TOPIC_REVIEW = "topic_review"
-    SUBTITLE_OPTIMIZATION = "subtitle_optimization"
-
-
-class CacheOutcome(str, Enum):
-    """单次处理缓存操作的封闭结果。"""
-
-    HIT = "hit"
-    MISS = "miss"
-    CORRUPT_QUARANTINED = "corrupt_quarantined"
-    WRITE_PUBLISHED = "write_published"
-    WRITE_ALREADY_PRESENT = "write_already_present"
-    INFRASTRUCTURE_FAILED = "infrastructure_failed"
 
 
 class ResultKind(str, Enum):

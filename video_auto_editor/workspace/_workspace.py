@@ -18,6 +18,7 @@ from pathlib import Path
 from threading import Condition, get_ident
 from typing import BinaryIO, Literal, TypeVar
 
+from video_auto_editor.runtime.cancellation import CancellationToken
 from video_auto_editor.runtime.errors import ErrorCode
 from video_auto_editor.runtime.identity import RunId
 
@@ -47,6 +48,10 @@ _MANAGED_FILE_FLAGS: dict[_FileMode, int] = {
     # 追加只允许既有受管文件，防止事件日志丢失后静默创建新时间线。
     "ab": os.O_WRONLY | os.O_APPEND,
 }
+_CACHE_LOCK_FLAGS = os.O_RDWR
+_ALLOWED_MANAGED_FILE_FLAGS = frozenset(
+    (*_MANAGED_FILE_FLAGS.values(), _CACHE_LOCK_FLAGS)
+)
 _Identity = tuple[int, int]
 _CAPABILITY_ISSUER = _claim_workspace_issuer()
 _LIBC = ctypes.CDLL(None, use_errno=True)
@@ -527,7 +532,7 @@ class Workspace:
             raise ValueError("受管文件位置必须包含相对文件名")
         _validate_effect_parts(base_parts, allow_empty=False)
         _validate_effect_parts(relative_parts, allow_empty=False)
-        if flags not in _MANAGED_FILE_FLAGS.values():
+        if flags not in _ALLOWED_MANAGED_FILE_FLAGS:
             raise ValueError("受管文件打开标志不合法")
         self._validate_lease_root(root_descriptor)
         parent_descriptor = -1
@@ -703,6 +708,76 @@ class Workspace:
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
+
+    def _use_managed_exclusive_lock(
+        self,
+        root_descriptor: int,
+        base_parts: tuple[str, ...],
+        base_identities: tuple[_Identity, ...],
+        relative_parts: tuple[str, ...],
+        cancellation: CancellationToken,
+        effect: Callable[[], object],
+    ) -> object:
+        if not isinstance(cancellation, CancellationToken):
+            raise TypeError("处理缓存独占锁必须绑定 CancellationToken")
+        if not callable(effect):
+            raise TypeError("处理缓存独占锁效果必须可调用")
+        descriptor = -1
+        locked = False
+        try:
+            descriptor = self._open_managed_file(
+                root_descriptor,
+                base_parts,
+                base_identities,
+                relative_parts,
+                _CACHE_LOCK_FLAGS,
+            )
+            expected_identity = _identity(os.fstat(descriptor))
+            while True:
+                cancellation.raise_if_cancelled()
+                try:
+                    fcntl.flock(
+                        descriptor,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    locked = True
+                    break
+                except InterruptedError:
+                    cancellation.raise_if_cancelled()
+                    continue
+                except BlockingIOError:
+                    cancellation.wait(0.01)
+            cancellation.raise_if_cancelled()
+            result = effect()
+            self._revalidate_managed_open_file(
+                root_descriptor,
+                base_parts,
+                base_identities,
+                relative_parts,
+                descriptor,
+                expected_identity,
+            )
+            return result
+        except WorkspaceFailure:
+            raise
+        except PermissionError as exc:
+            raise _workspace_access_failure(
+                "workspace.permission_denied"
+            ) from exc
+        except OSError as exc:
+            raise _workspace_access_failure("workspace.io_failed") from exc
+        finally:
+            if descriptor >= 0:
+                try:
+                    if locked:
+                        while True:
+                            try:
+                                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                                break
+                            except InterruptedError:
+                                continue
+                finally:
+                    os.close(descriptor)
 
     def _publish_managed_file_atomically(
         self,
@@ -925,6 +1000,176 @@ class Workspace:
                 finally:
                     if parent_descriptor >= 0:
                         os.close(parent_descriptor)
+
+    def _quarantine_managed_file(
+        self,
+        root_descriptor: int,
+        base_parts: tuple[str, ...],
+        base_identities: tuple[_Identity, ...],
+        source_parts: tuple[str, ...],
+        destination_parts: tuple[str, ...],
+    ) -> None:
+        if not source_parts or not destination_parts:
+            raise ValueError("缓存隔离源和目标都必须包含相对文件名")
+        if source_parts == destination_parts:
+            raise ValueError("缓存隔离源和目标不能相同")
+        _validate_effect_parts(base_parts, allow_empty=False)
+        _validate_effect_parts(source_parts, allow_empty=False)
+        _validate_effect_parts(destination_parts, allow_empty=False)
+        self._validate_lease_root(root_descriptor)
+        source_parent = -1
+        destination_parent = -1
+        try:
+            source_parent = _open_bound_directory(
+                root_descriptor,
+                base_parts,
+                base_identities,
+                expected_mount_id=self._layout.mount_id,
+            )
+            for part in source_parts[:-1]:
+                next_descriptor = _open_managed_directory_at(
+                    source_parent,
+                    part,
+                    expected_mount_id=self._layout.mount_id,
+                )
+                os.close(source_parent)
+                source_parent = next_descriptor
+
+            destination_parent = _open_bound_directory(
+                root_descriptor,
+                base_parts,
+                base_identities,
+                expected_mount_id=self._layout.mount_id,
+            )
+            for part in destination_parts[:-1]:
+                next_descriptor = _open_managed_directory_at(
+                    destination_parent,
+                    part,
+                    expected_mount_id=self._layout.mount_id,
+                )
+                os.close(destination_parent)
+                destination_parent = next_descriptor
+
+            source_name = source_parts[-1]
+            destination_name = destination_parts[-1]
+            source_status = os.stat(
+                source_name,
+                dir_fd=source_parent,
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(source_status.st_mode):
+                raise _workspace_access_failure(
+                    "workspace.symlink_encountered"
+                )
+            if (
+                not stat.S_ISREG(source_status.st_mode)
+                or source_status.st_nlink != 1
+            ):
+                raise _workspace_access_failure(
+                    "workspace.ownership_changed"
+                )
+            source_identity = _identity(source_status)
+            _assert_name_identity(
+                source_parent,
+                source_name,
+                source_identity,
+                access_failure=True,
+            )
+            try:
+                destination_status = os.stat(
+                    destination_name,
+                    dir_fd=destination_parent,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                destination_status = None
+            if destination_status is not None:
+                if stat.S_ISLNK(destination_status.st_mode):
+                    raise _workspace_access_failure(
+                        "workspace.symlink_encountered"
+                    )
+                raise FileExistsError(
+                    errno.EEXIST,
+                    "缓存隔离目标已经存在",
+                )
+
+            self._revalidate_managed_parent(
+                root_descriptor,
+                base_parts,
+                base_identities,
+                source_parts[:-1],
+                source_parent,
+            )
+            self._revalidate_managed_parent(
+                root_descriptor,
+                base_parts,
+                base_identities,
+                destination_parts[:-1],
+                destination_parent,
+            )
+            _rename_no_replace(
+                source_parent,
+                source_name,
+                destination_parent,
+                destination_name,
+            )
+            _assert_name_identity(
+                destination_parent,
+                destination_name,
+                source_identity,
+                access_failure=True,
+            )
+            try:
+                os.stat(
+                    source_name,
+                    dir_fd=source_parent,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise _workspace_access_failure(
+                    "workspace.ownership_changed"
+                )
+
+            os.fsync(source_parent)
+            if _identity(os.fstat(destination_parent)) != _identity(
+                os.fstat(source_parent)
+            ):
+                os.fsync(destination_parent)
+            self._revalidate_managed_parent(
+                root_descriptor,
+                base_parts,
+                base_identities,
+                source_parts[:-1],
+                source_parent,
+            )
+            self._revalidate_managed_parent(
+                root_descriptor,
+                base_parts,
+                base_identities,
+                destination_parts[:-1],
+                destination_parent,
+            )
+            _assert_name_identity(
+                destination_parent,
+                destination_name,
+                source_identity,
+                access_failure=True,
+            )
+        except (WorkspaceFailure, FileExistsError):
+            raise
+        except PermissionError as exc:
+            raise _workspace_access_failure(
+                "workspace.permission_denied"
+            ) from exc
+        except OSError as exc:
+            raise _workspace_access_failure("workspace.io_failed") from exc
+        finally:
+            if destination_parent >= 0:
+                os.close(destination_parent)
+            if source_parent >= 0:
+                os.close(source_parent)
 
     def _revalidate_managed_parent(
         self,
@@ -1307,7 +1552,7 @@ class _LeaseGuard:
                         relative_parts,
                     )
                 )
-            except WorkspaceFailure:
+            except (WorkspaceFailure, FileExistsError):
                 raise
             except PermissionError as exc:
                 raise _workspace_access_failure(
@@ -1318,11 +1563,47 @@ class _LeaseGuard:
                     "workspace.io_failed"
                 ) from exc
 
+        def use_exclusive_lock(
+            relative_parts: tuple[str, ...],
+            cancellation: CancellationToken,
+            effect: Callable[[], object],
+        ) -> object:
+            return self._execute(
+                lambda root_descriptor: (
+                    self._workspace._use_managed_exclusive_lock(
+                        root_descriptor,
+                        base_parts,
+                        base_identities,
+                        relative_parts,
+                        cancellation,
+                        effect,
+                    )
+                )
+            )
+
+        def quarantine_file(
+            source_parts: tuple[str, ...],
+            destination_parts: tuple[str, ...],
+        ) -> None:
+            self._execute(
+                lambda root_descriptor: (
+                    self._workspace._quarantine_managed_file(
+                        root_descriptor,
+                        base_parts,
+                        base_identities,
+                        source_parts,
+                        destination_parts,
+                    )
+                )
+            )
+
         return _CAPABILITY_ISSUER.operations(
             use_file=use_file,
             publish_file=publish_file,
             validate_directory=validate_directory,
             make_directory=make_directory,
+            use_exclusive_lock=use_exclusive_lock,
+            quarantine_file=quarantine_file,
             workspace_identity=workspace_identity,
             run_id=run_id,
             role=role,
@@ -2420,8 +2701,7 @@ def _remove_directory_contents(
         raise _workspace_cleanup_failure(
             "workspace.ownership_changed"
         ) from exc
-    with os.scandir(descriptor) as entries:
-        names = [entry.name for entry in entries]
+    names = _directory_names(descriptor)
     for name in names:
         if name.startswith((".workspace-quarantine-", _CREATE_PREFIX)):
             raise _workspace_cleanup_failure(
@@ -2682,18 +2962,30 @@ def _remove_atomic_publish_temporary(
 
 
 def _directory_is_empty(descriptor: int) -> bool:
-    with os.scandir(descriptor) as entries:
-        return next(entries, None) is None
+    return not _directory_names(descriptor)
 
 
 def _assert_exact_directory_names(
     descriptor: int,
     expected_names: set[str],
 ) -> None:
-    with os.scandir(descriptor) as entries:
-        actual_names = {entry.name for entry in entries}
+    actual_names = set(_directory_names(descriptor))
     if actual_names != expected_names:
         raise _invalid_workspace_marker()
+
+
+def _directory_names(descriptor: int) -> list[str]:
+    """用独立 open-file description 扫描，避免并发副本共享目录偏移。"""
+    scan_descriptor = os.open(
+        ".",
+        _DIRECTORY_FLAGS,
+        dir_fd=descriptor,
+    )
+    try:
+        with os.scandir(scan_descriptor) as entries:
+            return [entry.name for entry in entries]
+    finally:
+        os.close(scan_descriptor)
 
 
 def _validate_effect_parts(

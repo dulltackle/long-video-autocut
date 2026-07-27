@@ -2,6 +2,7 @@ import errno
 import json
 import multiprocessing
 import os
+import signal
 import stat
 import threading
 from pathlib import Path
@@ -9,6 +10,10 @@ from pathlib import Path
 import pytest
 
 from video_auto_editor.delivery import capability as delivery_capability
+from video_auto_editor.runtime.cancellation import (
+    CancellationRequested,
+    CancellationSource,
+)
 from video_auto_editor.runtime.errors import (
     ErrorCode,
     ErrorModule,
@@ -1569,6 +1574,140 @@ def test_atomic_publish_rejects_a_tampered_workspace_effect_binding(tmp_path):
 
         with pytest.raises(FileNotFoundError):
             location.read_bytes()
+
+
+def test_cache_lock_and_quarantine_effects_reject_non_cache_roles(tmp_path):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        diagnostic_source = run_workspace.diagnostics.location("source.bin")
+        diagnostic_source.write_bytes(b"diagnostic", exclusive=True)
+
+        with pytest.raises(TypeError, match="只允许处理缓存"):
+            diagnostic_source.with_exclusive_cache_lock(
+                CancellationSource().token,
+                lambda: None,
+            )
+        with pytest.raises(TypeError, match="只允许处理缓存"):
+            diagnostic_source.quarantine_to(
+                run_workspace.diagnostics.location("quarantined.bin")
+            )
+
+        assert diagnostic_source.read_bytes() == b"diagnostic"
+
+
+def test_cache_lock_rejects_a_tampered_workspace_effect_binding(tmp_path):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        location = run_workspace.cache.location("claim.lock")
+        location.publish_bytes_atomically(b"")
+        operations = location._operations
+        authentic_lock = operations._use_exclusive_lock
+        object.__setattr__(
+            operations,
+            "_use_exclusive_lock",
+            lambda _parts, _cancellation, effect: effect(),
+        )
+        try:
+            with pytest.raises(TypeError, match="由 Workspace 签发"):
+                location.with_exclusive_cache_lock(
+                    CancellationSource().token,
+                    lambda: None,
+                )
+        finally:
+            object.__setattr__(
+                operations,
+                "_use_exclusive_lock",
+                authentic_lock,
+            )
+
+
+def test_cache_lock_maps_interrupted_wait_with_requested_signal_to_cancellation(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    cancellation = CancellationSource()
+    original_flock = workspace_module.fcntl.flock
+    interrupted = False
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        location = run_workspace.cache.location("claim.lock")
+        location.publish_bytes_atomically(b"")
+
+        def interrupt_once(descriptor, operation):
+            nonlocal interrupted
+            if (
+                not interrupted
+                and operation
+                == (
+                    workspace_module.fcntl.LOCK_EX
+                    | workspace_module.fcntl.LOCK_NB
+                )
+            ):
+                interrupted = True
+                cancellation.request(signal.SIGTERM)
+                raise InterruptedError(errno.EINTR, "injected")
+            return original_flock(descriptor, operation)
+
+        monkeypatch.setattr(
+            workspace_module.fcntl,
+            "flock",
+            interrupt_once,
+        )
+
+        with pytest.raises(CancellationRequested):
+            location.with_exclusive_cache_lock(
+                cancellation.token,
+                lambda: pytest.fail("取消后不得执行持锁效果"),
+            )
+
+    assert interrupted
+
+
+def test_cache_lock_retries_an_interrupted_unlock(tmp_path, monkeypatch):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    original_flock = workspace_module.fcntl.flock
+    unlock_attempts = 0
+    cache_lock_descriptor = None
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        location = run_workspace.cache.location("claim.lock")
+        location.publish_bytes_atomically(b"")
+
+        def interrupt_first_unlock(descriptor, operation):
+            nonlocal cache_lock_descriptor, unlock_attempts
+            if operation == workspace_module.fcntl.LOCK_UN:
+                if cache_lock_descriptor is None:
+                    cache_lock_descriptor = descriptor
+                if descriptor == cache_lock_descriptor:
+                    unlock_attempts += 1
+                    if unlock_attempts == 1:
+                        raise InterruptedError(errno.EINTR, "injected")
+            return original_flock(descriptor, operation)
+
+        monkeypatch.setattr(
+            workspace_module.fcntl,
+            "flock",
+            interrupt_first_unlock,
+        )
+
+        result = location.with_exclusive_cache_lock(
+            CancellationSource().token,
+            lambda: "completed",
+        )
+
+    assert result == "completed"
+    assert unlock_attempts == 2
 
 
 def test_private_capability_effects_remain_bound_and_reject_raw_escape_parts(

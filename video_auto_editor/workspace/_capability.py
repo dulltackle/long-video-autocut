@@ -7,6 +7,7 @@ from enum import Enum
 from typing import BinaryIO, Literal, TypeVar, cast
 from weakref import WeakKeyDictionary
 
+from video_auto_editor.runtime.cancellation import CancellationToken
 from video_auto_editor.runtime.identity import RunId
 
 from ._failure import _without_sensitive_exception_context
@@ -30,6 +31,14 @@ _UseFile = Callable[[tuple[str, ...], _FileMode, _FileEffect], object]
 _PublishFile = Callable[[tuple[str, ...], bytes], int]
 _ValidateDirectory = Callable[[tuple[str, ...]], None]
 _MakeDirectory = Callable[[tuple[str, ...]], None]
+_UseExclusiveLock = Callable[
+    [tuple[str, ...], CancellationToken, Callable[[], object]],
+    object,
+]
+_QuarantineFile = Callable[
+    [tuple[str, ...], tuple[str, ...]],
+    None,
+]
 _CAPABILITY_SEAL = object()
 
 
@@ -88,6 +97,8 @@ class _ManagedAuthority:
     publish_file: _PublishFile
     validate_directory: _ValidateDirectory
     make_directory: _MakeDirectory
+    use_exclusive_lock: _UseExclusiveLock
+    quarantine_file: _QuarantineFile
     workspace_identity: object
     run_id: RunId | None
     role: ManagedDirectoryRole
@@ -99,6 +110,8 @@ class _ManagedOperations:
     _publish_file: _PublishFile = field(repr=False)
     _validate_directory: _ValidateDirectory = field(repr=False)
     _make_directory: _MakeDirectory = field(repr=False)
+    _use_exclusive_lock: _UseExclusiveLock = field(repr=False)
+    _quarantine_file: _QuarantineFile = field(repr=False)
     _seal: object = field(repr=False)
 
     def __new__(cls) -> "_ManagedOperations":
@@ -143,6 +156,38 @@ class _ManagedOperations:
             lambda: self._make_directory(relative_parts)
         )
 
+    def use_exclusive_lock(
+        self,
+        relative_parts: tuple[str, ...],
+        cancellation: CancellationToken,
+        effect: Callable[[], object],
+    ) -> object:
+        self._assert_authentic()
+        if self._authority().role is not ManagedDirectoryRole.CACHE:
+            raise TypeError("独占内容 claim 只允许处理缓存使用")
+        return _without_sensitive_exception_context(
+            lambda: self._use_exclusive_lock(
+                relative_parts,
+                cancellation,
+                effect,
+            )
+        )
+
+    def quarantine_file(
+        self,
+        source_parts: tuple[str, ...],
+        destination_parts: tuple[str, ...],
+    ) -> None:
+        self._assert_authentic()
+        if self._authority().role is not ManagedDirectoryRole.CACHE:
+            raise TypeError("原子隔离只允许处理缓存使用")
+        _without_sensitive_exception_context(
+            lambda: self._quarantine_file(
+                source_parts,
+                destination_parts,
+            )
+        )
+
     def _assert_authentic(self) -> None:
         authority = _OPERATION_AUTHORITIES.get(self)
         if authority is None or (
@@ -151,6 +196,8 @@ class _ManagedOperations:
             or self._publish_file is not authority.publish_file
             or self._validate_directory is not authority.validate_directory
             or self._make_directory is not authority.make_directory
+            or self._use_exclusive_lock is not authority.use_exclusive_lock
+            or self._quarantine_file is not authority.quarantine_file
         ):
             raise TypeError("受管效果只能由 Workspace 绑定")
 
@@ -243,6 +290,45 @@ class ManagedPathCapability:
         if not self._relative_parts:
             raise ValueError("不能重复创建 capability 根目录")
         self._operations.make_directory(self._relative_parts)
+
+    def with_exclusive_cache_lock(
+        self,
+        cancellation: CancellationToken,
+        effect: Callable[[], _ResultT],
+    ) -> _ResultT:
+        """持有同一受管锁文件的 Linux 独占锁执行可取消效果。"""
+        self._assert_authentic()
+        if not isinstance(cancellation, CancellationToken):
+            raise TypeError("处理缓存独占锁必须绑定 CancellationToken")
+        if not callable(effect):
+            raise TypeError("处理缓存独占锁效果必须可调用")
+        if not self._relative_parts:
+            raise ValueError("处理缓存锁位置必须包含相对文件名")
+        return cast(
+            _ResultT,
+            self._operations.use_exclusive_lock(
+                self._relative_parts,
+                cancellation,
+                effect,
+            ),
+        )
+
+    def quarantine_to(self, destination: "ManagedPathCapability") -> None:
+        """把受管缓存普通文件以 no-replace 语义原子移入隔离位置。"""
+        self._assert_authentic()
+        if not isinstance(destination, ManagedPathCapability):
+            raise TypeError("缓存隔离目标必须是受管位置")
+        destination._assert_authentic()
+        if self._operations is not destination._operations:
+            raise ValueError("缓存隔离源和目标必须属于同一受管缓存目录")
+        if not self._relative_parts or not destination._relative_parts:
+            raise ValueError("缓存隔离源和目标都必须包含相对文件名")
+        if self._relative_parts == destination._relative_parts:
+            raise ValueError("缓存隔离源和目标不能相同")
+        self._operations.quarantine_file(
+            self._relative_parts,
+            destination._relative_parts,
+        )
 
     def _assert_authentic(self) -> None:
         try:
@@ -343,6 +429,8 @@ class _WorkspaceCapabilityIssuer:
         publish_file: _PublishFile,
         validate_directory: _ValidateDirectory,
         make_directory: _MakeDirectory,
+        use_exclusive_lock: _UseExclusiveLock,
+        quarantine_file: _QuarantineFile,
         workspace_identity: object,
         run_id: RunId | None,
         role: ManagedDirectoryRole,
@@ -359,12 +447,24 @@ class _WorkspaceCapabilityIssuer:
             validate_directory,
         )
         object.__setattr__(operations, "_make_directory", make_directory)
+        object.__setattr__(
+            operations,
+            "_use_exclusive_lock",
+            use_exclusive_lock,
+        )
+        object.__setattr__(
+            operations,
+            "_quarantine_file",
+            quarantine_file,
+        )
         object.__setattr__(operations, "_seal", _CAPABILITY_SEAL)
         _OPERATION_AUTHORITIES[operations] = _ManagedAuthority(
             use_file=use_file,
             publish_file=publish_file,
             validate_directory=validate_directory,
             make_directory=make_directory,
+            use_exclusive_lock=use_exclusive_lock,
+            quarantine_file=quarantine_file,
             workspace_identity=workspace_identity,
             run_id=run_id,
             role=role,
