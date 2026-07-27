@@ -1091,6 +1091,371 @@ def test_run_and_maintenance_leases_are_mutually_exclusive_and_release_lock(
         retained_location.read_bytes()
 
 
+def test_cache_maintenance_never_reports_success_if_cache_changes_during_clear(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    cache = workspace.root / "work" / "cache"
+    (cache / "entry.json").write_bytes(b"cached")
+    original_sync = workspace_module._sync_cleanup_directory
+    inserted = False
+
+    def insert_after_empty_cache_sync(descriptor):
+        nonlocal inserted
+        original_sync(descriptor)
+        descriptor_path = Path(
+            os.readlink(f"/proc/self/fd/{descriptor}")
+        )
+        if (
+            not inserted
+            and descriptor_path == cache
+            and list(cache.iterdir()) == []
+        ):
+            (cache / "late.json").write_bytes(b"late")
+            inserted = True
+
+    monkeypatch.setattr(
+        workspace_module,
+        "_sync_cleanup_directory",
+        insert_after_empty_cache_sync,
+    )
+
+    with (
+        workspace.acquire_maintenance() as maintenance,
+        pytest.raises(WorkspaceFailure) as captured,
+    ):
+        maintenance.clear_cache()
+
+    assert inserted is True
+    assert captured.value.diagnostics == {
+        "operation": "workspace.cleanup",
+        "reason_code": "workspace.ownership_changed",
+    }
+    assert (cache / "late.json").read_bytes() == b"late"
+
+
+def test_cache_maintenance_excludes_cache_effects_until_clear_finishes(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    cache = workspace.root / "work" / "cache"
+    (cache / "entry.json").write_bytes(b"cached")
+    maintenance = workspace.acquire_maintenance()
+    original_is_empty = workspace_module._directory_is_empty
+    empty_checked = threading.Event()
+    release_empty_check = threading.Event()
+    writer_started = threading.Event()
+    writer_finished = threading.Event()
+    failures = []
+
+    def pause_after_final_empty_check(descriptor):
+        result = original_is_empty(descriptor)
+        descriptor_path = Path(
+            os.readlink(f"/proc/self/fd/{descriptor}")
+        )
+        if (
+            result
+            and descriptor_path == cache
+            and not empty_checked.is_set()
+        ):
+            empty_checked.set()
+            if not release_empty_check.wait(5):
+                raise AssertionError("缓存空目录检查没有获准继续")
+        return result
+
+    def clear_cache():
+        try:
+            maintenance.clear_cache()
+        except BaseException as exc:  # noqa: BLE001 - 跨线程回传
+            failures.append(exc)
+
+    def write_cache():
+        writer_started.set()
+        try:
+            maintenance.cache.location("late.json").write_bytes(b"late")
+        except BaseException as exc:  # noqa: BLE001 - 跨线程回传
+            failures.append(exc)
+        finally:
+            writer_finished.set()
+
+    monkeypatch.setattr(
+        workspace_module,
+        "_directory_is_empty",
+        pause_after_final_empty_check,
+    )
+    clear_thread = threading.Thread(target=clear_cache)
+    writer_thread = threading.Thread(target=write_cache)
+    try:
+        clear_thread.start()
+        assert empty_checked.wait(5)
+        writer_thread.start()
+        assert writer_started.wait(5)
+        writer_thread.join(0.5)
+        writer_was_excluded = writer_thread.is_alive()
+    finally:
+        release_empty_check.set()
+        clear_thread.join(5)
+        writer_thread.join(5)
+        maintenance.close()
+
+    assert writer_was_excluded is True
+    assert not clear_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert failures == []
+    assert writer_finished.is_set()
+    assert (cache / "late.json").read_bytes() == b"late"
+
+
+def test_cache_maintenance_allows_active_effects_to_finish_cross_thread_work(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    cache = workspace.root / "work" / "cache"
+    maintenance = workspace.acquire_maintenance()
+    outer_started = threading.Event()
+    nested_finished = threading.Event()
+    nested_completed_during_outer = []
+    failures = []
+
+    def outer_effect(stream):
+        outer_started.set()
+        nested_completed_during_outer.append(
+            nested_finished.wait(5)
+        )
+        stream.write(b"outer")
+
+    def use_outer_effect():
+        try:
+            maintenance.cache.location("outer.bin").use_binary(
+                "wb",
+                outer_effect,
+            )
+        except BaseException as exc:  # noqa: BLE001 - 跨线程回传
+            failures.append(exc)
+
+    def write_nested_effect():
+        try:
+            maintenance.cache.location("nested.bin").write_bytes(
+                b"nested"
+            )
+        except BaseException as exc:  # noqa: BLE001 - 跨线程回传
+            failures.append(exc)
+        finally:
+            nested_finished.set()
+
+    def clear_cache():
+        try:
+            maintenance.clear_cache()
+        except BaseException as exc:  # noqa: BLE001 - 跨线程回传
+            failures.append(exc)
+
+    outer_thread = threading.Thread(target=use_outer_effect)
+    clear_thread = threading.Thread(target=clear_cache)
+    nested_thread = threading.Thread(target=write_nested_effect)
+    try:
+        outer_thread.start()
+        assert outer_started.wait(5)
+        clear_thread.start()
+        guard = maintenance._lease_guard
+        with guard._condition:
+            assert guard._condition.wait_for(
+                lambda: guard._exclusive_waiters == 1,
+                timeout=1,
+            )
+        nested_thread.start()
+        outer_thread.join(6)
+        nested_thread.join(6)
+        clear_thread.join(6)
+    finally:
+        maintenance.close()
+
+    assert nested_completed_during_outer == [True]
+    assert not outer_thread.is_alive()
+    assert not nested_thread.is_alive()
+    assert not clear_thread.is_alive()
+    assert failures == []
+    assert list(cache.iterdir()) == []
+
+
+def test_exclusive_maintenance_rejects_reentrant_cache_effects(tmp_path):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    cache = workspace.root / "work" / "cache"
+
+    with workspace.acquire_maintenance() as maintenance:
+        with pytest.raises(RuntimeError, match="独占维护"):
+            maintenance._lease_guard.execute_exclusive(
+                lambda _descriptor: maintenance.cache.location(
+                    "nested.bin"
+                ).write_bytes(b"nested")
+            )
+
+        maintenance.cache.location("after.bin").write_bytes(b"after")
+
+    assert not (cache / "nested.bin").exists()
+    assert (cache / "after.bin").read_bytes() == b"after"
+
+
+def test_cache_maintenance_revalidates_marker_before_deleting_cache(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    cache_entry = workspace.root / "work" / "cache" / "keep.json"
+    cache_entry.write_bytes(b"keep")
+
+    with workspace.acquire_maintenance() as maintenance:
+        (
+            workspace.root / ".video-auto-editor-workspace.json"
+        ).write_text(
+            '{"schema_version":"workspace.v999"}\n',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(WorkspaceFailure) as captured:
+            maintenance.clear_cache()
+
+    assert captured.value.error_code is ErrorCode.WORKSPACE_CLEANUP_FAILED
+    assert captured.value.diagnostics == {
+        "operation": "workspace.cleanup",
+        "reason_code": "workspace.ownership_changed",
+    }
+    assert cache_entry.read_bytes() == b"keep"
+
+
+def test_cache_maintenance_rejects_a_replaced_cache_root_without_following_it(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    cache = workspace.root / "work" / "cache"
+    cache_entry = cache / "keep.json"
+    cache_entry.write_bytes(b"keep")
+    displaced = tmp_path / "displaced-cache"
+    external = tmp_path / "external"
+    external.mkdir()
+    external_sentinel = external / "sentinel.txt"
+    external_sentinel.write_text("outside", encoding="utf-8")
+
+    with workspace.acquire_maintenance() as maintenance:
+        cache.rename(displaced)
+        cache.symlink_to(external, target_is_directory=True)
+
+        with pytest.raises(WorkspaceFailure) as captured:
+            maintenance.clear_cache()
+
+    assert captured.value.error_code is ErrorCode.WORKSPACE_CLEANUP_FAILED
+    assert captured.value.diagnostics == {
+        "operation": "workspace.cleanup",
+        "reason_code": "workspace.ownership_changed",
+    }
+    assert (displaced / "keep.json").read_bytes() == b"keep"
+    assert external_sentinel.read_text(encoding="utf-8") == "outside"
+    assert cache.is_symlink()
+
+
+def test_cache_maintenance_classifies_replacement_after_initial_validation(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    cache = workspace.root / "work" / "cache"
+    (cache / "keep.json").write_bytes(b"keep")
+    displaced = tmp_path / "displaced-cache"
+    external = tmp_path / "external"
+    external.mkdir()
+    external_sentinel = external / "sentinel.txt"
+    external_sentinel.write_text("outside", encoding="utf-8")
+    original_validate = Workspace._validate_lease_root
+    armed = False
+    swapped = False
+
+    def swap_after_validation(candidate, root_descriptor):
+        nonlocal swapped
+        result = original_validate(candidate, root_descriptor)
+        if armed and candidate is workspace and not swapped:
+            cache.rename(displaced)
+            cache.symlink_to(external, target_is_directory=True)
+            swapped = True
+        return result
+
+    with workspace.acquire_maintenance() as maintenance:
+        monkeypatch.setattr(
+            Workspace,
+            "_validate_lease_root",
+            swap_after_validation,
+        )
+        armed = True
+
+        with pytest.raises(WorkspaceFailure) as captured:
+            maintenance.clear_cache()
+
+    assert swapped is True
+    assert captured.value.error_code is ErrorCode.WORKSPACE_CLEANUP_FAILED
+    assert captured.value.diagnostics == {
+        "operation": "workspace.cleanup",
+        "reason_code": "workspace.ownership_changed",
+    }
+    assert (displaced / "keep.json").read_bytes() == b"keep"
+    assert external_sentinel.read_text(encoding="utf-8") == "outside"
+
+
+def test_cache_maintenance_releases_lock_after_sync_failure_and_can_retry(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    cache = workspace.root / "work" / "cache"
+    (cache / "entry.json").write_bytes(b"cached")
+    original_fsync = os.fsync
+    injected = False
+
+    def fail_first_cache_sync(descriptor):
+        nonlocal injected
+        descriptor_path = Path(
+            os.readlink(f"/proc/self/fd/{descriptor}")
+        )
+        if not injected and descriptor_path == cache:
+            injected = True
+            raise OSError(errno.EIO, "injected")
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_first_cache_sync)
+
+    with (
+        workspace.acquire_maintenance() as maintenance,
+        pytest.raises(WorkspaceFailure) as captured,
+    ):
+        maintenance.clear_cache()
+
+    assert injected is True
+    assert captured.value.error_code is ErrorCode.WORKSPACE_CLEANUP_FAILED
+    assert captured.value.diagnostics == {
+        "operation": "workspace.cleanup",
+        "reason_code": "workspace.directory_sync_failed",
+    }
+
+    with workspace.acquire_maintenance() as maintenance:
+        maintenance.clear_cache()
+
+    assert list(cache.iterdir()) == []
+
+
 def test_existing_workspace_object_rejects_replaced_lock_file(tmp_path):
     source = tmp_path / "course.mp4"
     source.write_bytes(b"source")

@@ -339,6 +339,7 @@ class Workspace:
             return MaintenanceWorkspace(
                 lock_handle=lock_handle,
                 lease_guard=lease_guard,
+                clear_cache_callback=self._clear_cache,
                 cache=self._capability(
                     ManagedDirectoryRole.CACHE,
                     ("work", "cache"),
@@ -353,6 +354,94 @@ class Workspace:
             except BaseException as release_failure:
                 raise release_failure from exc
             raise
+
+    def _clear_cache(self, root_descriptor: int) -> None:
+        try:
+            self._validate_lease_root(root_descriptor)
+        except WorkspaceFailure as exc:
+            raise _workspace_cleanup_failure(
+                "workspace.ownership_changed"
+            ) from exc
+
+        cache_descriptor = -1
+        try:
+            cache_descriptor = self._open_layout_directory(
+                root_descriptor,
+                ("work", "cache"),
+            )
+            self._validate_cache_cleanup_target(
+                root_descriptor,
+                cache_descriptor,
+            )
+            _remove_directory_contents(
+                cache_descriptor,
+                expected_device=self._layout.root[0],
+                expected_mount_id=self._layout.mount_id,
+                allow_reserved_entries=True,
+            )
+            _sync_cleanup_directory(cache_descriptor)
+            self._validate_cache_cleanup_target(
+                root_descriptor,
+                cache_descriptor,
+            )
+            if not _directory_is_empty(cache_descriptor):
+                raise _workspace_cleanup_failure(
+                    "workspace.ownership_changed"
+                )
+        except WorkspaceFailure as exc:
+            if exc.error_code is ErrorCode.WORKSPACE_CLEANUP_FAILED:
+                raise
+            raise _workspace_cleanup_failure(
+                "workspace.ownership_changed"
+            ) from exc
+        except PermissionError as exc:
+            raise _workspace_cleanup_failure(
+                "workspace.permission_denied"
+            ) from exc
+        except OSError as exc:
+            raise _workspace_cleanup_failure(
+                "workspace.remove_failed"
+            ) from exc
+        finally:
+            if cache_descriptor >= 0:
+                os.close(cache_descriptor)
+
+        try:
+            self._validate_lease_root(root_descriptor)
+        except WorkspaceFailure as exc:
+            raise _workspace_cleanup_failure(
+                "workspace.ownership_changed"
+            ) from exc
+
+    def _validate_cache_cleanup_target(
+        self,
+        root_descriptor: int,
+        cache_descriptor: int,
+    ) -> None:
+        try:
+            self._validate_lease_root(root_descriptor)
+            status = os.fstat(cache_descriptor)
+            if (
+                not stat.S_ISDIR(status.st_mode)
+                or _identity(status)
+                != self._layout.directory(("work", "cache"))
+                or status.st_dev != self._layout.root[0]
+                or _descriptor_mount_id(cache_descriptor)
+                != self._layout.mount_id
+            ):
+                raise _workspace_cleanup_failure(
+                    "workspace.ownership_changed"
+                )
+        except WorkspaceFailure as exc:
+            if exc.error_code is ErrorCode.WORKSPACE_CLEANUP_FAILED:
+                raise
+            raise _workspace_cleanup_failure(
+                "workspace.ownership_changed"
+            ) from exc
+        except OSError as exc:
+            raise _workspace_cleanup_failure(
+                "workspace.ownership_changed"
+            ) from exc
 
     def _layout_chain(
         self,
@@ -1458,6 +1547,9 @@ class _LeaseGuard:
         "_active_effects",
         "_condition",
         "_effect_threads",
+        "_exclusive_active",
+        "_exclusive_thread",
+        "_exclusive_waiters",
         "_release_pending",
         "_root_descriptor",
         "_workspace",
@@ -1475,6 +1567,9 @@ class _LeaseGuard:
         self._active_effects = 0
         self._condition = Condition()
         self._effect_threads: dict[int, int] = {}
+        self._exclusive_active = False
+        self._exclusive_thread: int | None = None
+        self._exclusive_waiters = 0
         self._release_pending = True
 
     def bind(
@@ -1615,6 +1710,20 @@ class _LeaseGuard:
     ) -> _ResultT:
         return self._execute(effect)
 
+    def execute_exclusive(
+        self,
+        effect: Callable[[int], _ResultT],
+    ) -> _ResultT:
+        """独占当前 lease 的全部受管效果执行维护操作。"""
+        descriptor = self._begin_exclusive_effect()
+        try:
+            return effect(descriptor)
+        finally:
+            try:
+                os.close(descriptor)
+            finally:
+                self._finish_exclusive_effect()
+
     def _execute(
         self,
         effect: Callable[[int], _ResultT],
@@ -1630,15 +1739,60 @@ class _LeaseGuard:
 
     def _begin_effect(self) -> int:
         with self._condition:
+            thread_id = get_ident()
+            reentrant = bool(self._effect_threads.get(thread_id, 0))
+            if reentrant and self._exclusive_active:
+                raise RuntimeError(
+                    "不能在独占维护中启动受管文件效果"
+                )
+            while (
+                self._active
+                and not reentrant
+                and (
+                    self._exclusive_active
+                    or (
+                        self._exclusive_waiters
+                        and self._active_effects == 0
+                    )
+                )
+            ):
+                self._condition.wait()
             if not self._active:
                 raise RuntimeError("workspace lease 已关闭")
             descriptor = os.dup(self._root_descriptor)
             self._active_effects += 1
-            thread_id = get_ident()
             self._effect_threads[thread_id] = (
                 self._effect_threads.get(thread_id, 0) + 1
             )
             return descriptor
+
+    def _begin_exclusive_effect(self) -> int:
+        with self._condition:
+            thread_id = get_ident()
+            if not self._active:
+                raise RuntimeError("workspace lease 已关闭")
+            if self._effect_threads.get(thread_id, 0):
+                raise RuntimeError(
+                    "不能在受管文件效果内启动独占 workspace 维护"
+                )
+            self._exclusive_waiters += 1
+            self._condition.notify_all()
+            try:
+                while self._active and (
+                    self._exclusive_active or self._active_effects
+                ):
+                    self._condition.wait()
+                if not self._active:
+                    raise RuntimeError("workspace lease 已关闭")
+                descriptor = os.dup(self._root_descriptor)
+                self._exclusive_active = True
+                self._exclusive_thread = thread_id
+                self._active_effects += 1
+                self._effect_threads[thread_id] = 1
+                return descriptor
+            finally:
+                self._exclusive_waiters -= 1
+                self._condition.notify_all()
 
     def _finish_effect(self) -> None:
         with self._condition:
@@ -1652,6 +1806,22 @@ class _LeaseGuard:
             if self._active_effects == 0:
                 self._condition.notify_all()
 
+    def _finish_exclusive_effect(self) -> None:
+        with self._condition:
+            thread_id = get_ident()
+            if (
+                not self._exclusive_active
+                or self._exclusive_thread != thread_id
+                or self._effect_threads.get(thread_id) != 1
+            ):
+                # 内部状态损坏时保持独占闸门关闭，不能放行未知并发。
+                raise RuntimeError("独占 workspace 维护状态不一致")
+            self._active_effects -= 1
+            del self._effect_threads[thread_id]
+            self._exclusive_active = False
+            self._exclusive_thread = None
+            self._condition.notify_all()
+
     def assert_active(self) -> None:
         with self._condition:
             if not self._active:
@@ -1663,6 +1833,7 @@ class _LeaseGuard:
                 raise RuntimeError("不能在受管文件效果内关闭 workspace lease")
             if self._active:
                 self._active = False
+                self._condition.notify_all()
             while self._active_effects:
                 self._condition.wait()
             if not self._release_pending:
@@ -1810,21 +1981,31 @@ class RunWorkspace(_WorkspaceLease):
 class MaintenanceWorkspace(_WorkspaceLease):
     """只授予处理缓存维护能力且不创建运行事实的 lease。"""
 
-    __slots__ = ("_cache",)
+    __slots__ = ("_cache", "_clear_cache_callback")
 
     def __init__(
         self,
         *,
         lock_handle: _LockHandle,
         lease_guard: _LeaseGuard,
+        clear_cache_callback: Callable[[int], None],
         cache: ManagedDirectoryCapability,
     ) -> None:
         super().__init__(lock_handle, lease_guard)
+        self._clear_cache_callback = clear_cache_callback
         self._cache = cache
 
     @property
     def cache(self) -> ManagedDirectoryCapability:
         return self._cache
+
+    def clear_cache(self) -> None:
+        """安全且幂等地清空处理缓存区域。"""
+        _without_sensitive_exception_context(
+            lambda: self._lease_guard.execute_exclusive(
+                self._clear_cache_callback
+            )
+        )
 
     def __enter__(self) -> "MaintenanceWorkspace":
         super().__enter__()
@@ -2684,6 +2865,7 @@ def _remove_directory_contents(
     *,
     expected_device: int,
     expected_mount_id: int,
+    allow_reserved_entries: bool = False,
 ) -> None:
     try:
         descriptor_status = os.fstat(descriptor)
@@ -2703,7 +2885,12 @@ def _remove_directory_contents(
         ) from exc
     names = _directory_names(descriptor)
     for name in names:
-        if name.startswith((".workspace-quarantine-", _CREATE_PREFIX)):
+        if (
+            not allow_reserved_entries
+            and name.startswith(
+                (".workspace-quarantine-", _CREATE_PREFIX)
+            )
+        ):
             raise _workspace_cleanup_failure(
                 "workspace.ownership_changed"
             )
@@ -2743,6 +2930,7 @@ def _remove_directory_contents(
                     child_descriptor,
                     expected_device=expected_device,
                     expected_mount_id=expected_mount_id,
+                    allow_reserved_entries=allow_reserved_entries,
                 )
                 _sync_cleanup_directory(child_descriptor)
             finally:
