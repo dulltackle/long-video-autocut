@@ -53,7 +53,11 @@ _ALLOWED_MANAGED_FILE_FLAGS = frozenset(
     (*_MANAGED_FILE_FLAGS.values(), _CACHE_LOCK_FLAGS)
 )
 _Identity = tuple[int, int]
+_SourceIdentity = tuple[int, int, int, int, int]
 _CAPABILITY_ISSUER = _claim_workspace_issuer()
+_LIVE_WORKSPACE = object()
+_DIAGNOSTIC_WORKSPACE = object()
+_MAINTENANCE_WORKSPACE = object()
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _RENAME_NOREPLACE = 1
 
@@ -63,6 +67,7 @@ class SourceFileCapability:
     """启动时已经解析并验证的素材普通文件。"""
 
     path: Path
+    _identity: _SourceIdentity = field(repr=False, compare=False)
 
     def __new__(
         cls,
@@ -70,6 +75,23 @@ class SourceFileCapability:
         **_kwargs: object,
     ) -> "SourceFileCapability":
         raise TypeError("SourceFileCapability 只能由 Workspace 签发")
+
+    def _matches_file_snapshot(
+        self,
+        device: int,
+        inode: int,
+        byte_length: int,
+        modified_ns: int,
+        changed_ns: int,
+    ) -> bool:
+        """供素材深模块确认文件仍与 Workspace 签发快照一致。"""
+        return self._identity == (
+            device,
+            inode,
+            byte_length,
+            modified_ns,
+            changed_ns,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +131,7 @@ class Workspace:
     root: Path
     _identity: object = field(repr=False, compare=False)
     _layout: _LayoutSnapshot = field(repr=False, compare=False)
+    _purpose: object = field(repr=False, compare=False)
 
     @classmethod
     def open(
@@ -127,20 +150,26 @@ class Workspace:
         source: PathLike[str] | str,
         workspace_dir: PathLike[str] | str | None,
     ) -> "Workspace":
-        source_path = _resolve_source_file(Path(source))
+        source_path, source_identity = _resolve_source_file(Path(source))
         root = (
-            source_path.with_suffix(".autocut")
+            _default_workspace_root(source_path)
             if workspace_dir is None
             else _resolve_workspace_path(Path(workspace_dir))
         )
         layout = _open_or_initialize_workspace(root)
         source_capability = object.__new__(SourceFileCapability)
         object.__setattr__(source_capability, "path", source_path)
+        object.__setattr__(
+            source_capability,
+            "_identity",
+            source_identity,
+        )
         return cls(
             source=source_capability,
             root=root,
             _identity=object(),
             _layout=layout,
+            _purpose=_LIVE_WORKSPACE,
         )
 
     @classmethod
@@ -151,6 +180,39 @@ class Workspace:
         """只打开已有受管 workspace，不创建直播拆条运行或目录。"""
         return _without_sensitive_exception_context(
             lambda: cls._open_existing(workspace_dir)
+        )
+
+    @classmethod
+    def open_diagnostics(
+        cls,
+        source: PathLike[str] | str,
+        workspace_dir: PathLike[str] | str | None = None,
+    ) -> "Workspace":
+        """为素材启动失败建立不携带素材 capability 的审计 workspace。"""
+        return _without_sensitive_exception_context(
+            lambda: cls._open_diagnostics(source, workspace_dir)
+        )
+
+    @classmethod
+    def _open_diagnostics(
+        cls,
+        source: PathLike[str] | str,
+        workspace_dir: PathLike[str] | str | None,
+    ) -> "Workspace":
+        source_path = _resolve_diagnostic_source_path(Path(source))
+        if workspace_dir is None:
+            root = _default_workspace_root(source_path)
+        else:
+            root = _resolve_workspace_path(Path(workspace_dir))
+            if root.is_relative_to(source_path):
+                raise _workspace_not_directory()
+        layout = _open_or_initialize_workspace(root)
+        return cls(
+            source=None,
+            root=root,
+            _identity=object(),
+            _layout=layout,
+            _purpose=_DIAGNOSTIC_WORKSPACE,
         )
 
     @classmethod
@@ -165,12 +227,24 @@ class Workspace:
             root=root,
             _identity=object(),
             _layout=layout,
+            _purpose=_MAINTENANCE_WORKSPACE,
         )
 
     def acquire_run(self, run_id: RunId) -> "RunWorkspace":
         """为一次直播拆条运行签发受管 capability。"""
         return _without_sensitive_exception_context(
             lambda: self._acquire_run(run_id)
+        )
+
+    def acquire_diagnostic_run(
+        self,
+        run_id: RunId,
+    ) -> "DiagnosticRunWorkspace":
+        """只为启动输入失败签发诊断与清理所需的运行 capability。"""
+        if self._purpose is not _DIAGNOSTIC_WORKSPACE:
+            raise RuntimeError("只有启动输入失败诊断 workspace 能创建诊断运行")
+        return _without_sensitive_exception_context(
+            lambda: self._acquire_diagnostic_run(run_id)
         )
 
     def _acquire_run(self, run_id: RunId) -> "RunWorkspace":
@@ -302,6 +376,85 @@ class Workspace:
                 raise close_failure
             _discard_created_entries(journal)
             return run_workspace
+        except BaseException as exc:
+            rollback_failure = _rollback_created_entries(journal)
+            _release_lock(lock_handle)
+            if rollback_failure is not None:
+                raise rollback_failure from exc
+            if isinstance(exc, WorkspaceFailure):
+                raise
+            if isinstance(exc, PermissionError):
+                raise _workspace_filesystem_failure(
+                    operation="workspace.create",
+                    reason_code="filesystem.permission_denied",
+                ) from exc
+            if isinstance(exc, OSError):
+                raise _workspace_filesystem_failure(
+                    operation="workspace.create",
+                    reason_code="filesystem.create_failed",
+                ) from exc
+            raise
+        finally:
+            _close_descriptors(reversed(opened_descriptors))
+
+    def _acquire_diagnostic_run(
+        self,
+        run_id: RunId,
+    ) -> "DiagnosticRunWorkspace":
+        if not isinstance(run_id, RunId):
+            raise TypeError("启动失败诊断 workspace 必须绑定 RunId")
+
+        lock_handle = self._acquire_lock()
+        journal: list[_CreatedEntry] = []
+        opened_descriptors: list[int] = []
+        try:
+            self._cleanup_stale_temporary(lock_handle.root_descriptor)
+            runs_descriptor = self._open_layout_directory(
+                lock_handle.root_descriptor,
+                ("work", "runs"),
+            )
+            opened_descriptors.append(runs_descriptor)
+
+            run_name = str(run_id)
+            run_descriptor, run_identity = _create_directory_at(
+                runs_descriptor,
+                run_name,
+                journal,
+            )
+            opened_descriptors.append(run_descriptor)
+            self._validate_lease_root(lock_handle.root_descriptor)
+
+            lease_guard = _LeaseGuard(
+                workspace=self,
+                root_descriptor=lock_handle.root_descriptor,
+            )
+            run_parts = ("work", "runs", run_name)
+            run_chain = (
+                self._layout.directory(("work",)),
+                self._layout.directory(("work", "runs")),
+                run_identity,
+            )
+            diagnostic_workspace = DiagnosticRunWorkspace(
+                lock_handle=lock_handle,
+                lease_guard=lease_guard,
+                cleanup_callback=self._validate_lease_root,
+                run_id=run_id,
+                diagnostics=self._capability(
+                    ManagedDirectoryRole.RUN_DIAGNOSTICS,
+                    run_parts,
+                    run_chain,
+                    lease_guard,
+                    run_id,
+                ),
+            )
+            close_failure = _close_descriptors(
+                reversed(opened_descriptors)
+            )
+            opened_descriptors.clear()
+            if close_failure is not None:
+                raise close_failure
+            _discard_created_entries(journal)
+            return diagnostic_workspace
         except BaseException as exc:
             rollback_failure = _rollback_created_entries(journal)
             _release_lock(lock_handle)
@@ -1978,6 +2131,48 @@ class RunWorkspace(_WorkspaceLease):
         return self
 
 
+class DiagnosticRunWorkspace(_WorkspaceLease):
+    """只授予启动失败审计写入与受控清理能力的 lease。"""
+
+    __slots__ = (
+        "_cleanup_callback",
+        "_diagnostics",
+        "_run_id",
+    )
+
+    def __init__(
+        self,
+        *,
+        lock_handle: _LockHandle,
+        lease_guard: _LeaseGuard,
+        cleanup_callback: Callable[[int], None],
+        run_id: RunId,
+        diagnostics: ManagedDirectoryCapability,
+    ) -> None:
+        super().__init__(lock_handle, lease_guard)
+        self._cleanup_callback = cleanup_callback
+        self._run_id = run_id
+        self._diagnostics = diagnostics
+
+    @property
+    def run_id(self) -> RunId:
+        return self._run_id
+
+    @property
+    def diagnostics(self) -> ManagedDirectoryCapability:
+        return self._diagnostics
+
+    def cleanup(self) -> None:
+        """验证 workspace 归属；诊断运行不持有业务临时目录。"""
+        _without_sensitive_exception_context(
+            lambda: self._lease_guard.execute(self._cleanup_callback)
+        )
+
+    def __enter__(self) -> "DiagnosticRunWorkspace":
+        super().__enter__()
+        return self
+
+
 class MaintenanceWorkspace(_WorkspaceLease):
     """只授予处理缓存维护能力且不创建运行事实的 lease。"""
 
@@ -2012,7 +2207,36 @@ class MaintenanceWorkspace(_WorkspaceLease):
         return self
 
 
-def _resolve_source_file(candidate: Path) -> Path:
+def _default_workspace_root(source_path: Path) -> Path:
+    """从素材提示派生一个绝不与具名输入重合的默认根。"""
+    if source_path.suffix.casefold() == ".mp4":
+        return source_path.with_suffix(".autocut")
+    if not source_path.name:
+        raise WorkspaceFailure(
+            ErrorCode.INPUT_UNREADABLE,
+            {"reason_code": "input.read_failed"},
+        )
+    return source_path.with_name(f"{source_path.name}.autocut")
+
+
+def _resolve_diagnostic_source_path(candidate: Path) -> Path:
+    """在最终分量不可解析时仍保留已规范化的父目录用于审计。"""
+    try:
+        return candidate.resolve(strict=False)
+    except (OSError, RuntimeError):
+        try:
+            parent = candidate.parent.resolve(strict=True)
+        except (FileNotFoundError, OSError, RuntimeError) as exc:
+            raise WorkspaceFailure(
+                ErrorCode.INPUT_UNREADABLE,
+                {"reason_code": "input.read_failed"},
+            ) from exc
+        if not candidate.name:
+            return parent
+        return parent / candidate.name
+
+
+def _resolve_source_file(candidate: Path) -> tuple[Path, _SourceIdentity]:
     try:
         resolved = candidate.resolve(strict=True)
         parent_descriptor = _open_absolute_directory_no_follow(resolved.parent)
@@ -2053,7 +2277,7 @@ def _resolve_source_file(candidate: Path) -> Path:
             ErrorCode.INPUT_UNREADABLE,
             {"reason_code": "input.not_regular_file"},
         )
-    return resolved
+    return resolved, _source_identity(source_status)
 
 
 def _resolve_workspace_path(candidate: Path) -> Path:
@@ -3201,6 +3425,16 @@ def _validate_effect_parts(
 
 def _identity(status: os.stat_result) -> _Identity:
     return status.st_dev, status.st_ino
+
+
+def _source_identity(status: os.stat_result) -> _SourceIdentity:
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
 
 
 def _managed_component_failure(

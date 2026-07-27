@@ -22,6 +22,7 @@ from video_auto_editor.runtime.errors import (
 )
 from video_auto_editor.runtime.identity import RunId
 from video_auto_editor.workspace import (
+    DiagnosticRunWorkspace,
     ManagedDirectoryCapability,
     ManagedDirectoryRole,
     ManagedPathCapability,
@@ -61,6 +62,17 @@ def test_open_resolves_source_link_and_derives_default_workspace_from_target(
     assert workspace.root.is_absolute()
     assert ".." not in workspace.root.parts
     assert isinstance(workspace.root, Path)
+
+
+def test_default_workspace_never_reuses_a_non_mp4_source_path(tmp_path):
+    source = tmp_path / "course.autocut"
+    source.write_bytes(b"source")
+
+    workspace = Workspace.open(source)
+
+    assert workspace.root == tmp_path / "course.autocut.autocut"
+    assert source.read_bytes() == b"source"
+    assert source.is_file()
 
 
 def test_open_accepts_an_explicit_workspace_link_only_after_resolving_its_target(
@@ -1499,6 +1511,87 @@ def test_open_existing_supports_maintenance_without_source_or_creation(
         pass
     with pytest.raises(RuntimeError, match="素材"):
         reopened.acquire_run(RunId.new())
+    diagnostic_run_id = RunId.new()
+    with pytest.raises(RuntimeError, match="诊断"):
+        reopened.acquire_diagnostic_run(diagnostic_run_id)
+    assert not (
+        reopened.root / "work" / "runs" / str(diagnostic_run_id)
+    ).exists()
+    assert not (
+        reopened.root / "work" / "tmp" / str(diagnostic_run_id)
+    ).exists()
+
+
+def test_diagnostic_run_exposes_only_diagnostics_and_cleanup(tmp_path):
+    workspace = Workspace.open_diagnostics(
+        tmp_path / "missing.mp4",
+        tmp_path / "workspace",
+    )
+    run_id = RunId.new()
+
+    with workspace.acquire_diagnostic_run(run_id) as diagnostic_run:
+        assert isinstance(diagnostic_run, DiagnosticRunWorkspace)
+        assert diagnostic_run.run_id == run_id
+        assert diagnostic_run.diagnostics.role is (
+            ManagedDirectoryRole.RUN_DIAGNOSTICS
+        )
+        assert not hasattr(diagnostic_run, "cache")
+        assert not hasattr(diagnostic_run, "temporary")
+        assert not hasattr(diagnostic_run, "delivery_staging")
+        assert not hasattr(diagnostic_run, "published_delivery")
+        assert not hasattr(diagnostic_run, "previous_delivery")
+        diagnostic_run.cleanup()
+
+    assert not (
+        workspace.root / "work" / "tmp" / str(run_id)
+    ).exists()
+
+
+@pytest.mark.parametrize("source_exists", [False, True])
+def test_diagnostic_workspace_never_reuses_the_invalid_source_path(
+    tmp_path,
+    source_exists,
+):
+    source = tmp_path / "invalid.mp4"
+    if source_exists:
+        source.mkdir()
+
+    with pytest.raises(WorkspaceFailure) as captured:
+        Workspace.open_diagnostics(source, source)
+
+    assert (
+        captured.value.error_code
+        is ErrorCode.ENVIRONMENT_WORKSPACE_UNWRITABLE
+    )
+    assert captured.value.diagnostics == {
+        "component": "workspace",
+        "operation": "workspace.verify",
+        "reason_code": "filesystem.not_directory",
+    }
+    if source_exists:
+        assert source.is_dir()
+        assert list(source.iterdir()) == []
+    else:
+        assert not source.exists()
+
+
+def test_diagnostic_workspace_cannot_be_created_inside_an_invalid_directory(
+    tmp_path,
+):
+    source = tmp_path / "invalid.mp4"
+    source.mkdir()
+
+    with pytest.raises(WorkspaceFailure) as captured:
+        Workspace.open_diagnostics(source, source / "audit")
+
+    assert (
+        captured.value.error_code
+        is ErrorCode.ENVIRONMENT_WORKSPACE_UNWRITABLE
+    )
+    assert captured.value.diagnostics["reason_code"] == (
+        "filesystem.not_directory"
+    )
+    assert list(source.iterdir()) == []
 
 
 def test_run_lock_excludes_maintenance_in_another_process(tmp_path):

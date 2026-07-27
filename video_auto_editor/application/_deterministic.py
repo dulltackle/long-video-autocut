@@ -1,11 +1,12 @@
 """只供无密钥契约测试使用的确定性直播拆条组合根。"""
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from datetime import datetime, timezone
+import hashlib
 import json
 import os
 import signal
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from types import MappingProxyType
 
 from video_auto_editor.configuration import Configuration, LoadedConfiguration
@@ -40,7 +41,13 @@ from video_auto_editor.runtime.errors import (
     RunStage,
 )
 from video_auto_editor.runtime.identity import RunId
-from video_auto_editor.workspace import RunWorkspace, Workspace
+from video_auto_editor.source_analysis import SourceDescription
+from video_auto_editor.workspace import (
+    DiagnosticRunWorkspace,
+    RunWorkspace,
+    SourceFileCapability,
+    Workspace,
+)
 
 from .live import (
     LiveApplication,
@@ -56,8 +63,31 @@ class _DeterministicFact:
     kind: str
 
 
+_SourceAnalyzer = Callable[
+    [SourceFileCapability, CancellationToken],
+    SourceDescription,
+]
+
+
+def _deterministic_source_analyzer(
+    source: SourceFileCapability,
+    cancellation: CancellationToken,
+) -> SourceDescription:
+    """形成不启动媒体工具的确定性素材事实。"""
+    cancellation.raise_if_cancelled()
+    contents = source.path.read_bytes()
+    cancellation.raise_if_cancelled()
+    return SourceDescription._from_analysis(
+        source_file=source,
+        sha256=f"sha256:{hashlib.sha256(contents).hexdigest()}",
+        byte_length=len(contents),
+        duration_ms=1_000,
+    )
+
+
 class _DeterministicRunAssembly:
     __slots__ = (
+        "_course_context_sha256",
         "_emit_non_stage_events",
         "_failure_stage",
         "_invalid_result_stage",
@@ -66,6 +96,7 @@ class _DeterministicRunAssembly:
         "_postcommit_effect_failure",
         "_result_kind",
         "_run_workspace",
+        "_source_analyzer",
         "_subtitle_failure",
         "_unexpected_stage",
     )
@@ -73,6 +104,8 @@ class _DeterministicRunAssembly:
     def __init__(
         self,
         run_workspace: RunWorkspace,
+        source_analyzer: _SourceAnalyzer,
+        configuration: LoadedConfiguration,
         result_kind: ResultKind,
         emit_non_stage_events: bool,
         subtitle_failure: bool,
@@ -84,6 +117,12 @@ class _DeterministicRunAssembly:
         postcommit_effect_failure: bool,
     ) -> None:
         self._run_workspace = run_workspace
+        self._source_analyzer = source_analyzer
+        self._course_context_sha256 = (
+            None
+            if configuration.course_context is None
+            else configuration.course_context.sha256
+        )
         self._result_kind = result_kind
         self._emit_non_stage_events = emit_non_stage_events
         self._subtitle_failure = subtitle_failure
@@ -127,15 +166,27 @@ class _DeterministicRunAssembly:
 
     def analyze_source(
         self,
+        source: SourceFileCapability,
         stage: StageDiagnostics,
         cancellation: CancellationToken,
     ) -> _StageWork:
-        stage.scope(ErrorModule.SOURCE_ANALYSIS)
+        scope = stage.scope(ErrorModule.SOURCE_ANALYSIS)
         cancellation.raise_if_cancelled()
         self._before_work(RunStage.SOURCE_ANALYSIS)
+        description = self._source_analyzer(source, cancellation)
+        context_digest = self._course_context_sha256
+        scope.record(
+            Facts.source(
+                sha256=description.sha256,
+                byte_length=description.byte_length,
+                duration_ms=description.duration_ms,
+                course_context_provided=context_digest is not None,
+                course_context_sha256=context_digest,
+            )
+        )
         return self._work(
             RunStage.SOURCE_ANALYSIS,
-            _DeterministicFact("source"),
+            description,
             1,
         )
 
@@ -145,7 +196,7 @@ class _DeterministicRunAssembly:
         stage: StageDiagnostics,
         cancellation: CancellationToken,
     ) -> _StageWork:
-        if not isinstance(source, _DeterministicFact):
+        if not isinstance(source, SourceDescription):
             raise TypeError("确定性语音识别需要素材事实")
         scope = stage.scope(ErrorModule.TRANSCRIPTION)
         cancellation.raise_if_cancelled()
@@ -416,12 +467,14 @@ class _DeterministicAssemblyFactory:
         "_postcommit_cancellation",
         "_postcommit_effect_failure",
         "_result_kind",
+        "_source_analyzer",
         "_subtitle_failure",
         "_unexpected_stage",
     )
 
     def __init__(
         self,
+        source_analyzer: _SourceAnalyzer,
         result_kind: ResultKind,
         emit_non_stage_events: bool,
         subtitle_failure: bool,
@@ -432,6 +485,7 @@ class _DeterministicAssemblyFactory:
         postcommit_cancellation: bool,
         postcommit_effect_failure: bool,
     ) -> None:
+        self._source_analyzer = source_analyzer
         self._result_kind = result_kind
         self._emit_non_stage_events = emit_non_stage_events
         self._subtitle_failure = subtitle_failure
@@ -449,9 +503,11 @@ class _DeterministicAssemblyFactory:
         configuration: LoadedConfiguration,
         run_workspace: RunWorkspace,
     ) -> _RunAssembly:
-        del request, configuration
+        del request
         return _DeterministicRunAssembly(
             run_workspace,
+            self._source_analyzer,
+            configuration,
             self._result_kind,
             self._emit_non_stage_events,
             self._subtitle_failure,
@@ -578,7 +634,10 @@ class _DeterministicCleanup:
         self._fail = fail
         self._fail_before_delete = fail_before_delete
 
-    def __call__(self, run_workspace: RunWorkspace) -> None:
+    def __call__(
+        self,
+        run_workspace: RunWorkspace | DiagnosticRunWorkspace,
+    ) -> None:
         if self._fail_before_delete:
             raise _DeterministicFailure(
                 ErrorCode.WORKSPACE_CLEANUP_FAILED,
@@ -674,7 +733,7 @@ class _DeterministicDiagnosticsInitializer:
 
     def __call__(
         self,
-        run_workspace: RunWorkspace,
+        run_workspace: RunWorkspace | DiagnosticRunWorkspace,
         application_version: str,
         wall_clock,
         monotonic_clock,
@@ -699,6 +758,7 @@ class _DeterministicDiagnosticsInitializer:
 
 def compose_deterministic_live_application(
     *,
+    source_analyzer: _SourceAnalyzer | None = None,
     result_kind: ResultKind = ResultKind.CLIPS,
     failure_stage: RunStage | None = None,
     interruption_stage: RunStage | None = None,
@@ -720,6 +780,8 @@ def compose_deterministic_live_application(
     interrupt_during_run_id_factory: bool = False,
 ) -> LiveApplication:
     """装配只使用本地确定性模块的应用实例。"""
+    if source_analyzer is not None and not callable(source_analyzer):
+        raise TypeError("确定性素材分析器必须可调用")
     if not isinstance(result_kind, ResultKind):
         raise TypeError("确定性结果必须使用 ResultKind")
     if failure_stage is not None and failure_stage not in _FAILURES:
@@ -804,6 +866,11 @@ def compose_deterministic_live_application(
         raise ValueError("确定性故障与中断不能同时注入")
     return LiveApplication._compose(
         assembly_factory=_DeterministicAssemblyFactory(
+            (
+                _deterministic_source_analyzer
+                if source_analyzer is None
+                else source_analyzer
+            ),
             result_kind,
             emit_non_stage_events,
             subtitle_failure,
@@ -819,6 +886,7 @@ def compose_deterministic_live_application(
             if interrupt_during_workspace_open
             else Workspace.open
         ),
+        open_diagnostic_workspace=Workspace.open_diagnostics,
         load_configuration=Configuration.load,
         initialize_diagnostics=_DeterministicDiagnosticsInitializer(
             diagnostics_failure

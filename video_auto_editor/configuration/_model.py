@@ -78,6 +78,7 @@ class CourseContext:
     """供业务模块消费、但不在 repr 中泄露正文的课程上下文。"""
 
     schema_version: str
+    sha256: str = field(repr=False)
     course_topic: str = field(repr=False)
     attribution: str | None = field(default=None, repr=False)
     priority_topics: tuple[str, ...] = field(default=(), repr=False)
@@ -123,11 +124,11 @@ class ConfigurationDiagnosticProjection:
     """只能由 Configuration 签发的配置诊断安全投影。"""
 
     __slots__ = (
+        "__weakref__",
         "configuration_fingerprint",
+        "course_context",
         "result_configuration",
         "runtime_policy",
-        "course_context",
-        "__weakref__",
     )
 
     configuration_fingerprint: str

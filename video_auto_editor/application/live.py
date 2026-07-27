@@ -1,12 +1,12 @@
 """固定推进直播拆条运行生命周期的顶层应用。"""
 
+import signal
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from os import PathLike
 from pathlib import Path
-import signal
 from time import monotonic
 from types import MappingProxyType
 from typing import NoReturn, Protocol, runtime_checkable
@@ -46,10 +46,14 @@ from video_auto_editor.runtime.errors import (
     get_error_definition,
 )
 from video_auto_editor.runtime.identity import RunId
+from video_auto_editor.source_analysis import SourceDescription
 from video_auto_editor.workspace import (
+    DiagnosticRunWorkspace,
     ManagedDirectoryCapability,
     RunWorkspace,
+    SourceFileCapability,
     Workspace,
+    WorkspaceFailure,
 )
 
 
@@ -379,6 +383,7 @@ class _RunAssembly(Protocol):
 
     def analyze_source(
         self,
+        source: SourceFileCapability,
         stage: StageDiagnostics,
         cancellation: CancellationToken,
     ) -> _StageWork: ...
@@ -531,11 +536,17 @@ class _ApplicationFailure(RuntimeError):
 
 _OpenWorkspace = Callable[[Path, Path | None], Workspace]
 _LoadConfiguration = Callable[[Path], LoadedConfiguration]
+_AuditableRunWorkspace = RunWorkspace | DiagnosticRunWorkspace
 _InitializeDiagnostics = Callable[
-    [RunWorkspace, str, Callable[[], datetime], Callable[[], float]],
+    [
+        _AuditableRunWorkspace,
+        str,
+        Callable[[], datetime],
+        Callable[[], float],
+    ],
     RunDiagnostics,
 ]
-_CleanupRun = Callable[[RunWorkspace], None]
+_CleanupRun = Callable[[_AuditableRunWorkspace], None]
 
 
 def _validate_work_item_count(value: object) -> None:
@@ -556,6 +567,7 @@ class LiveApplication:
         "_initialize_diagnostics",
         "_load_configuration",
         "_monotonic_clock",
+        "_open_diagnostic_workspace",
         "_open_workspace",
         "_run_id_factory",
         "_wall_clock",
@@ -570,6 +582,7 @@ class LiveApplication:
         *,
         assembly_factory: _RunAssemblyFactory,
         open_workspace: _OpenWorkspace,
+        open_diagnostic_workspace: _OpenWorkspace,
         load_configuration: _LoadConfiguration,
         initialize_diagnostics: _InitializeDiagnostics,
         application_version: str,
@@ -582,6 +595,7 @@ class LiveApplication:
         instance = object.__new__(cls)
         instance._assembly_factory = assembly_factory
         instance._open_workspace = open_workspace
+        instance._open_diagnostic_workspace = open_diagnostic_workspace
         instance._load_configuration = load_configuration
         instance._initialize_diagnostics = initialize_diagnostics
         instance._application_version = application_version
@@ -604,7 +618,7 @@ class LiveApplication:
             raise TypeError("直播拆条应用只接受 LiveRunRequest")
         cancellation = CancellationSource(clock=self._monotonic_clock)
         run_id: RunId | None = None
-        run_workspace: RunWorkspace | None = None
+        run_workspace: _AuditableRunWorkspace | None = None
         commit_state: _CommitState | None = None
         projected_outcome: LiveRunOutcome | None = None
         teardown_incomplete = False
@@ -624,23 +638,44 @@ class LiveApplication:
             if not isinstance(candidate_run_id, RunId):
                 raise TypeError("运行标识工厂必须返回 RunId")
             run_id = candidate_run_id
-            workspace = self._open_workspace(
-                request.source,
-                request.workspace_dir,
-            )
-            run_workspace = workspace.acquire_run(run_id)
-            commit_state = _CommitState(
-                run_id,
-                run_workspace.published_delivery,
-            )
-            projected_outcome = self._execute_acquired_run(
-                request=request,
-                run_id=run_id,
-                workspace=workspace,
-                run_workspace=run_workspace,
-                cancellation=cancellation,
-                commit_state=commit_state,
-            )
+            try:
+                workspace = self._open_workspace(
+                    request.source,
+                    request.workspace_dir,
+                )
+            except WorkspaceFailure as source_failure:
+                if source_failure.error_code not in {
+                    ErrorCode.INPUT_MISSING,
+                    ErrorCode.INPUT_UNREADABLE,
+                }:
+                    raise
+                workspace = self._open_diagnostic_workspace(
+                    request.source,
+                    request.workspace_dir,
+                )
+                run_workspace = workspace.acquire_diagnostic_run(run_id)
+                projected_outcome = (
+                    self._execute_workspace_input_failure(
+                        run_id=run_id,
+                        run_workspace=run_workspace,
+                        failure=source_failure,
+                        cancellation=cancellation.token,
+                    )
+                )
+            else:
+                run_workspace = workspace.acquire_run(run_id)
+                commit_state = _CommitState(
+                    run_id,
+                    run_workspace.published_delivery,
+                )
+                projected_outcome = self._execute_acquired_run(
+                    request=request,
+                    run_id=run_id,
+                    workspace=workspace,
+                    run_workspace=run_workspace,
+                    cancellation=cancellation,
+                    commit_state=commit_state,
+                )
         except Exception as failure:
             outcome_run_id = run_id if run_id is not None else RunId.new()
             if run_workspace is None or commit_state is None:
@@ -652,14 +687,19 @@ class LiveApplication:
                 )
                 if not isinstance(error_code, ErrorCode):
                     error_code = ErrorCode.INTERNAL_UNEXPECTED
+                recovery_incomplete = (
+                    error_code is ErrorCode.WORKSPACE_CLEANUP_FAILED
+                )
+                if run_workspace is not None:
+                    try:
+                        self._cleanup_run(run_workspace)
+                    except Exception:
+                        recovery_incomplete = True
                 projected_outcome = (
                     LiveRunOutcome._failed_without_diagnostics(
                         outcome_run_id,
                         error_code,
-                        recovery_incomplete=(
-                            error_code
-                            is ErrorCode.WORKSPACE_CLEANUP_FAILED
-                        ),
+                        recovery_incomplete=recovery_incomplete,
                     )
                 )
             else:
@@ -715,6 +755,75 @@ class LiveApplication:
             )
         return projected_outcome
 
+    def _execute_workspace_input_failure(
+        self,
+        *,
+        run_id: RunId,
+        run_workspace: DiagnosticRunWorkspace,
+        failure: WorkspaceFailure,
+        cancellation: CancellationToken,
+    ) -> LiveRunOutcome:
+        diagnostics = self._initialize_diagnostics(
+            run_workspace,
+            self._application_version,
+            self._wall_clock,
+            self._monotonic_clock,
+        )
+        stage = diagnostics.start_stage(RunStage.INITIALIZED)
+        cleanup_started = self._monotonic_clock()
+        cleanup_failure = self._attempt_cleanup(run_workspace)
+        cleanup_completed = self._monotonic_clock()
+        cleanup_duration_ms = max(
+            0,
+            int((cleanup_completed - cleanup_started) * 1000),
+        )
+        signal_number = cancellation.signal_number
+        if signal_number in {signal.SIGINT, signal.SIGTERM}:
+            interruption_signal = self._record_interruption(
+                stage,
+                RunStage.INITIALIZED,
+                signal_number,
+            )
+            associated_errors, recovery_incomplete = (
+                self._record_cleanup_failure(stage, cleanup_failure)
+            )
+            stage.complete(
+                StageOutcome.INTERRUPTED,
+                work_item_count=0,
+            )
+            run_outcome = RunOutcome.interrupted(
+                interruption_signal,
+                cleanup_duration_ms=cleanup_duration_ms,
+                associated_errors=associated_errors,
+                recovery_incomplete=recovery_incomplete,
+            )
+        else:
+            primary_error = stage.scope(
+                ErrorModule.WORKSPACE
+            ).record_failure(failure)
+            associated_errors, recovery_incomplete = (
+                self._record_cleanup_failure(stage, cleanup_failure)
+            )
+            stage.complete(StageOutcome.FAILED, work_item_count=0)
+            run_outcome = RunOutcome.failed(
+                primary_error,
+                associated_errors=associated_errors,
+                recovery_incomplete=recovery_incomplete,
+            )
+        try:
+            finalization = diagnostics.finish(run_outcome)
+        except Exception:
+            return LiveRunOutcome._from_run_outcome(
+                run_id,
+                run_outcome,
+                diagnostics_incomplete=True,
+            )
+        return LiveRunOutcome._from_run_outcome(
+            run_id,
+            run_outcome,
+            diagnostics_incomplete=finalization.diagnostics_incomplete,
+        )
+
     def _execute_acquired_run(
         self,
         *,
@@ -746,7 +855,7 @@ class LiveApplication:
                 RunStage.PREFLIGHT,
                 lambda stage, token: self._prepare_run(
                     request=request,
-                    source=source_capability.path,
+                    source=source_capability,
                     run_workspace=run_workspace,
                     stage=stage,
                     cancellation=token,
@@ -759,7 +868,12 @@ class LiveApplication:
                 cancellation,
                 run_workspace,
                 RunStage.SOURCE_ANALYSIS,
-                assembly.analyze_source,
+                lambda stage, token: assembly.analyze_source(
+                    source_capability,
+                    stage,
+                    token,
+                ),
+                expected_value=SourceDescription,
             )
             transcript = self._run_stage(
                 cursor,
@@ -1076,6 +1190,57 @@ class LiveApplication:
         stage: RunStage,
         signal_number: int | None,
     ) -> NoReturn:
+        run_outcome = self._complete_interrupted_stage(
+            stage_diagnostics,
+            run_workspace,
+            stage,
+            signal_number,
+        )
+        cursor.terminate()
+        raise _StageTerminated(run_outcome) from None
+
+    def _complete_interrupted_stage(
+        self,
+        stage_diagnostics: StageDiagnostics,
+        run_workspace: RunWorkspace,
+        stage: RunStage,
+        signal_number: int | None,
+    ) -> RunOutcome:
+        interruption_signal = self._record_interruption(
+            stage_diagnostics,
+            stage,
+            signal_number,
+        )
+        cleanup_started = self._monotonic_clock()
+        cleanup_failure = self._attempt_cleanup(run_workspace)
+        associated_errors, recovery_incomplete = (
+            self._record_cleanup_failure(
+                stage_diagnostics,
+                cleanup_failure,
+            )
+        )
+        cleanup_completed = self._monotonic_clock()
+        cleanup_duration_ms = max(
+            0,
+            int((cleanup_completed - cleanup_started) * 1000),
+        )
+        stage_diagnostics.complete(
+            StageOutcome.INTERRUPTED,
+            work_item_count=0,
+        )
+        return RunOutcome.interrupted(
+            interruption_signal,
+            cleanup_duration_ms=cleanup_duration_ms,
+            associated_errors=associated_errors,
+            recovery_incomplete=recovery_incomplete,
+        )
+
+    def _record_interruption(
+        self,
+        stage_diagnostics: StageDiagnostics,
+        stage: RunStage,
+        signal_number: int | None,
+    ) -> InterruptionSignal:
         if signal_number not in {signal.SIGINT, signal.SIGTERM}:
             raise _ApplicationFailure(
                 ErrorCode.INTERNAL_UNEXPECTED,
@@ -1095,31 +1260,7 @@ class LiveApplication:
         stage_diagnostics.scope(ErrorModule.APPLICATION).record(
             Facts.interruption(interruption_signal)
         )
-        cleanup_started = self._monotonic_clock()
-        associated_errors, recovery_incomplete = (
-            self._cleanup_before_terminal(
-                stage_diagnostics,
-                run_workspace,
-            )
-        )
-        cleanup_completed = self._monotonic_clock()
-        cleanup_duration_ms = max(
-            0,
-            int((cleanup_completed - cleanup_started) * 1000),
-        )
-        stage_diagnostics.complete(
-            StageOutcome.INTERRUPTED,
-            work_item_count=0,
-        )
-        cursor.terminate()
-        raise _StageTerminated(
-            RunOutcome.interrupted(
-                interruption_signal,
-                cleanup_duration_ms=cleanup_duration_ms,
-                associated_errors=associated_errors,
-                recovery_incomplete=recovery_incomplete,
-            )
-        ) from None
+        return interruption_signal
 
     @staticmethod
     def _record_delivery_started(
@@ -1219,12 +1360,12 @@ class LiveApplication:
         self,
         *,
         request: LiveRunRequest,
-        source: Path,
+        source: SourceFileCapability,
         run_workspace: RunWorkspace,
         stage: StageDiagnostics,
         cancellation: CancellationToken,
     ) -> _StageWork:
-        configuration = self._load_configuration(source)
+        configuration = self._load_configuration(source.path)
         stage.scope(ErrorModule.CONFIGURATION).record(
             Facts.configuration(
                 configuration.diagnostic_projection
@@ -1245,21 +1386,38 @@ class LiveApplication:
     def _cleanup_before_terminal(
         self,
         stage: StageDiagnostics,
-        run_workspace: RunWorkspace,
+        run_workspace: _AuditableRunWorkspace,
     ) -> tuple[tuple[RunError, ...], bool]:
+        return self._record_cleanup_failure(
+            stage,
+            self._attempt_cleanup(run_workspace),
+        )
+
+    def _attempt_cleanup(
+        self,
+        run_workspace: _AuditableRunWorkspace,
+    ) -> Exception | None:
         try:
             self._cleanup_run(run_workspace)
         except Exception as failure:
-            recordable_failure = _recordable_failure(failure)
-            module = _failure_module(
-                recordable_failure,
-                stage.stage,
-            )
-            cleanup_error = stage.scope(module).record_failure(
-                recordable_failure
-            )
-            return (cleanup_error,), True
-        return (), False
+            return _recordable_failure(failure)
+        return None
+
+    @staticmethod
+    def _record_cleanup_failure(
+        stage: StageDiagnostics,
+        cleanup_failure: Exception | None,
+    ) -> tuple[tuple[RunError, ...], bool]:
+        if cleanup_failure is None:
+            return (), False
+        module = _failure_module(
+            cleanup_failure,
+            stage.stage,
+        )
+        cleanup_error = stage.scope(module).record_failure(
+            cleanup_failure
+        )
+        return (cleanup_error,), True
 
 
 _STAGE_MODULES = {

@@ -1,5 +1,5 @@
-import json
 import inspect
+import json
 import os
 import signal
 from dataclasses import FrozenInstanceError
@@ -19,14 +19,13 @@ from video_auto_editor.application._deterministic import (
 )
 from video_auto_editor.application.live import _CommitState
 from video_auto_editor.diagnostics import InterruptionSignal, ResultKind
-from video_auto_editor.runtime.errors import ExitCode, RunStage
-from video_auto_editor.runtime.errors import ErrorCode
+from video_auto_editor.runtime.errors import ErrorCode, ExitCode, RunStage
 from video_auto_editor.workspace import (
     ManagedPathCapability,
     RunWorkspace,
     Workspace,
+    WorkspaceFailure,
 )
-
 
 EXPECTED_STAGES = [
     "preflight",
@@ -545,6 +544,142 @@ def test_signal_during_workspace_open_enters_the_typed_lifecycle(
     assert outcome.interruption_signal is interruption_signal
     assert not any((workspace / "delivery").iterdir())
     assert not (workspace / "work" / "tmp" / str(outcome.run_id)).exists()
+
+
+@pytest.mark.parametrize(
+    ("interruption_signal", "exit_code_value"),
+    [
+        (InterruptionSignal.SIGINT, 130),
+        (InterruptionSignal.SIGTERM, 143),
+    ],
+)
+def test_signal_during_missing_source_open_remains_an_auditable_interruption(
+    tmp_path,
+    interruption_signal,
+    exit_code_value,
+):
+    source = tmp_path / "missing.mp4"
+    workspace = tmp_path / "workspace"
+    application = compose_deterministic_live_application(
+        interruption_signal=interruption_signal,
+        interrupt_during_workspace_open=True,
+    )
+
+    outcome = application.execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.INTERRUPTED
+    assert int(outcome.exit_code) == exit_code_value
+    assert outcome.primary_error is None
+    assert outcome.primary_error_code is None
+    assert outcome.interruption_signal is interruption_signal
+    assert outcome.diagnostics_incomplete is False
+    assert not (workspace / "work" / "tmp" / str(outcome.run_id)).exists()
+    manifest = json.loads(
+        (
+            workspace
+            / "work"
+            / "runs"
+            / str(outcome.run_id)
+            / "run.json"
+        ).read_text()
+    )
+    assert manifest["lifecycle"]["outcome"] == "interrupted"
+    assert manifest["lifecycle"]["exit_code"] == exit_code_value
+    assert manifest["stages"]["initialized"]["status"] == "interrupted"
+    assert manifest["errors"]["primary_error"] == {
+        "status": "not_applicable"
+    }
+
+
+def test_signal_arriving_during_startup_failure_cleanup_wins_the_terminal_race(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "missing.mp4"
+    workspace = tmp_path / "workspace"
+    application = compose_deterministic_live_application()
+    signal_sent = False
+
+    def interrupt_then_cleanup(run_workspace):
+        nonlocal signal_sent
+        if not signal_sent:
+            signal_sent = True
+            os.kill(os.getpid(), signal.SIGINT)
+        run_workspace.cleanup()
+
+    monkeypatch.setattr(
+        application,
+        "_cleanup_run",
+        interrupt_then_cleanup,
+    )
+
+    outcome = application.execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.INTERRUPTED
+    assert outcome.exit_code is ExitCode.SIGINT
+    assert outcome.primary_error is None
+    assert outcome.interruption_signal is InterruptionSignal.SIGINT
+    assert outcome.diagnostics_incomplete is False
+    manifest = json.loads(
+        (
+            workspace
+            / "work"
+            / "runs"
+            / str(outcome.run_id)
+            / "run.json"
+        ).read_text()
+    )
+    assert manifest["lifecycle"]["outcome"] == "interrupted"
+    assert manifest["stages"]["initialized"]["status"] == "interrupted"
+
+
+def test_startup_interruption_records_a_cleanup_failure_as_associated(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "missing.mp4"
+    workspace = tmp_path / "workspace"
+    application = compose_deterministic_live_application()
+    signal_sent = False
+
+    def interrupt_then_fail_cleanup(run_workspace):
+        nonlocal signal_sent
+        del run_workspace
+        if not signal_sent:
+            signal_sent = True
+            os.kill(os.getpid(), signal.SIGINT)
+        raise WorkspaceFailure(
+            ErrorCode.WORKSPACE_CLEANUP_FAILED,
+            {
+                "operation": "workspace.cleanup",
+                "reason_code": "workspace.directory_sync_failed",
+            },
+        )
+
+    monkeypatch.setattr(
+        application,
+        "_cleanup_run",
+        interrupt_then_fail_cleanup,
+    )
+
+    outcome = application.execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.INTERRUPTED
+    assert outcome.exit_code is ExitCode.SIGINT
+    assert outcome.primary_error is None
+    assert len(outcome.associated_errors) == 1
+    assert (
+        outcome.associated_errors[0].error_code
+        is ErrorCode.WORKSPACE_CLEANUP_FAILED
+    )
+    assert outcome.recovery_incomplete is True
+    assert outcome.diagnostics_incomplete is False
 
 
 def test_signal_inside_publication_critical_section_observes_commit(
@@ -1331,7 +1466,7 @@ def test_unexpected_exception_is_redacted_to_stable_internal_failure(
     assert b"secret exception detail" not in diagnostic_bytes
 
 
-def test_workspace_startup_failure_still_returns_typed_outcome(tmp_path):
+def test_workspace_startup_input_failure_forms_an_auditable_run(tmp_path):
     source = tmp_path / "missing.mp4"
     workspace = tmp_path / "workspace"
 
@@ -1342,10 +1477,187 @@ def test_workspace_startup_failure_still_returns_typed_outcome(tmp_path):
     assert outcome.state is LiveRunState.FAILED
     assert outcome.exit_code is ExitCode.INPUT_FAILED
     assert outcome.primary_error_code is ErrorCode.INPUT_MISSING
-    assert outcome.primary_error is None
+    assert outcome.primary_error is not None
+    assert outcome.primary_error.diagnostics == {
+        "reason_code": "input.not_found"
+    }
     assert outcome.associated_errors == ()
+    assert outcome.diagnostics_incomplete is False
+    run_directory = (
+        workspace / "work" / "runs" / str(outcome.run_id)
+    )
+    manifest = json.loads((run_directory / "run.json").read_text())
+    assert manifest["lifecycle"]["outcome"] == "failed"
+    assert manifest["lifecycle"]["exit_code"] == 20
+    assert manifest["errors"]["primary_error"]["error_code"] == (
+        "input.missing"
+    )
+    assert manifest["stages"]["initialized"]["status"] == "failed"
+    for stage in EXPECTED_STAGES:
+        assert manifest["stages"][stage] == {"status": "not_started"}
+    assert b"external_request.completed" not in (
+        run_directory / "events.jsonl"
+    ).read_bytes()
+
+
+@pytest.mark.parametrize(
+    "cleanup_options",
+    [
+        {"cleanup_failure": True},
+        {"cleanup_failure_before_delete": True},
+    ],
+)
+def test_startup_input_error_precedes_its_cleanup_error(
+    tmp_path,
+    cleanup_options,
+):
+    source = tmp_path / "missing.mp4"
+    workspace = tmp_path / "workspace"
+    application = compose_deterministic_live_application(
+        **cleanup_options,
+    )
+
+    outcome = application.execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.exit_code is ExitCode.INPUT_FAILED
+    assert outcome.primary_error_code is ErrorCode.INPUT_MISSING
+    assert outcome.primary_error is not None
+    assert len(outcome.associated_errors) == 1
+    cleanup_error = outcome.associated_errors[0]
+    assert cleanup_error.error_code is ErrorCode.WORKSPACE_CLEANUP_FAILED
+    assert outcome.primary_error.event_sequence < cleanup_error.event_sequence
+    assert outcome.recovery_incomplete is True
+    assert outcome.diagnostics_incomplete is False
+    assert (
+        workspace
+        / "work"
+        / "runs"
+        / str(outcome.run_id)
+        / "run.json"
+    ).is_file()
+
+
+def test_missing_source_uses_the_default_workspace_for_its_audit(tmp_path):
+    source = tmp_path / "missing.mp4"
+
+    outcome = compose_deterministic_live_application().execute(
+        LiveRunRequest(source)
+    )
+
+    workspace = tmp_path / "missing.autocut"
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.exit_code is ExitCode.INPUT_FAILED
+    assert outcome.primary_error_code is ErrorCode.INPUT_MISSING
+    assert outcome.diagnostics_incomplete is False
+    assert (
+        workspace
+        / "work"
+        / "runs"
+        / str(outcome.run_id)
+        / "run.json"
+    ).is_file()
+
+
+def test_non_regular_source_is_an_auditable_input_failure(tmp_path):
+    source = tmp_path / "course.mp4"
+    source.mkdir()
+    workspace = tmp_path / "workspace"
+
+    outcome = compose_deterministic_live_application().execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.exit_code is ExitCode.INPUT_FAILED
+    assert outcome.primary_error_code is ErrorCode.INPUT_UNREADABLE
+    assert outcome.primary_error is not None
+    assert outcome.primary_error.diagnostics == {
+        "reason_code": "input.not_regular_file"
+    }
+    assert outcome.diagnostics_incomplete is False
+    manifest = json.loads(
+        (
+            workspace
+            / "work"
+            / "runs"
+            / str(outcome.run_id)
+            / "run.json"
+        ).read_text()
+    )
+    assert manifest["errors"]["primary_error"]["error_code"] == (
+        "input.unreadable"
+    )
+    assert manifest["lifecycle"]["exit_code"] == 20
+
+
+def test_self_referential_source_link_uses_a_separate_default_audit_workspace(
+    tmp_path,
+):
+    source = tmp_path / "loop.mp4"
+    source.symlink_to(source.name)
+
+    outcome = compose_deterministic_live_application().execute(
+        LiveRunRequest(source)
+    )
+
+    workspace = tmp_path / "loop.autocut"
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.exit_code is ExitCode.INPUT_FAILED
+    assert outcome.primary_error_code is ErrorCode.INPUT_UNREADABLE
+    assert outcome.diagnostics_incomplete is False
+    assert source.is_symlink()
+    assert (
+        workspace
+        / "work"
+        / "runs"
+        / str(outcome.run_id)
+        / "run.json"
+    ).is_file()
+
+
+def test_invalid_autocut_directory_is_not_initialized_as_its_own_audit(
+    tmp_path,
+):
+    source = tmp_path / "bad.autocut"
+    source.mkdir()
+
+    outcome = compose_deterministic_live_application().execute(
+        LiveRunRequest(source)
+    )
+
+    workspace = tmp_path / "bad.autocut.autocut"
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.exit_code is ExitCode.INPUT_FAILED
+    assert outcome.primary_error_code is ErrorCode.INPUT_UNREADABLE
+    assert outcome.diagnostics_incomplete is False
+    assert list(source.iterdir()) == []
+    assert (
+        workspace
+        / "work"
+        / "runs"
+        / str(outcome.run_id)
+        / "run.json"
+    ).is_file()
+
+
+def test_explicit_audit_workspace_cannot_replace_the_missing_source(tmp_path):
+    source = tmp_path / "missing.mp4"
+
+    outcome = compose_deterministic_live_application().execute(
+        LiveRunRequest(source, workspace_dir=source)
+    )
+
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.exit_code is ExitCode.PREFLIGHT_FAILED
+    assert (
+        outcome.primary_error_code
+        is ErrorCode.ENVIRONMENT_WORKSPACE_UNWRITABLE
+    )
     assert outcome.diagnostics_incomplete is True
-    assert not workspace.exists()
+    assert not source.exists()
 
 
 def test_subtitle_optimization_failure_terminates_delivery_build_stage(

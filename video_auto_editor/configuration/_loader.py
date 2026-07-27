@@ -1,5 +1,6 @@
 """Configuration 深模块的唯一公共加载入口。"""
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -359,10 +360,25 @@ def _build_effective(values: Mapping[str, Any]) -> EffectiveConfiguration:
 
 
 def _build_course_context(values: Mapping[str, Any]) -> CourseContext:
+    normalized = {
+        "schema_version": values["schema_version"],
+        "course_topic": values["course_topic"],
+        "attribution": values.get("attribution"),
+        "priority_topics": list(values.get("priority_topics", ())),
+        "excluded_content": list(values.get("excluded_content", ())),
+    }
+    canonical = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
     return CourseContext(
-        schema_version=values["schema_version"],
-        course_topic=values["course_topic"],
-        attribution=values.get("attribution"),
-        priority_topics=tuple(values.get("priority_topics", ())),
-        excluded_content=tuple(values.get("excluded_content", ())),
+        schema_version=normalized["schema_version"],
+        sha256=f"sha256:{hashlib.sha256(canonical).hexdigest()}",
+        course_topic=normalized["course_topic"],
+        attribution=normalized["attribution"],
+        priority_topics=tuple(normalized["priority_topics"]),
+        excluded_content=tuple(normalized["excluded_content"]),
     )

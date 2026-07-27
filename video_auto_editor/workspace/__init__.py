@@ -8,6 +8,7 @@ from ._capability import (
 )
 from ._failure import WorkspaceFailure
 from ._workspace import (
+    DiagnosticRunWorkspace,
     MaintenanceWorkspace,
     RunWorkspace,
     SourceFileCapability,
@@ -15,6 +16,7 @@ from ._workspace import (
 )
 
 __all__ = [
+    "DiagnosticRunWorkspace",
     "MaintenanceWorkspace",
     "ManagedBinaryFile",
     "ManagedDirectoryCapability",

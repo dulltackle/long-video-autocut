@@ -490,6 +490,11 @@ def test_load_discovers_an_immutable_optional_course_context(tmp_path):
     assert first.course_context == second.course_context
     assert first.course_context is not second.course_context
     assert first.course_context.schema_version == "course_context.v1"
+    assert re.fullmatch(
+        r"sha256:[0-9a-f]{64}",
+        first.course_context.sha256,
+    )
+    assert first.course_context.sha256 == second.course_context.sha256
     assert first.course_context.course_topic == "直播拆条生产课"
     assert first.course_context.attribution == "示例学院"
     assert first.course_context.priority_topics == (
@@ -501,6 +506,49 @@ def test_load_discovers_an_immutable_optional_course_context(tmp_path):
 
     with pytest.raises(FrozenInstanceError):
         first.course_context.course_topic = "已修改"
+
+
+def test_course_context_digest_uses_validated_semantics_not_json_layout(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"not-inspected-by-configuration")
+    context_path = tmp_path / "course.context.json"
+    semantic_context = {
+        "schema_version": "course_context.v1",
+        "course_topic": "规范摘要",
+        "priority_topics": ["稳定键序"],
+    }
+    context_path.write_text(
+        json.dumps(semantic_context, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    first = Configuration.load(source).course_context
+    context_path.write_text(
+        json.dumps(
+            {
+                "priority_topics": ["稳定键序"],
+                "course_topic": "规范摘要",
+                "schema_version": "course_context.v1",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    second = Configuration.load(source).course_context
+    semantic_context["course_topic"] = "内容已变化"
+    context_path.write_text(
+        json.dumps(semantic_context, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    changed = Configuration.load(source).course_context
+
+    assert first is not None
+    assert second is not None
+    assert changed is not None
+    assert first.sha256 == second.sha256
+    assert changed.sha256 != first.sha256
 
 
 @pytest.mark.parametrize(
