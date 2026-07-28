@@ -1,9 +1,43 @@
-"""形成候选片段、初始边界与主题评审上下文。"""
+"""形成候选方案，并把完整主题评审归并为最终交付方案。"""
 
-from ._model import CandidatePlan
+from ._model import (
+    BoundaryRemedy,
+    BoundaryRemedyStatus,
+    CandidatePlan,
+    CandidateReviewContext,
+    ClipCandidate,
+    CompleteTopicReview,
+    DeliveryPlan,
+    FinalCandidate,
+    PublishedSelection,
+    RejectedSelection,
+    RejectionReason,
+    ReviewRecommendation,
+    SameTopicSeries,
+    ShortVideo,
+    TopicReviewItem,
+    TopicReviewSnapshot,
+    TranscriptExcerpt,
+)
 from ._planning import ClipPlanning
 
 __all__ = [
+    "BoundaryRemedy",
+    "BoundaryRemedyStatus",
     "CandidatePlan",
+    "CandidateReviewContext",
+    "ClipCandidate",
     "ClipPlanning",
+    "CompleteTopicReview",
+    "DeliveryPlan",
+    "FinalCandidate",
+    "PublishedSelection",
+    "RejectedSelection",
+    "RejectionReason",
+    "ReviewRecommendation",
+    "SameTopicSeries",
+    "ShortVideo",
+    "TopicReviewItem",
+    "TopicReviewSnapshot",
+    "TranscriptExcerpt",
 ]

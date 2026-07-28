@@ -9,6 +9,7 @@ from video_auto_editor.cache import (
 from video_auto_editor.cache import CacheOutcome as CacheOutcome
 from video_auto_editor.delivery.capability import PublishedDelivery
 from video_auto_editor.runtime.errors import RunError
+from video_auto_editor.runtime.result import ResultKind
 
 
 class StageOutcome(str, Enum):
@@ -52,13 +53,6 @@ class RetryKind(str, Enum):
     TRANSPORT_RETRY = "transport_retry"
     SEMANTIC_RETRY = "semantic_retry"
     COVERAGE_RECOVERY = "coverage_recovery"
-
-
-class ResultKind(str, Enum):
-    """成功运行形成的两类合法业务结果。"""
-
-    CLIPS = "clips"
-    EMPTY = "empty"
 
 
 class InterruptionSignal(str, Enum):
