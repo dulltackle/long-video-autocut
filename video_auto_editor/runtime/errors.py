@@ -1,10 +1,10 @@
 """稳定公共错误与 CLI 退出码。"""
 
+import hashlib
+import re
 from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-import hashlib
-import re
 from types import MappingProxyType
 from typing import Any, Callable, FrozenSet, Mapping
 
@@ -1648,6 +1648,17 @@ def _freeze_diagnostics(
             raise ValueError(f"诊断字段 {key}：{exc}") from exc
     _validate_diagnostic_union(frozen)
     return MappingProxyType(frozen)
+
+
+def freeze_error_diagnostics(
+    code: ErrorCode | str,
+    diagnostics: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    """按公共错误注册表校验并冻结脱敏诊断。"""
+    return _freeze_diagnostics(
+        get_error_definition(code),
+        diagnostics,
+    )
 
 
 def _normalize_run_stage(value: RunStage | str) -> RunStage:

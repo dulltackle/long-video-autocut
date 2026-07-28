@@ -45,8 +45,17 @@ from video_auto_editor.runtime.errors import (
     RunStage,
     get_error_definition,
 )
-from video_auto_editor.runtime.identity import RunId
+from video_auto_editor.runtime.identity import (
+    RunId,
+    TranscriptChunkId,
+    TranscriptId,
+)
 from video_auto_editor.source_analysis import SourceDescription
+from video_auto_editor.transcription import (
+    CompleteTranscript,
+    TranscriptChunk,
+    TranscriptionResult,
+)
 from video_auto_editor.workspace import (
     DiagnosticRunWorkspace,
     ManagedDirectoryCapability,
@@ -393,7 +402,7 @@ class _RunAssembly(Protocol):
         source: object,
         stage: StageDiagnostics,
         cancellation: CancellationToken,
-    ) -> _StageWork: ...
+    ) -> TranscriptionResult: ...
 
     def plan_candidates(
         self,
@@ -881,11 +890,13 @@ class LiveApplication:
                 cancellation,
                 run_workspace,
                 RunStage.TRANSCRIPTION,
-                lambda stage, token: assembly.transcribe(
-                    source.value,
-                    stage,
-                    token,
+                lambda stage, token: self._transcribe(
+                    assembly=assembly,
+                    source=source.value,
+                    stage=stage,
+                    cancellation=token,
                 ),
+                expected_value=CompleteTranscript,
             )
             plan = self._run_stage(
                 cursor,
@@ -1032,6 +1043,35 @@ class LiveApplication:
         )
 
     @staticmethod
+    def _transcribe(
+        *,
+        assembly: _RunAssembly,
+        source: object,
+        stage: StageDiagnostics,
+        cancellation: CancellationToken,
+    ) -> _StageWork:
+        result = assembly.transcribe(source, stage, cancellation)
+        if not isinstance(result, TranscriptionResult):
+            raise TypeError(
+                "语音识别阶段必须返回 TranscriptionResult"
+            )
+        transcript = CompleteTranscript._from_application(
+            transcript_id=TranscriptId.new(),
+            speech_presence=result.speech_presence,
+            chunks=tuple(
+                TranscriptChunk._from_application(
+                    TranscriptChunkId.new(),
+                    chunk,
+                )
+                for chunk in result.chunks
+            ),
+        )
+        return _StageWork(
+            value=transcript,
+            work_item_count=len(transcript.chunks),
+        )
+
+    @staticmethod
     def _capture_publication(
         cancellation: CancellationSource,
         commit_state: _CommitState,
@@ -1087,6 +1127,8 @@ class LiveApplication:
             self._control.stage_started(stage, cancellation)
             cancellation.token.raise_if_cancelled()
             result = effect(stage_diagnostics, cancellation.token)
+            if commit_state is None or not commit_state.committed:
+                cancellation.token.raise_if_cancelled()
             if not isinstance(result, expected_result):
                 raise TypeError("业务阶段返回了错误的类型化阶段结果")
             if expected_value is not None and not isinstance(

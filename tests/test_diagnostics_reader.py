@@ -43,6 +43,20 @@ _RUN_ID = "run_11111111-1111-4111-8111-111111111111"
 _OTHER_RUN_ID = "run_22222222-2222-4222-8222-222222222222"
 
 
+def _in_memory_diagnostics():
+    return RunDiagnostics.in_memory(
+        RunId.new(),
+        application_version="4.7.0",
+        wall_clock=lambda: datetime(
+            2026,
+            7,
+            26,
+            tzinfo=timezone.utc,
+        ),
+        monotonic_clock=lambda: 0.0,
+    )
+
+
 def _event(
     event_code,
     sequence,
@@ -394,6 +408,12 @@ def test_reader_accepts_producer_aggregates_rebuilt_from_events():
             RecoveredNoticeKind.TRANSPORT_RETRY_SUCCEEDED
         )
     )
+    scope.record(
+        Facts.transcription_execution(
+            retry_count=1,
+            recovery_count=0,
+        )
+    )
     stage.complete(StageOutcome.SUCCEEDED, work_item_count=1)
     stage = diagnostics.start_stage(RunStage.DELIVERY_BUILD)
     stage.scope(ErrorModule.APPLICATION).record(
@@ -404,6 +424,375 @@ def test_reader_accepts_producer_aggregates_rebuilt_from_events():
         RunOutcome.interrupted(
             InterruptionSignal.SIGINT,
             cleanup_duration_ms=10,
+        )
+    )
+
+    result = DiagnosticPackageReader.read(diagnostics.snapshot())
+
+    assert result.state is DiagnosticPackageReadState.COMPLETE
+    assert result.reason is DiagnosticPackageReadReason.VALID
+
+
+def test_reader_rebuilds_neutral_transcription_execution_aggregates():
+    monotonic_value = 0.0
+
+    def monotonic_clock():
+        nonlocal monotonic_value
+        monotonic_value += 0.1
+        return monotonic_value
+
+    diagnostics = RunDiagnostics.in_memory(
+        RunId.new(),
+        application_version="4.7.0",
+        wall_clock=lambda: datetime(
+            2026,
+            7,
+            26,
+            tzinfo=timezone.utc,
+        ),
+        monotonic_clock=monotonic_clock,
+    )
+    stage = diagnostics.start_stage(RunStage.TRANSCRIPTION)
+    scope = stage.scope(ErrorModule.TRANSCRIPTION)
+    scope.record(
+        Facts.transcription_execution(
+            retry_count=2,
+            recovery_count=1,
+        )
+    )
+    primary_error = scope.record_failure(
+        SimpleNamespace(
+            error_code=ErrorCode.TRANSCRIPTION_SERVICE_UNAVAILABLE,
+            diagnostics={"attempt": 3, "http_status": 503},
+        )
+    )
+    stage.complete(StageOutcome.FAILED, work_item_count=0)
+    diagnostics.finish(RunOutcome.failed(primary_error))
+
+    snapshot = diagnostics.snapshot()
+    manifest = json.loads(snapshot.manifest)
+    events = [
+        json.loads(line)
+        for line in snapshot.events.decode("utf-8").splitlines()
+    ]
+    result = DiagnosticPackageReader.read(snapshot)
+
+    assert manifest["retries_and_recovery"] == {
+        "coverage_recovery": 1,
+        "semantic_retry": 0,
+        "transport_retry": 2,
+    }
+    assert [
+        event["attributes"]
+        for event in events
+        if event["event_code"] == "transcription.execution_observed"
+    ] == [{"recovery_count": 1, "retry_count": 2}]
+    assert result.state is DiagnosticPackageReadState.COMPLETE
+    assert result.reason is DiagnosticPackageReadReason.VALID
+
+
+def test_rejected_transcription_aggregate_does_not_pollute_retry_counts():
+    diagnostics = _in_memory_diagnostics()
+    stage = diagnostics.start_stage(RunStage.TRANSCRIPTION)
+    scope = stage.scope(ErrorModule.TRANSCRIPTION)
+    recovery = scope.start_operation(
+        OperationKind.COVERAGE_RECOVERY,
+        item_index=1,
+        item_count=1,
+    )
+    recovery.schedule_retry(
+        RetryKind.COVERAGE_RECOVERY,
+        next_attempt=2,
+        reason_code="coverage.gap_detected",
+        backoff_ms=0,
+    )
+    recovery.complete(OperationOutcome.SUCCEEDED, attempt_count=2)
+
+    with pytest.raises(ValueError, match="少于已记录内部操作"):
+        scope.record(
+            Facts.transcription_execution(
+                retry_count=2,
+                recovery_count=0,
+            )
+        )
+
+    scope.record(
+        Facts.transcription_execution(
+            retry_count=0,
+            recovery_count=1,
+        )
+    )
+    primary_error = scope.record_failure(
+        SimpleNamespace(
+            error_code=ErrorCode.TRANSCRIPTION_SERVICE_UNAVAILABLE,
+            diagnostics={"attempt": 2, "http_status": 503},
+        )
+    )
+    stage.complete(StageOutcome.FAILED, work_item_count=0)
+    diagnostics.finish(RunOutcome.failed(primary_error))
+    snapshot = diagnostics.snapshot()
+    manifest = json.loads(snapshot.manifest)
+
+    assert manifest["retries_and_recovery"] == {
+        "coverage_recovery": 1,
+        "semantic_retry": 0,
+        "transport_retry": 0,
+    }
+    assert (
+        DiagnosticPackageReader.read(snapshot).state
+        is DiagnosticPackageReadState.COMPLETE
+    )
+
+
+def test_transcription_aggregate_rejects_internal_work_after_whole_cache_hit():
+    diagnostics = _in_memory_diagnostics()
+    stage = diagnostics.start_stage(RunStage.TRANSCRIPTION)
+    scope = stage.scope(ErrorModule.TRANSCRIPTION)
+    cache = scope.start_operation(
+        OperationKind.CACHE_READ,
+        item_index=1,
+        item_count=1,
+    )
+    cache.record(
+        Facts.cache(
+            CacheNamespace.TRANSCRIPT,
+            CacheOutcome.HIT,
+        )
+    )
+    cache.complete(OperationOutcome.SUCCEEDED, attempt_count=1)
+
+    with pytest.raises(ValueError, match="整场转写缓存命中"):
+        scope.record(
+            Facts.transcription_execution(
+                retry_count=1,
+                recovery_count=0,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "order",
+    ("hit_then_retry", "retry_then_hit"),
+)
+def test_whole_cache_hit_and_transcription_retry_conflict_is_rejected(
+    order,
+):
+    diagnostics = _in_memory_diagnostics()
+    stage = diagnostics.start_stage(RunStage.TRANSCRIPTION)
+    scope = stage.scope(ErrorModule.TRANSCRIPTION)
+
+    def record_hit():
+        cache = scope.start_operation(
+            OperationKind.CACHE_READ,
+            item_index=1,
+            item_count=1,
+        )
+        cache.record(
+            Facts.cache(
+                CacheNamespace.TRANSCRIPT,
+                CacheOutcome.HIT,
+            )
+        )
+        cache.complete(OperationOutcome.SUCCEEDED, attempt_count=1)
+
+    def schedule_retry():
+        request = scope.start_operation(
+            OperationKind.EXTERNAL_REQUEST,
+            item_index=1,
+            item_count=1,
+        )
+        request.schedule_retry(
+            RetryKind.TRANSPORT_RETRY,
+            next_attempt=2,
+            reason_code="provider.rate_limited",
+            backoff_ms=0,
+        )
+        request.complete(OperationOutcome.SUCCEEDED, attempt_count=2)
+
+    if order == "hit_then_retry":
+        record_hit()
+        with pytest.raises(ValueError, match="整场转写缓存命中"):
+            schedule_retry()
+    else:
+        schedule_retry()
+        with pytest.raises(ValueError, match="整场转写缓存命中"):
+            record_hit()
+
+
+def test_reader_rejects_internal_work_forged_after_whole_cache_hit():
+    diagnostics = _in_memory_diagnostics()
+    stage = diagnostics.start_stage(RunStage.TRANSCRIPTION)
+    scope = stage.scope(ErrorModule.TRANSCRIPTION)
+    cache = scope.start_operation(
+        OperationKind.CACHE_READ,
+        item_index=1,
+        item_count=1,
+    )
+    cache.record(
+        Facts.cache(
+            CacheNamespace.TRANSCRIPT,
+            CacheOutcome.MISS,
+        )
+    )
+    cache.complete(OperationOutcome.SUCCEEDED, attempt_count=1)
+    scope.record(
+        Facts.transcription_execution(
+            retry_count=1,
+            recovery_count=0,
+        )
+    )
+    primary_error = scope.record_failure(
+        SimpleNamespace(
+            error_code=ErrorCode.TRANSCRIPTION_SERVICE_UNAVAILABLE,
+            diagnostics={"attempt": 2, "http_status": 503},
+        )
+    )
+    stage.complete(StageOutcome.FAILED, work_item_count=0)
+    diagnostics.finish(RunOutcome.failed(primary_error))
+    snapshot = diagnostics.snapshot()
+    events = [
+        json.loads(line)
+        for line in snapshot.events.decode("utf-8").splitlines()
+    ]
+    cache_event = next(
+        event
+        for event in events
+        if event["event_code"] == "cache.observed"
+    )
+    cache_event["attributes"]["outcome"] = "hit"
+    forged_events = _encode_events(events)
+    manifest = json.loads(snapshot.manifest)
+    cache_stats = manifest["cache"]["namespaces"]["transcript"]
+    cache_stats["hits"] = 1
+    cache_stats["misses"] = 0
+    manifest["event_log"].update(
+        {
+            "byte_length": len(forged_events),
+            "sha256": (
+                "sha256:" + hashlib.sha256(forged_events).hexdigest()
+            ),
+        }
+    )
+
+    result = DiagnosticPackageReader.read(
+        DiagnosticPackageSnapshot(
+            events=forged_events,
+            manifest=(
+                json.dumps(
+                    manifest,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            ),
+        )
+    )
+
+    assert result.state is DiagnosticPackageReadState.CORRUPT
+
+
+def test_reader_scopes_whole_transcript_hit_conflict_to_transcription_stage():
+    diagnostics = _in_memory_diagnostics()
+    stage = diagnostics.start_stage(RunStage.TRANSCRIPTION)
+    transcription = stage.scope(ErrorModule.TRANSCRIPTION)
+    request = transcription.start_operation(
+        OperationKind.EXTERNAL_REQUEST,
+        item_index=1,
+        item_count=1,
+    )
+    request.schedule_retry(
+        RetryKind.TRANSPORT_RETRY,
+        next_attempt=2,
+        reason_code="provider.rate_limited",
+        backoff_ms=0,
+    )
+    request.complete(OperationOutcome.SUCCEEDED, attempt_count=2)
+    transcription.record(
+        Facts.transcription_execution(
+            retry_count=1,
+            recovery_count=0,
+        )
+    )
+    stage.complete(StageOutcome.SUCCEEDED, work_item_count=1)
+
+    stage = diagnostics.start_stage(RunStage.CANDIDATE_PLANNING)
+    planning = stage.scope(ErrorModule.CLIP_PLANNING)
+    cache = planning.start_operation(
+        OperationKind.CACHE_READ,
+        item_index=1,
+        item_count=1,
+    )
+    cache.record(
+        Facts.cache(
+            CacheNamespace.TRANSCRIPT,
+            CacheOutcome.HIT,
+        )
+    )
+    cache.complete(OperationOutcome.SUCCEEDED, attempt_count=1)
+    stage.scope(ErrorModule.APPLICATION).record(
+        Facts.interruption(InterruptionSignal.SIGINT)
+    )
+    stage.complete(StageOutcome.INTERRUPTED, work_item_count=0)
+    diagnostics.finish(
+        RunOutcome.interrupted(
+            InterruptionSignal.SIGINT,
+            cleanup_duration_ms=0,
+        )
+    )
+
+    result = DiagnosticPackageReader.read(diagnostics.snapshot())
+
+    assert result.state is DiagnosticPackageReadState.COMPLETE
+    assert result.reason is DiagnosticPackageReadReason.VALID
+
+
+def test_producer_scopes_whole_transcript_hit_conflict_to_transcription_stage():
+    diagnostics = _in_memory_diagnostics()
+    stage = diagnostics.start_stage(RunStage.PREFLIGHT)
+    readiness = stage.scope(ErrorModule.READINESS)
+    cache = readiness.start_operation(
+        OperationKind.CACHE_READ,
+        item_index=1,
+        item_count=1,
+    )
+    cache.record(
+        Facts.cache(
+            CacheNamespace.TRANSCRIPT,
+            CacheOutcome.HIT,
+        )
+    )
+    cache.complete(OperationOutcome.SUCCEEDED, attempt_count=1)
+    stage.complete(StageOutcome.SUCCEEDED, work_item_count=1)
+
+    stage = diagnostics.start_stage(RunStage.TRANSCRIPTION)
+    transcription = stage.scope(ErrorModule.TRANSCRIPTION)
+    request = transcription.start_operation(
+        OperationKind.EXTERNAL_REQUEST,
+        item_index=1,
+        item_count=1,
+    )
+    request.schedule_retry(
+        RetryKind.TRANSPORT_RETRY,
+        next_attempt=2,
+        reason_code="provider.rate_limited",
+        backoff_ms=0,
+    )
+    request.complete(OperationOutcome.SUCCEEDED, attempt_count=2)
+    transcription.record(
+        Facts.transcription_execution(
+            retry_count=1,
+            recovery_count=0,
+        )
+    )
+    stage.scope(ErrorModule.APPLICATION).record(
+        Facts.interruption(InterruptionSignal.SIGINT)
+    )
+    stage.complete(StageOutcome.INTERRUPTED, work_item_count=0)
+    diagnostics.finish(
+        RunOutcome.interrupted(
+            InterruptionSignal.SIGINT,
+            cleanup_duration_ms=0,
         )
     )
 

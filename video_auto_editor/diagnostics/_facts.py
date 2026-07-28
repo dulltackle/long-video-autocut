@@ -47,6 +47,7 @@ _FACT_SEAL = object()
 class _FactKind(str, Enum):
     CONFIGURATION = "configuration"
     CACHE = "cache"
+    TRANSCRIPTION_EXECUTION = "transcription_execution"
     SOURCE = "source"
     ENVIRONMENT = "environment"
     INTERRUPTION = "interruption"
@@ -67,6 +68,12 @@ class _CacheFact:
     reason_code: str | None
     quarantine_digest_prefix: str | None
     error_code: ErrorCode | None
+
+
+@dataclass(frozen=True, slots=True)
+class _TranscriptionExecutionFact:
+    retry_count: int
+    recovery_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +300,23 @@ class Facts:
                 reason_code=reason_code,
                 quarantine_digest_prefix=quarantine_digest_prefix,
                 error_code=error_code,
+            ),
+        )
+
+    @staticmethod
+    def transcription_execution(
+        *,
+        retry_count: int,
+        recovery_count: int,
+    ) -> DiagnosticFact:
+        """记录整场转写完成后可验证的中性聚合执行次数。"""
+        _nonnegative_integer(retry_count, field="语音识别内部重试次数")
+        _nonnegative_integer(recovery_count, field="语音覆盖补救次数")
+        return DiagnosticFact._create(
+            _FactKind.TRANSCRIPTION_EXECUTION,
+            _TranscriptionExecutionFact(
+                retry_count=retry_count,
+                recovery_count=recovery_count,
             ),
         )
 

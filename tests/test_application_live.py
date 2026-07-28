@@ -20,6 +20,10 @@ from video_auto_editor.application._deterministic import (
 from video_auto_editor.application.live import _CommitState
 from video_auto_editor.diagnostics import InterruptionSignal, ResultKind
 from video_auto_editor.runtime.errors import ErrorCode, ExitCode, RunStage
+from video_auto_editor.runtime.identity import (
+    TranscriptChunkId,
+    TranscriptId,
+)
 from video_auto_editor.workspace import (
     ManagedPathCapability,
     RunWorkspace,
@@ -138,9 +142,13 @@ def test_clips_run_advances_once_through_the_fixed_lifecycle(tmp_path):
         (stage, "succeeded") for stage in EXPECTED_STAGES
     ]
     assert not (workspace / "work" / "tmp" / str(outcome.run_id)).exists()
-    assert json.loads(
+    delivery_manifest = json.loads(
         (workspace / "delivery" / "manifest.json").read_text()
-    ) == {
+    )
+    assert {
+        key: delivery_manifest[key]
+        for key in ("result_kind", "run_id", "schema_version")
+    } == {
         "result_kind": "clips",
         "run_id": str(outcome.run_id),
         "schema_version": "deterministic.v1",
@@ -193,9 +201,13 @@ def test_effective_empty_result_uses_the_same_success_path(tmp_path):
         and event["attributes"]["operation_kind"] == "subtitle_window"
         for event in events
     )
-    assert json.loads(
+    delivery_manifest = json.loads(
         (workspace / "delivery" / "manifest.json").read_text()
-    ) == {
+    )
+    assert {
+        key: delivery_manifest[key]
+        for key in ("result_kind", "run_id", "schema_version")
+    } == {
         "result_kind": "empty",
         "run_id": str(outcome.run_id),
         "schema_version": "deterministic.v1",
@@ -903,20 +915,24 @@ def test_retry_cache_recovery_and_subtitle_work_remain_events(
         if event["event_code"] == "stage.started"
     ] == EXPECTED_STAGES
     assert any(
-        event["event_code"] == "retry.scheduled"
-        and event["attributes"]["retry_kind"] == "coverage_recovery"
-        and event["stage"] == "transcription"
-        for event in events
-    )
-    assert any(
         event["event_code"] == "cache.observed"
-        and event["attributes"]["outcome"] == "hit"
+        and event["attributes"]["outcome"] == "miss"
         and event["stage"] == "transcription"
         for event in events
     )
-    assert any(
-        event["event_code"] == "notice.recorded"
-        and event["attributes"]["kind"] == "coverage_recovery_succeeded"
+    execution_events = [
+        event
+        for event in events
+        if event["event_code"] == "transcription.execution_observed"
+    ]
+    assert [event["attributes"] for event in execution_events] == [
+        {"recovery_count": 1, "retry_count": 1}
+    ]
+    assert not any(
+        event["event_code"] in {
+            "retry.scheduled",
+            "notice.recorded",
+        }
         and event["stage"] == "transcription"
         for event in events
     )
@@ -1258,6 +1274,233 @@ def test_invalid_work_item_count_is_a_typed_internal_failure(
     assert outcome.primary_error_code is ErrorCode.INTERNAL_UNEXPECTED
     assert not any((workspace / "delivery").iterdir())
     assert not (workspace / "work" / "tmp" / str(outcome.run_id)).exists()
+
+
+def test_transcription_work_item_count_injection_is_rejected():
+    with pytest.raises(ValueError, match="转写工作项数量由应用"):
+        compose_deterministic_live_application(
+            invalid_work_count_stage=RunStage.TRANSCRIPTION
+        )
+
+
+def test_verification_rejects_manifest_result_kind_derived_from_untrusted_content(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    original_read = ManagedPathCapability.read_bytes
+
+    def substitute_result_kind(path):
+        contents = original_read(path)
+        if b'"schema_version":"deterministic.v1"' not in contents:
+            return contents
+        manifest = json.loads(contents)
+        manifest["result_kind"] = "empty"
+        manifest["speech_presence"] = "absent"
+        manifest["transcript_chunk_ids"] = []
+        return (
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+
+    monkeypatch.setattr(
+        ManagedPathCapability,
+        "read_bytes",
+        substitute_result_kind,
+    )
+
+    outcome = compose_deterministic_live_application().execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.FAILED
+    assert (
+        outcome.primary_error_code
+        is ErrorCode.DELIVERY_VERIFICATION_FAILED
+    )
+
+
+def test_verification_rejects_transcript_ids_not_created_by_this_run(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    original_read = ManagedPathCapability.read_bytes
+    forged_transcript_id = TranscriptId.new()
+    forged_chunk_id = TranscriptChunkId.new()
+
+    def substitute_transcript_ids(path):
+        contents = original_read(path)
+        if b'"schema_version":"deterministic.v1"' not in contents:
+            return contents
+        manifest = json.loads(contents)
+        manifest["transcript_id"] = str(forged_transcript_id)
+        manifest["transcript_chunk_ids"] = [str(forged_chunk_id)]
+        return (
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+
+    monkeypatch.setattr(
+        ManagedPathCapability,
+        "read_bytes",
+        substitute_transcript_ids,
+    )
+
+    outcome = compose_deterministic_live_application().execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.FAILED
+    assert (
+        outcome.primary_error_code
+        is ErrorCode.DELIVERY_VERIFICATION_FAILED
+    )
+
+
+def test_publication_uses_the_manifest_snapshot_bound_by_verification(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    original_read = ManagedPathCapability.read_bytes
+    forged_transcript_id = TranscriptId.new()
+    forged_chunk_id = TranscriptChunkId.new()
+    manifest_read_count = 0
+
+    def substitute_after_verification(path):
+        nonlocal manifest_read_count
+        contents = original_read(path)
+        if b'"schema_version":"deterministic.v1"' not in contents:
+            return contents
+        manifest_read_count += 1
+        if manifest_read_count == 1:
+            return contents
+        manifest = json.loads(contents)
+        manifest["transcript_id"] = str(forged_transcript_id)
+        manifest["transcript_chunk_ids"] = [str(forged_chunk_id)]
+        return (
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+
+    monkeypatch.setattr(
+        ManagedPathCapability,
+        "read_bytes",
+        substitute_after_verification,
+    )
+
+    outcome = compose_deterministic_live_application().execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    published = json.loads(
+        (workspace / "delivery" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert outcome.state is LiveRunState.SUCCEEDED
+    assert manifest_read_count == 1
+    assert published["transcript_id"] != str(forged_transcript_id)
+    assert published["transcript_chunk_ids"] != [str(forged_chunk_id)]
+
+
+def test_verification_reports_manifest_read_failure_as_stable_failure(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    original_read = ManagedPathCapability.read_bytes
+
+    def fail_manifest_read(path):
+        contents = original_read(path)
+        if b'"schema_version":"deterministic.v1"' in contents:
+            raise OSError("secret manifest read failure")
+        return contents
+
+    monkeypatch.setattr(
+        ManagedPathCapability,
+        "read_bytes",
+        fail_manifest_read,
+    )
+
+    outcome = compose_deterministic_live_application().execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.FAILED
+    assert (
+        outcome.primary_error_code
+        is ErrorCode.DELIVERY_VERIFICATION_FAILED
+    )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("duplicate_field", "truncated"),
+)
+def test_verification_reports_malformed_manifest_as_stable_failure(
+    tmp_path,
+    monkeypatch,
+    corruption,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    original_read = ManagedPathCapability.read_bytes
+
+    def corrupt_manifest(path):
+        contents = original_read(path)
+        if b'"schema_version":"deterministic.v1"' not in contents:
+            return contents
+        if corruption == "truncated":
+            return b'{"schema_version":"deterministic.v1"'
+        manifest = json.loads(contents)
+        duplicate = (
+            '"run_id":'
+            + json.dumps(manifest["run_id"])
+            + ","
+        ).encode("utf-8")
+        return b"{" + duplicate + contents[1:]
+
+    monkeypatch.setattr(
+        ManagedPathCapability,
+        "read_bytes",
+        corrupt_manifest,
+    )
+
+    outcome = compose_deterministic_live_application().execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.FAILED
+    assert (
+        outcome.primary_error_code
+        is ErrorCode.DELIVERY_VERIFICATION_FAILED
+    )
 
 
 def test_postcommit_control_failure_does_not_revoke_success(tmp_path):

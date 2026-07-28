@@ -204,6 +204,9 @@ _EVENT_SCHEMAS: Final = {
         operation="required",
         parent_operation_allowed=True,
     ),
+    "transcription.execution_observed": _EventSchema(
+        frozenset({"recovery_count", "retry_count"})
+    ),
     "source.observed": _EventSchema(
         frozenset(
             {
@@ -435,6 +438,9 @@ _EVENT_MESSAGES: Final = {
     "operation.completed": "诊断操作已完成。",
     "configuration.observed": "生效配置的脱敏投影已记录。",
     "cache.observed": "处理缓存操作事实已记录。",
+    "transcription.execution_observed": (
+        "语音识别的中性聚合执行事实已记录。"
+    ),
     "source.observed": "素材的脱敏来源事实已记录。",
     "environment.observed": "认证环境的脱敏预检事实已记录。",
     "interruption.requested": "应用已接受受控中断请求。",
@@ -634,6 +640,7 @@ def _validate_event_timeline(
     operations: dict[str, dict[str, Any]] = {}
     operation_attempts: dict[str, int] = {}
     active_operations: set[str] = set()
+    transcription_execution_seen = False
     last_stage = RunStage.INITIALIZED.value
     for index, event in enumerate(events):
         code = event["event_code"]
@@ -681,9 +688,24 @@ def _validate_event_timeline(
             continue
         if active_stage is None or event["stage"] != active_stage["stage"]:
             return DiagnosticPackageReadReason.EVENT_SCHEMA_INVALID
+        if code == "transcription.execution_observed":
+            if (
+                transcription_execution_seen
+                or event["stage"] != RunStage.TRANSCRIPTION.value
+                or event["module"] != ErrorModule.TRANSCRIPTION.value
+                or active_operations
+            ):
+                return DiagnosticPackageReadReason.EVENT_SCHEMA_INVALID
+            transcription_execution_seen = True
+            continue
         operation_id = event.get("operation_id")
         if code == "operation.started":
             if (
+                (
+                    transcription_execution_seen
+                    and event["stage"] == RunStage.TRANSCRIPTION.value
+                )
+                or
                 operation_id in operations
                 or (
                     event.get("parent_operation_id") is not None
@@ -736,6 +758,11 @@ def _validate_event_timeline(
         ):
             return DiagnosticPackageReadReason.EVENT_SCHEMA_INVALID
         if code == "retry.scheduled":
+            if (
+                transcription_execution_seen
+                and event["stage"] == RunStage.TRANSCRIPTION.value
+            ):
+                return DiagnosticPackageReadReason.EVENT_SCHEMA_INVALID
             next_attempt = event["attributes"]["next_attempt"]
             if next_attempt != operation_attempts[operation_id] + 1:
                 return DiagnosticPackageReadReason.EVENT_SCHEMA_INVALID
@@ -1151,6 +1178,11 @@ def _validate_future_event_attributes(
                 attributes["course_context_provided"],
                 bool,
             )
+        )
+    if event_code == "transcription.execution_observed":
+        return (
+            _nonnegative_int(attributes["recovery_count"])
+            and _nonnegative_int(attributes["retry_count"])
         )
     if event_code == "environment.observed":
         font = attributes["font"]
@@ -1580,13 +1612,73 @@ def _retries_from_events(
     events: list[dict[str, Any]],
 ) -> dict[str, int] | None:
     retry_events = _events_with_code(events, "retry.scheduled")
-    return {
+    retry_counts = {
         kind.value: sum(
             event["attributes"]["retry_kind"] == kind.value
             for event in retry_events
         )
         for kind in RetryKind
     }
+    execution_events = _events_with_code(
+        events,
+        "transcription.execution_observed",
+    )
+    if len(execution_events) > 1:
+        return None
+    if not execution_events:
+        if _whole_transcript_hit_conflicts_with_retries(
+            events,
+            retry_events,
+        ):
+            return None
+        return retry_counts
+    execution = execution_events[0]["attributes"]
+    if (
+        execution["retry_count"] > 0
+        or execution["recovery_count"] > 0
+    ) and _whole_transcript_cache_hit(events):
+        return None
+    if _whole_transcript_hit_conflicts_with_retries(
+        events,
+        retry_events,
+    ):
+        return None
+    aggregate_counts = {
+        RetryKind.TRANSPORT_RETRY.value: execution["retry_count"],
+        RetryKind.COVERAGE_RECOVERY.value: execution["recovery_count"],
+    }
+    for kind, reported_count in aggregate_counts.items():
+        observed_count = sum(
+            event["stage"] == RunStage.TRANSCRIPTION.value
+            and event["attributes"]["retry_kind"] == kind
+            for event in retry_events
+        )
+        if reported_count < observed_count:
+            return None
+        retry_counts[kind] += reported_count - observed_count
+    return retry_counts
+
+
+def _whole_transcript_cache_hit(
+    events: list[dict[str, Any]],
+) -> bool:
+    return any(
+        event["stage"] == RunStage.TRANSCRIPTION.value
+        and event["attributes"]["namespace"]
+        == CacheNamespace.TRANSCRIPT.value
+        and event["attributes"]["outcome"] == CacheOutcome.HIT.value
+        for event in _events_with_code(events, "cache.observed")
+    )
+
+
+def _whole_transcript_hit_conflicts_with_retries(
+    events: list[dict[str, Any]],
+    retry_events: list[dict[str, Any]],
+) -> bool:
+    return _whole_transcript_cache_hit(events) and any(
+        event["stage"] == RunStage.TRANSCRIPTION.value
+        for event in retry_events
+    )
 
 
 def _cache_from_events(
@@ -1931,6 +2023,8 @@ def _notices_supported_by_events(
         for notice in _notices_from_events(events)
     }
     retry_counts = _retries_from_events(events)
+    if retry_counts is None:
+        return False
     retry_support = {
         RecoveredNoticeKind.TRANSPORT_RETRY_SUCCEEDED.value: (
             RetryKind.TRANSPORT_RETRY.value

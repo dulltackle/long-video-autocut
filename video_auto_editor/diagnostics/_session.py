@@ -40,6 +40,7 @@ from ._facts import (
     _FactKind,
     _RecoveredNoticeFact,
     _SourceFact,
+    _TranscriptionExecutionFact,
 )
 from ._failure import (
     DiagnosticsFailure,
@@ -50,7 +51,6 @@ from ._model import (
     ArtifactRole,
     CacheNamespace,
     CacheOutcome,
-    CertifiedPlatform,
     DiagnosticFinalization,
     DiagnosticPackageSnapshot,
     DeliveryBuildState,
@@ -106,6 +106,9 @@ class RunDiagnostics:
         "_postcommit_incomplete",
         "_postcommit_proof",
         "_retry_counts",
+        "_transcription_execution",
+        "_transcription_retry_counts",
+        "_transcription_transcript_cache_hit",
         "_run_started_at",
         "_run_id",
         "_sequence",
@@ -255,6 +258,11 @@ class RunDiagnostics:
         instance._postcommit_incomplete = False
         instance._postcommit_proof = None
         instance._retry_counts = {kind: 0 for kind in RetryKind}
+        instance._transcription_execution = None
+        instance._transcription_retry_counts = {
+            kind: 0 for kind in RetryKind
+        }
+        instance._transcription_transcript_cache_hit = False
         instance._errors = {}
         instance._external_services = {}
         instance._finished = False
@@ -620,6 +628,13 @@ class RunDiagnostics:
                 cache_fact = fact._payload
                 if not isinstance(cache_fact, _CacheFact):
                     raise TypeError("缓存诊断事实类型不合法")
+                if (
+                    scope._stage is RunStage.TRANSCRIPTION
+                    and cache_fact.namespace is CacheNamespace.TRANSCRIPT
+                    and cache_fact.outcome is CacheOutcome.HIT
+                    and any(self._transcription_retry_counts.values())
+                ):
+                    raise ValueError("整场转写缓存命中时不得发生内部工作")
                 observed_at = _monotonic_value(self._monotonic_clock())
                 attributes: dict[str, object] = {
                     "duration_ms": _duration_ms(
@@ -663,6 +678,70 @@ class RunDiagnostics:
                     parent_operation_id=operation._parent_operation_id,
                 )
                 _update_cache_stats(self._cache_stats, cache_fact)
+                if (
+                    scope._stage is RunStage.TRANSCRIPTION
+                    and cache_fact.namespace is CacheNamespace.TRANSCRIPT
+                    and cache_fact.outcome is CacheOutcome.HIT
+                ):
+                    self._transcription_transcript_cache_hit = True
+                return sequence
+            if fact._kind is _FactKind.TRANSCRIPTION_EXECUTION:
+                if operation is not None:
+                    raise ValueError("转写聚合执行事实不能绑定诊断操作")
+                if (
+                    scope._stage is not RunStage.TRANSCRIPTION
+                    or scope._module is not ErrorModule.TRANSCRIPTION
+                ):
+                    raise ValueError("转写聚合执行事实只能由语音识别阶段记录")
+                if self._transcription_execution is not None:
+                    raise RuntimeError("转写聚合执行事实已经记录")
+                if any(
+                    not candidate._completed
+                    and candidate._scope._stage is scope._stage
+                    for candidate in self._operations.values()
+                ):
+                    raise RuntimeError("转写聚合执行事实必须在内部操作完成后记录")
+                execution_fact = fact._payload
+                if not isinstance(
+                    execution_fact,
+                    _TranscriptionExecutionFact,
+                ):
+                    raise TypeError("转写聚合执行事实类型不合法")
+                if (
+                    self._transcription_transcript_cache_hit
+                    and (
+                        execution_fact.retry_count > 0
+                        or execution_fact.recovery_count > 0
+                        or any(self._transcription_retry_counts.values())
+                    )
+                ):
+                    raise ValueError("整场转写缓存命中时不得发生内部工作")
+                reported_counts = {
+                    RetryKind.TRANSPORT_RETRY: execution_fact.retry_count,
+                    RetryKind.COVERAGE_RECOVERY: (
+                        execution_fact.recovery_count
+                    ),
+                }
+                retry_deltas: dict[RetryKind, int] = {}
+                for kind, reported_count in reported_counts.items():
+                    observed_count = self._transcription_retry_counts[kind]
+                    if reported_count < observed_count:
+                        raise ValueError("转写聚合执行次数少于已记录内部操作")
+                    retry_deltas[kind] = reported_count - observed_count
+                sequence = self._append_event(
+                    level="info",
+                    event_code="transcription.execution_observed",
+                    stage=scope._stage,
+                    module=scope._module,
+                    message="语音识别的中性聚合执行事实已记录。",
+                    attributes={
+                        "recovery_count": execution_fact.recovery_count,
+                        "retry_count": execution_fact.retry_count,
+                    },
+                )
+                for kind, retry_delta in retry_deltas.items():
+                    self._retry_counts[kind] += retry_delta
+                self._transcription_execution = execution_fact
                 return sequence
             if fact._kind is _FactKind.SOURCE:
                 if operation is not None:
@@ -1261,6 +1340,11 @@ class RunDiagnostics:
             if self._postcommit_proof is not None:
                 raise RuntimeError("发布提交后不能开始新的诊断操作")
             self._assert_scope_active(scope)
+            if (
+                scope._stage is RunStage.TRANSCRIPTION
+                and self._transcription_execution is not None
+            ):
+                raise RuntimeError("转写聚合执行事实形成后不能开始内部操作")
             parent_operation_id = None
             if parent is not None:
                 if not isinstance(parent, DiagnosticOperation):
@@ -1320,6 +1404,16 @@ class RunDiagnostics:
         with self._lock:
             self._assert_open()
             self._assert_operation_active(operation)
+            if (
+                operation._scope._stage is RunStage.TRANSCRIPTION
+                and self._transcription_execution is not None
+            ):
+                raise RuntimeError("转写聚合执行事实形成后不能再安排内部重试")
+            if (
+                operation._scope._stage is RunStage.TRANSCRIPTION
+                and self._transcription_transcript_cache_hit
+            ):
+                raise ValueError("整场转写缓存命中时不得发生内部工作")
             if next_attempt != operation._last_attempt + 1:
                 raise ValueError("下一尝试序号必须严格递增")
             sequence = self._append_event(
@@ -1339,6 +1433,8 @@ class RunDiagnostics:
             )
             operation._last_attempt = next_attempt
             self._retry_counts[kind] += 1
+            if operation._scope._stage is RunStage.TRANSCRIPTION:
+                self._transcription_retry_counts[kind] += 1
             return sequence
 
     def _complete_operation(
