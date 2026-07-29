@@ -347,6 +347,7 @@ class _BusinessComputationFailed(RuntimeError):
 
 def _assert_business_computation_failure_is_not_reclassified(repository):
     entry = _text_entry()
+    token = CancellationSource().token
 
     def fail():
         raise _BusinessComputationFailed("业务端口失败")
@@ -354,9 +355,14 @@ def _assert_business_computation_failure_is_not_reclassified(repository):
     with pytest.raises(_BusinessComputationFailed, match="业务端口失败"):
         repository.resolve(
             entry,
-            cancellation=CancellationSource().token,
+            cancellation=token,
             compute=fail,
         )
+
+    assert (
+        repository.lookup(entry, cancellation=token).observation.outcome
+        is CacheOutcome.MISS
+    )
 
 
 def test_in_memory_repository_preserves_business_computation_failures():

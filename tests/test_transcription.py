@@ -215,6 +215,7 @@ def test_transcription_chunk_rejects_invalid_character_timing(
         "output.empty_with_speech",
         "output.text_invalid",
         "output.time_invalid",
+        "output.overlap_text_mismatch",
         "output.char_timing_invalid",
         "output.out_of_bounds",
     ],

@@ -315,6 +315,73 @@ def test_typed_transcription_failure_stops_before_planning_and_new_delivery(
     ).read_bytes()
 
 
+def test_incomplete_coverage_fails_the_run_without_partial_delivery_or_recovery_notice(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    Workspace.open(source, workspace)
+    sentinel = workspace / "delivery" / "existing.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    application = compose_deterministic_live_application(
+        transcription_script=DeterministicTranscriptionScript.fail(
+            TranscriptionFailure(
+                ErrorCode.TRANSCRIPTION_COVERAGE_INCOMPLETE,
+                execution_facts=ExecutionFacts(
+                    cache_use=CacheUse.MISS,
+                    recovery_count=2,
+                ),
+                diagnostics={
+                    "gap_count": 1,
+                    "gap_duration_ms": 15_000,
+                    "reason_code": "coverage.budget_exhausted",
+                },
+            )
+        )
+    )
+
+    outcome = application.execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.exit_code is ExitCode.EXTERNAL_SERVICE_FAILED
+    assert (
+        outcome.primary_error_code
+        is ErrorCode.TRANSCRIPTION_COVERAGE_INCOMPLETE
+    )
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert sorted(path.name for path in (workspace / "delivery").iterdir()) == [
+        "existing.txt"
+    ]
+    events = _events(workspace, outcome.run_id)
+    assert not any(
+        event["event_code"] == "stage.started"
+        and event["stage"] == "candidate_planning"
+        for event in events
+    )
+    assert not any(
+        event["event_code"] == "notice.recorded"
+        and event["attributes"]["kind"]
+        == "coverage_recovery_succeeded"
+        for event in events
+    )
+    manifest = json.loads(
+        (
+            workspace
+            / "work"
+            / "runs"
+            / str(outcome.run_id)
+            / "run.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert manifest["retries_and_recovery"]["coverage_recovery"] == 2
+    assert manifest["stages"]["candidate_planning"] == {
+        "status": "not_started"
+    }
+
+
 def test_invalid_transcription_output_stops_as_external_failure(
     tmp_path,
 ):

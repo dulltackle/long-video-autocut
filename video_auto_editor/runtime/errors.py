@@ -1081,6 +1081,7 @@ def _build_diagnostic_value_choices() -> Mapping[
                 "output.empty_with_speech",
                 "output.text_invalid",
                 "output.time_invalid",
+                "output.overlap_text_mismatch",
                 "output.char_timing_invalid",
                 "output.out_of_bounds",
             }
