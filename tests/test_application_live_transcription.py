@@ -315,6 +315,55 @@ def test_typed_transcription_failure_stops_before_planning_and_new_delivery(
     ).read_bytes()
 
 
+def test_invalid_transcription_output_stops_as_external_failure(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    Workspace.open(source, workspace)
+    sentinel = workspace / "delivery" / "existing.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    application = compose_deterministic_live_application(
+        transcription_script=DeterministicTranscriptionScript.succeed(
+            TranscriptionResult(
+                chunks=(
+                    TranscriptionChunk(
+                        start_ms=900,
+                        end_ms=1_001,
+                        text="越过素材末尾的供应商输出",
+                    ),
+                ),
+                speech_presence=SpeechPresence.PRESENT,
+                execution_facts=ExecutionFacts(
+                    cache_use=CacheUse.MISS
+                ),
+            )
+        )
+    )
+
+    outcome = application.execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.exit_code is ExitCode.EXTERNAL_SERVICE_FAILED
+    assert (
+        outcome.primary_error_code
+        is ErrorCode.TRANSCRIPTION_OUTPUT_INVALID
+    )
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert sorted(path.name for path in (workspace / "delivery").iterdir()) == [
+        "existing.txt"
+    ]
+    events = _events(workspace, outcome.run_id)
+    assert not any(
+        event["event_code"] == "stage.started"
+        and event["stage"] == "candidate_planning"
+        for event in events
+    )
+
+
 def test_transcription_cancellation_stops_before_planning_and_new_delivery(
     tmp_path,
 ):

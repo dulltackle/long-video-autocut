@@ -14,11 +14,12 @@ from video_auto_editor.runtime.cancellation import (
     CancellationRequested,
     CancellationSource,
 )
-from video_auto_editor.runtime.errors import ErrorCode
+from video_auto_editor.runtime.errors import ErrorCategory, ErrorCode
 from video_auto_editor.runtime.identity import RunId
 from video_auto_editor.source_analysis import SourceDescription
 from video_auto_editor.transcription import (
     CacheUse,
+    CharacterSpan,
     DeterministicSpeechRecognition,
     DeterministicTranscriptionScript,
     ExecutionFacts,
@@ -139,6 +140,99 @@ def test_transcription_failure_rejects_whole_transcript_cache_hit():
         )
 
 
+def test_transcription_result_rejects_empty_text_blocks_when_speech_is_present():
+    with pytest.raises(ValueError, match="确认存在语音"):
+        TranscriptionResult(
+            chunks=(),
+            speech_presence=SpeechPresence.PRESENT,
+            execution_facts=ExecutionFacts(cache_use=CacheUse.MISS),
+        )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_error", "message"),
+    [
+        (" \n ", ValueError, "正文不能为空"),
+        (object(), TypeError, "正文必须是字符串"),
+    ],
+)
+def test_transcription_chunk_rejects_invalid_supplier_text(
+    text,
+    expected_error,
+    message,
+):
+    with pytest.raises(expected_error, match=message):
+        TranscriptionChunk(start_ms=100, end_ms=200, text=text)
+
+
+@pytest.mark.parametrize(
+    ("start_ms", "end_ms", "expected_error", "message"),
+    [
+        (-1, 200, ValueError, "开始时间不能为负数"),
+        (200, 200, ValueError, "结束时间必须晚于开始时间"),
+        (100.0, 200, TypeError, "开始时间必须是整数毫秒"),
+    ],
+)
+def test_transcription_chunk_rejects_invalid_supplier_time(
+    start_ms,
+    end_ms,
+    expected_error,
+    message,
+):
+    with pytest.raises(expected_error, match=message):
+        TranscriptionChunk(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            text="无效时间",
+        )
+
+
+@pytest.mark.parametrize(
+    "character_spans",
+    [
+        (CharacterSpan(start_ms=100, end_ms=200),),
+        (
+            CharacterSpan(start_ms=100, end_ms=200),
+            CharacterSpan(start_ms=200, end_ms=301),
+        ),
+    ],
+)
+def test_transcription_chunk_rejects_invalid_character_timing(
+    character_spans,
+):
+    with pytest.raises(ValueError, match="逐字时间"):
+        TranscriptionChunk(
+            start_ms=100,
+            end_ms=300,
+            text="你🙂",
+            character_spans=character_spans,
+        )
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    [
+        "output.empty_with_speech",
+        "output.text_invalid",
+        "output.time_invalid",
+        "output.char_timing_invalid",
+        "output.out_of_bounds",
+    ],
+)
+def test_invalid_supplier_output_has_stable_external_failure(reason_code):
+    failure = TranscriptionFailure(
+        ErrorCode.TRANSCRIPTION_OUTPUT_INVALID,
+        execution_facts=ExecutionFacts(cache_use=CacheUse.MISS),
+        diagnostics={"reason_code": reason_code},
+    )
+
+    assert failure.category is ErrorCategory.EXTERNAL_SERVICE
+    assert failure.diagnostics == {"reason_code": reason_code}
+    assert failure.retryable_in_new_run is True
+    assert not hasattr(failure, "chunks")
+    assert not hasattr(failure, "partial_result")
+
+
 @pytest.mark.parametrize(
     ("result", "failure", "readiness"),
     [
@@ -227,6 +321,57 @@ def test_deterministic_speech_recognition_replays_success_without_external_io(
         run_workspace.close()
 
 
+def test_deterministic_speech_recognition_preserves_faithful_unicode_transcript(
+    tmp_path,
+):
+    request, run_workspace = _transcription_request(tmp_path)
+    faithful_text = " 嗯，e\u0301🙂 "
+    character_spans = tuple(
+        CharacterSpan(
+            start_ms=100 + index * 100,
+            end_ms=200 + index * 100,
+        )
+        for index in range(7)
+    )
+    scripted_result = TranscriptionResult(
+        chunks=(
+            TranscriptionChunk(
+                start_ms=100,
+                end_ms=800,
+                text=faithful_text,
+                character_spans=character_spans,
+            ),
+            TranscriptionChunk(
+                start_ms=800,
+                end_ms=1_000,
+                text="啊，保持原样",
+            ),
+        ),
+        speech_presence=SpeechPresence.PRESENT,
+        execution_facts=ExecutionFacts(cache_use=CacheUse.MISS),
+    )
+    recognition = DeterministicSpeechRecognition(
+        DeterministicTranscriptionScript.succeed(scripted_result)
+    )
+
+    try:
+        result = recognition.transcribe(request)
+
+        assert tuple(chunk.text for chunk in result.chunks) == (
+            " 嗯，e\u0301🙂 ",
+            "啊，保持原样",
+        )
+        assert len(faithful_text) == 7
+        assert len(result.chunks[0].character_spans or ()) == 7
+        assert result.chunks[1].character_spans is None
+        assert tuple(
+            (chunk.start_ms, chunk.end_ms) for chunk in result.chunks
+        ) == ((100, 800), (800, 1_000))
+    finally:
+        run_workspace.cleanup()
+        run_workspace.close()
+
+
 def test_deterministic_speech_recognition_raises_fresh_typed_failure_without_partial_result(
     tmp_path,
 ):
@@ -289,6 +434,91 @@ def test_deterministic_speech_recognition_returns_confirmed_absence(
         assert result is scripted_result
         assert result.speech_presence is SpeechPresence.ABSENT
         assert result.chunks == ()
+    finally:
+        run_workspace.cleanup()
+        run_workspace.close()
+
+
+def test_deterministic_speech_recognition_rejects_out_of_bounds_supplier_output(
+    tmp_path,
+):
+    request, run_workspace = _transcription_request(tmp_path)
+    recognition = DeterministicSpeechRecognition(
+        DeterministicTranscriptionScript.succeed(
+            TranscriptionResult(
+                chunks=(
+                    TranscriptionChunk(
+                        start_ms=900,
+                        end_ms=1_001,
+                        text="越过素材末尾的供应商输出",
+                    ),
+                ),
+                speech_presence=SpeechPresence.PRESENT,
+                execution_facts=ExecutionFacts(
+                    cache_use=CacheUse.MISS
+                ),
+            )
+        )
+    )
+
+    try:
+        with pytest.raises(TranscriptionFailure) as captured:
+            recognition.transcribe(request)
+
+        assert (
+            captured.value.error_code
+            is ErrorCode.TRANSCRIPTION_OUTPUT_INVALID
+        )
+        assert captured.value.diagnostics == {
+            "reason_code": "output.out_of_bounds"
+        }
+        assert not hasattr(captured.value, "chunks")
+        assert not hasattr(captured.value, "partial_result")
+    finally:
+        run_workspace.cleanup()
+        run_workspace.close()
+
+
+def test_deterministic_speech_recognition_rejects_unordered_supplier_output(
+    tmp_path,
+):
+    request, run_workspace = _transcription_request(tmp_path)
+    recognition = DeterministicSpeechRecognition(
+        DeterministicTranscriptionScript.succeed(
+            TranscriptionResult(
+                chunks=(
+                    TranscriptionChunk(
+                        start_ms=500,
+                        end_ms=700,
+                        text="较晚返回的文本块",
+                    ),
+                    TranscriptionChunk(
+                        start_ms=100,
+                        end_ms=300,
+                        text="较早返回的文本块",
+                    ),
+                ),
+                speech_presence=SpeechPresence.PRESENT,
+                execution_facts=ExecutionFacts(
+                    cache_use=CacheUse.MISS
+                ),
+            )
+        )
+    )
+
+    try:
+        with pytest.raises(TranscriptionFailure) as captured:
+            recognition.transcribe(request)
+
+        assert (
+            captured.value.error_code
+            is ErrorCode.TRANSCRIPTION_OUTPUT_INVALID
+        )
+        assert captured.value.diagnostics == {
+            "reason_code": "output.time_invalid"
+        }
+        assert not hasattr(captured.value, "chunks")
+        assert not hasattr(captured.value, "partial_result")
     finally:
         run_workspace.cleanup()
         run_workspace.close()

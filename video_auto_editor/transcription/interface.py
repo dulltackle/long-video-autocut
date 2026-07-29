@@ -369,10 +369,18 @@ def validate_result_for_source(
     previous_key: tuple[int, int] | None = None
     for chunk in result.chunks:
         if chunk.end_ms > source.duration_ms:
-            raise ValueError("转写文本块不得超出素材时长")
+            raise TranscriptionFailure(
+                ErrorCode.TRANSCRIPTION_OUTPUT_INVALID,
+                execution_facts=result.execution_facts,
+                diagnostics={"reason_code": "output.out_of_bounds"},
+            )
         key = (chunk.start_ms, chunk.end_ms)
         if previous_key is not None and key < previous_key:
-            raise ValueError("转写文本块必须按素材全局时间稳定排序")
+            raise TranscriptionFailure(
+                ErrorCode.TRANSCRIPTION_OUTPUT_INVALID,
+                execution_facts=result.execution_facts,
+                diagnostics={"reason_code": "output.time_invalid"},
+            )
         previous_key = key
 
 
