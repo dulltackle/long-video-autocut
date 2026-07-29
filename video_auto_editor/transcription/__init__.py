@@ -9,6 +9,7 @@ from .interface import (
     CharacterSpan,
     CompleteTranscript,
     ExecutionFacts,
+    ReadinessIssue,
     ReadinessReport,
     SpeechPresence,
     SpeechRecognition,
@@ -18,6 +19,10 @@ from .interface import (
     TranscriptionRequest,
     TranscriptionResult,
 )
+from .stepaudio import (
+    StepAudioSettings,
+    StepAudioSpeechRecognition,
+)
 
 __all__ = [
     "CacheUse",
@@ -26,9 +31,12 @@ __all__ = [
     "DeterministicSpeechRecognition",
     "DeterministicTranscriptionScript",
     "ExecutionFacts",
+    "ReadinessIssue",
     "ReadinessReport",
     "SpeechPresence",
     "SpeechRecognition",
+    "StepAudioSettings",
+    "StepAudioSpeechRecognition",
     "TranscriptChunk",
     "TranscriptionChunk",
     "TranscriptionFailure",

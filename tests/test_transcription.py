@@ -23,6 +23,7 @@ from video_auto_editor.transcription import (
     DeterministicSpeechRecognition,
     DeterministicTranscriptionScript,
     ExecutionFacts,
+    ReadinessIssue,
     ReadinessReport,
     SpeechPresence,
     SpeechRecognition,
@@ -91,6 +92,25 @@ def test_speech_recognition_interface_exposes_only_stage_inputs_and_neutral_fact
     assert forbidden_details.isdisjoint(
         TranscriptionResult.__dataclass_fields__
     )
+
+
+def test_readiness_report_contains_only_frozen_stable_issues():
+    source_diagnostics = {"capability": "transcription"}
+    issue = ReadinessIssue(
+        ErrorCode.CONFIG_CREDENTIAL_MISSING,
+        source_diagnostics,
+    )
+    source_diagnostics["capability"] = "topic_review"
+
+    report = ReadinessReport(ready=False, issues=(issue,))
+
+    assert report.issues == (issue,)
+    assert issue.error_code is ErrorCode.CONFIG_CREDENTIAL_MISSING
+    assert issue.diagnostics == {"capability": "transcription"}
+    with pytest.raises(TypeError):
+        issue.diagnostics["capability"] = "topic_review"
+    with pytest.raises(TypeError, match="ReadinessIssue"):
+        ReadinessReport(ready=False, issues=(object(),))
 
 
 @pytest.mark.parametrize(

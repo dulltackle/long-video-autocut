@@ -21,6 +21,7 @@ from video_auto_editor.transcription import (
     TranscriptionRequest,
 )
 from video_auto_editor.transcription._reconciliation import (
+    RecognitionBatch,
     RecognitionKind,
     RecognitionObservation,
     RecognitionWork,
@@ -154,6 +155,36 @@ def test_complete_transcription_partitions_core_and_keeps_one_real_equivalent_re
     assert result.speech_presence is SpeechPresence.PRESENT
     assert result.chunks == (source.measured_chunk,)
     assert result.chunks[0] is source.measured_chunk
+
+
+def test_complete_transcription_aggregates_successful_transport_retries():
+    chunk = TranscriptionChunk(
+        start_ms=1_000,
+        end_ms=9_000,
+        text="瞬时传输恢复后仍返回完整转写",
+    )
+
+    class _RetriedObservationSource:
+        def observe(self, works, cancellation):
+            cancellation.raise_if_cancelled()
+            return RecognitionBatch(
+                observations=(
+                    RecognitionObservation(work=works[0], chunks=(chunk,)),
+                ),
+                retry_count=1,
+            )
+
+    result = complete_transcription(
+        source_duration_ms=10_000,
+        confirmed_speech=(TimeInterval(1_000, 9_000),),
+        observation_source=_RetriedObservationSource(),
+        cancellation=CancellationSource(clock=lambda: 0.0).token,
+    )
+
+    assert result.execution_facts == ExecutionFacts(
+        cache_use=CacheUse.MISS,
+        retry_count=1,
+    )
 
 
 def test_equivalent_measured_sequences_prefer_edge_distance_not_chunk_count():
@@ -1312,8 +1343,12 @@ def test_failed_recovery_request_keeps_retry_and_attempt_facts():
             cancellation.raise_if_cancelled()
             self.calls += 1
             if self.calls == 1:
-                return tuple(
-                    RecognitionObservation(work=work, chunks=()) for work in works
+                return RecognitionBatch(
+                    observations=tuple(
+                        RecognitionObservation(work=work, chunks=())
+                        for work in works
+                    ),
+                    retry_count=1,
                 )
             raise provider_failure._fresh()
 
@@ -1332,7 +1367,42 @@ def test_failed_recovery_request_keeps_retry_and_attempt_facts():
     assert captured.value.diagnostics == {"reason_code": "service.server_error"}
     assert captured.value.execution_facts == ExecutionFacts(
         cache_use=CacheUse.MISS,
-        retry_count=2,
+        retry_count=3,
+        recovery_count=1,
+    )
+
+
+def test_no_progress_recovery_keeps_all_successful_retry_facts():
+    class _RetriedButEmptySource:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def observe(self, works, cancellation):
+            cancellation.raise_if_cancelled()
+            self.calls += 1
+            return RecognitionBatch(
+                observations=tuple(
+                    RecognitionObservation(work=work, chunks=()) for work in works
+                ),
+                retry_count=self.calls,
+            )
+
+    source = _RetriedButEmptySource()
+
+    with pytest.raises(TranscriptionFailure) as captured:
+        complete_transcription(
+            source_duration_ms=60_000,
+            confirmed_speech=(TimeInterval(0, 60_000),),
+            observation_source=source,
+            cancellation=CancellationSource(clock=lambda: 0.0).token,
+        )
+
+    assert source.calls == 2
+    assert captured.value.error_code is ErrorCode.TRANSCRIPTION_COVERAGE_INCOMPLETE
+    assert captured.value.diagnostics["reason_code"] == "coverage.no_progress"
+    assert captured.value.execution_facts == ExecutionFacts(
+        cache_use=CacheUse.MISS,
+        retry_count=3,
         recovery_count=1,
     )
 

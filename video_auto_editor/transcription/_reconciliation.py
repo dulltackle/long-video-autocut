@@ -102,6 +102,28 @@ class RecognitionObservation:
             raise TypeError("识别观察只能包含不可变转写文本块")
 
 
+@dataclass(frozen=True, slots=True)
+class RecognitionBatch:
+    """一次包内观察调用的结果与成功传输重试事实。"""
+
+    observations: tuple[RecognitionObservation, ...]
+    retry_count: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.observations, tuple) or any(
+            not isinstance(observation, RecognitionObservation)
+            for observation in self.observations
+        ):
+            raise TypeError("识别批次只能包含不可变识别观察")
+        if (
+            not isinstance(self.retry_count, int)
+            or isinstance(self.retry_count, bool)
+        ):
+            raise TypeError("识别批次传输重试次数必须是整数")
+        if self.retry_count < 0:
+            raise ValueError("识别批次传输重试次数不能为负数")
+
+
 class RecognitionObservationSource(Protocol):
     """生产 Adapter 与确定性假实现共同满足的包内请求端口。"""
 
@@ -109,7 +131,7 @@ class RecognitionObservationSource(Protocol):
         self,
         works: tuple[RecognitionWork, ...],
         cancellation: CancellationToken,
-    ) -> tuple[RecognitionObservation, ...]:
+    ) -> RecognitionBatch | tuple[RecognitionObservation, ...]:
         """执行请求并返回可乱序完成的一次独立观察。"""
         ...
 
@@ -246,14 +268,14 @@ def complete_transcription(
 
     primary = _plan_primary_work(source_duration_ms)
     cancellation.raise_if_cancelled()
-    observations = list(
-        _collect_observations(
-            observation_source,
-            primary,
-            cancellation,
-            source_duration_ms=source_duration_ms,
-        )
+    primary_batch = _collect_observations(
+        observation_source,
+        primary,
+        cancellation,
+        source_duration_ms=source_duration_ms,
     )
+    observations = list(primary_batch.observations)
+    retry_count = primary_batch.retry_count
     analysis = _analyze(speech, tuple(observations))
     cancellation.raise_if_cancelled()
     recovery_count = 0
@@ -272,6 +294,7 @@ def complete_transcription(
             raise _coverage_failure(
                 analysis,
                 reason_code="coverage.budget_exhausted",
+                retry_count=retry_count,
                 recovery_count=recovery_count,
             )
         works = tuple(
@@ -300,12 +323,14 @@ def complete_transcription(
                 cancellation,
                 source_duration_ms=source_duration_ms,
             )
-            observations.extend(recovered)
+            observations.extend(recovered.observations)
+            retry_count += recovered.retry_count
             updated = _analyze(speech, tuple(observations))
         except TranscriptionFailure as failure:
-            raise _with_added_recovery_count(
+            raise _with_added_execution_counts(
                 failure,
-                attempted_recovery_count,
+                additional_retry_count=retry_count,
+                additional_recovery_count=attempted_recovery_count,
             ) from failure
         recovery_count = attempted_recovery_count
         recovery_audio_ms = attempted_recovery_audio_ms
@@ -316,6 +341,7 @@ def complete_transcription(
             raise _coverage_failure(
                 updated,
                 reason_code="coverage.no_progress",
+                retry_count=retry_count,
                 recovery_count=recovery_count,
             )
         analysis = updated
@@ -325,6 +351,7 @@ def complete_transcription(
         speech_presence=SpeechPresence.PRESENT,
         execution_facts=ExecutionFacts(
             cache_use=CacheUse.MISS,
+            retry_count=retry_count,
             recovery_count=recovery_count,
         ),
     )
@@ -502,16 +529,25 @@ def _collect_observations(
     cancellation: CancellationToken,
     *,
     source_duration_ms: int,
-) -> tuple[RecognitionObservation, ...]:
+) -> RecognitionBatch:
     returned = source.observe(works, cancellation)
     cancellation.raise_if_cancelled()
-    if not isinstance(returned, tuple) or any(
-        not isinstance(observation, RecognitionObservation) for observation in returned
+    if isinstance(returned, RecognitionBatch):
+        observations = returned.observations
+        retry_count = returned.retry_count
+    elif isinstance(returned, tuple):
+        observations = returned
+        retry_count = 0
+    else:
+        raise _observation_protocol_failure()
+    if any(
+        not isinstance(observation, RecognitionObservation)
+        for observation in observations
     ):
         raise _observation_protocol_failure()
     expected = {work.sequence: work for work in works}
     actual: dict[int, RecognitionObservation] = {}
-    for observation in returned:
+    for observation in observations:
         sequence = observation.work.sequence
         if sequence in actual or expected.get(sequence) != observation.work:
             raise _observation_protocol_failure()
@@ -519,7 +555,10 @@ def _collect_observations(
         actual[sequence] = observation
     if actual.keys() != expected.keys():
         raise _observation_protocol_failure()
-    return tuple(actual[index] for index in sorted(actual))
+    return RecognitionBatch(
+        observations=tuple(actual[index] for index in sorted(actual)),
+        retry_count=retry_count,
+    )
 
 
 def _observation_protocol_failure() -> TranscriptionFailure:
@@ -530,17 +569,21 @@ def _observation_protocol_failure() -> TranscriptionFailure:
     )
 
 
-def _with_added_recovery_count(
+def _with_added_execution_counts(
     failure: TranscriptionFailure,
-    recovery_count: int,
+    *,
+    additional_retry_count: int,
+    additional_recovery_count: int,
 ) -> TranscriptionFailure:
     facts = failure.execution_facts
     return type(failure)(
         failure.error_code,
         execution_facts=ExecutionFacts(
             cache_use=facts.cache_use,
-            retry_count=facts.retry_count,
-            recovery_count=facts.recovery_count + recovery_count,
+            retry_count=facts.retry_count + additional_retry_count,
+            recovery_count=(
+                facts.recovery_count + additional_recovery_count
+            ),
         ),
         diagnostics=failure.diagnostics,
     )
@@ -1001,6 +1044,7 @@ def _coverage_failure(
     analysis: _Analysis,
     *,
     reason_code: str,
+    retry_count: int,
     recovery_count: int,
 ) -> TranscriptionFailure:
     regions = _merge_intervals(
@@ -1011,6 +1055,7 @@ def _coverage_failure(
         ErrorCode.TRANSCRIPTION_COVERAGE_INCOMPLETE,
         execution_facts=ExecutionFacts(
             cache_use=CacheUse.MISS,
+            retry_count=retry_count,
             recovery_count=recovery_count,
         ),
         diagnostics={

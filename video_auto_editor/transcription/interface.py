@@ -239,17 +239,47 @@ class CompleteTranscript:
 
 
 @dataclass(frozen=True, slots=True)
+class ReadinessIssue:
+    """准备检查发现的稳定、脱敏阻塞问题。"""
+
+    error_code: ErrorCode
+    diagnostics: Mapping[str, Any] | None = field(
+        default=None,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.error_code, ErrorCode):
+            raise TypeError("准备问题必须使用稳定 ErrorCode")
+        if self.diagnostics is not None and not isinstance(
+            self.diagnostics,
+            Mapping,
+        ):
+            raise TypeError("准备问题诊断必须是映射")
+        object.__setattr__(
+            self,
+            "diagnostics",
+            freeze_error_diagnostics(
+                self.error_code,
+                self.diagnostics,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ReadinessReport:
     """本地只读准备检查的完整快照。"""
 
     ready: bool
-    issues: tuple[object, ...] = ()
+    issues: tuple[ReadinessIssue, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.ready, bool):
             raise TypeError("准备状态必须是布尔值")
-        if not isinstance(self.issues, tuple):
-            raise TypeError("准备问题必须是不可变元组")
+        if not isinstance(self.issues, tuple) or any(
+            not isinstance(issue, ReadinessIssue) for issue in self.issues
+        ):
+            raise TypeError("准备问题必须是 ReadinessIssue 不可变元组")
         if self.ready == bool(self.issues):
             raise ValueError("准备状态必须与阻塞问题保持一致")
 
