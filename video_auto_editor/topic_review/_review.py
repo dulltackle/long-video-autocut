@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from video_auto_editor.cache import (
@@ -11,7 +12,11 @@ from video_auto_editor.cache import (
     CacheNamespace,
     CacheRepository,
 )
-from video_auto_editor.runtime.errors import ErrorCode, RunStage
+from video_auto_editor.runtime.errors import (
+    ErrorCode,
+    RunStage,
+    get_error_definition,
+)
 from video_auto_editor.runtime.identity import OperationId
 from video_auto_editor.text_model import (
     ObservationContext,
@@ -285,7 +290,10 @@ class TopicReview:
                 raise TopicReviewFailure(
                     error_code,
                     execution_facts=ledger.snapshot(),
-                    diagnostics=failure.diagnostics,
+                    diagnostics=_compatible_failure_diagnostics(
+                        error_code,
+                        failure.diagnostics,
+                    ),
                 ) from None
             ledger.model_request_count += 1
             ledger.transport_attempt_count += (
@@ -314,6 +322,20 @@ class TopicReview:
                     },
                 ) from None
         raise AssertionError("主题评审语义尝试循环必须产生终态")
+
+
+def _compatible_failure_diagnostics(
+    error_code: ErrorCode,
+    diagnostics: Mapping[str, object],
+) -> Mapping[str, object]:
+    definition = get_error_definition(error_code)
+    value_choices = definition.diagnostic_value_choices
+    return {
+        key: value
+        for key, value in diagnostics.items()
+        if key in definition.allowed_diagnostics
+        and (key not in value_choices or value in value_choices[key])
+    }
 
 
 def _semantic_retry_payload(
@@ -442,7 +464,6 @@ def _batch_payload(candidate_plan, batch) -> dict[str, object]:
                 "attribution": context.attribution,
                 "course_topic": context.course_topic,
                 "excluded_content": list(context.excluded_content),
-                "priority_topics": list(context.priority_topics),
             }
         ),
         "review_constraints": {

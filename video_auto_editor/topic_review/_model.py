@@ -125,6 +125,7 @@ class CandidateTopicReview:
         ):
             if not isinstance(required_text, str) or not required_text.strip():
                 raise ValueError(f"{field_name}不能为空")
+            _require_valid_unicode(required_text, field_name)
         for boolean_value, field_name in (
             (self.topic_complete, "主题完整性"),
             (self.needs_human_review, "人工复核标记"),
@@ -151,12 +152,15 @@ class CandidateTopicReview:
             for keyword in self.keywords
         ):
             raise ValueError("主题评审关键词必须是字符串元组")
+        for keyword in self.keywords:
+            _require_valid_unicode(keyword, "主题评审关键词")
         for optional_text, field_name in (
             (self.reject_reason, "淘汰原因"),
             (self.boundary_fix_suggestion, "边界补救建议"),
         ):
             if not isinstance(optional_text, str):
                 raise TypeError(f"{field_name}必须是字符串")
+            _require_valid_unicode(optional_text, field_name)
         for boundary_value, field_name in (
             (self.boundary_fix_start_ms, "边界补救开始时间"),
             (self.boundary_fix_end_ms, "边界补救结束时间"),
@@ -165,6 +169,13 @@ class CandidateTopicReview:
                 not isinstance(boundary_value, int) or isinstance(boundary_value, bool)
             ):
                 raise TypeError(f"{field_name}必须是整数毫秒或 None")
+
+
+def _require_valid_unicode(value: str, field_name: str) -> None:
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        raise ValueError(f"{field_name}必须是有效 Unicode 文本") from None
 
 
 @dataclass(frozen=True, slots=True)

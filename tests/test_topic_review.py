@@ -369,8 +369,8 @@ def test_review_sends_neighbor_context_course_context_and_constraints_once(
         "attribution": "示例课程",
         "course_topic": "结构化直播拆条",
         "excluded_content": ["广告口播"],
-        "priority_topics": ["第一主题"],
     }
+    assert "priority_topics" not in user_payload["course_context"]
     assert user_payload["review_constraints"] == {
         "max_duration_ms": 300_000,
         "min_duration_ms": 60_000,
@@ -561,6 +561,7 @@ def test_semantic_retry_exhaustion_raises_typed_failure_without_a_result(
         ("unknown_field", "output.structure_invalid"),
         ("duplicate_json_key", "output.structure_invalid"),
         ("non_finite_score", "output.structure_invalid"),
+        ("invalid_unicode_escape", "output.constraint_failed"),
         ("candidate_missing", "output.candidate_missing"),
         ("candidate_duplicate", "output.candidate_duplicate"),
         ("candidate_unknown", "output.candidate_unknown"),
@@ -599,6 +600,11 @@ def test_model_output_is_strictly_validated_at_the_public_review_seam(
         response = json.dumps(
             {"reviews": [{**review, "publish_ready_score": float("nan")}]},
             ensure_ascii=False,
+        )
+    elif case == "invalid_unicode_escape":
+        response = json.dumps(
+            {"reviews": [{**review, "topic_name": "\ud800"}]},
+            ensure_ascii=True,
         )
     elif case == "candidate_missing":
         response = '{"reviews":[]}'
@@ -758,6 +764,69 @@ def test_text_model_failure_is_translated_once_without_semantic_retry(
     assert failure.execution_facts.transport_attempt_count == 3
     assert failure.execution_facts.transport_retry_count == 2
     assert len(requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("diagnostics", "expected_diagnostics"),
+    [
+        (
+            {
+                "attempt": 1,
+                "http_status": 429,
+                "reason_code": "vendor.rate_limited",
+            },
+            {
+                "attempt": 1,
+                "http_status": 429,
+            },
+        ),
+        (
+            {
+                "attempt": 1,
+                "http_status": 503,
+                "reason_code": "rate_limit.requests",
+            },
+            {
+                "attempt": 1,
+                "reason_code": "rate_limit.requests",
+            },
+        ),
+    ],
+)
+def test_model_failure_translation_drops_incompatible_diagnostic_values(
+    tmp_path,
+    diagnostics,
+    expected_diagnostics,
+):
+    model_failure = TextModelFailure(
+        TextModelFailureKind.RATE_LIMITED,
+        execution_facts=TextModelExecutionFacts(
+            transport_attempt_count=1,
+            elapsed_ms=1,
+        ),
+        diagnostics=diagnostics,
+    )
+    model = _PayloadAwareTextModel(lambda _payload: model_failure)
+
+    with pytest.raises(TopicReviewFailure) as captured:
+        TopicReview(
+            model,
+            CacheRepository.in_memory(application_version="4.7.0"),
+            _review_settings(),
+        ).review(
+            TopicReviewRequest(
+                _candidate_plan(tmp_path, ("供应商原因码候选",)),
+                RunId.new(),
+                CancellationSource(clock=lambda: 0.0).token,
+            )
+        )
+
+    failure = captured.value
+    assert failure.error_code is ErrorCode.TOPIC_REVIEW_RATE_LIMITED
+    assert failure.diagnostics == expected_diagnostics
+    assert failure.execution_facts.model_request_count == 1
+    assert failure.execution_facts.transport_attempt_count == 1
+    assert len(model.requests) == 1
 
 
 @pytest.mark.parametrize(
@@ -951,6 +1020,58 @@ def test_same_business_input_uses_cache_without_reusing_run_local_ids(tmp_path):
     assert first_result.execution_facts.cache_miss_count == 1
     assert second_result.execution_facts.cache_hit_count == 1
     assert second_result.execution_facts.model_request_count == 0
+
+
+def test_priority_topics_stay_out_of_review_and_reuse_the_same_cache(tmp_path):
+    cache = CacheRepository.in_memory(application_version="4.7.0")
+    model = _PayloadAwareTextModel(_valid_response_for_batch)
+    reviewer = TopicReview(model, cache, _review_settings())
+    common_context = {
+        "course_topic": "重点主题只影响最终选择",
+        "attribution": "示例课程",
+        "excluded_content": [],
+    }
+    first_plan = _candidate_plan(
+        tmp_path,
+        ("相同候选正文",),
+        course_context={
+            **common_context,
+            "priority_topics": ["甲主题"],
+        },
+    )
+
+    first_result = reviewer.review(
+        TopicReviewRequest(
+            first_plan,
+            RunId.new(),
+            CancellationSource(clock=lambda: 0.0).token,
+        )
+    )
+    second_plan = _candidate_plan(
+        tmp_path,
+        ("相同候选正文",),
+        course_context={
+            **common_context,
+            "priority_topics": ["乙主题"],
+        },
+    )
+    second_result = reviewer.review(
+        TopicReviewRequest(
+            second_plan,
+            RunId.new(),
+            CancellationSource(clock=lambda: 0.0).token,
+        )
+    )
+
+    assert len(model.requests) == 1
+    payload = json.loads(model.requests[0].messages[1].content)
+    assert "priority_topics" not in payload["course_context"]
+    assert first_result.execution_facts.cache_miss_count == 1
+    assert second_result.execution_facts.cache_hit_count == 1
+    assert second_result.execution_facts.model_request_count == 0
+    assert (
+        second_result.reviews[0].candidate_id == second_plan.candidates[0].candidate_id
+    )
 
 
 def test_cache_selectively_invalidates_result_affecting_inputs(
