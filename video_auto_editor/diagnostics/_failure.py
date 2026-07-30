@@ -3,6 +3,9 @@
 from collections.abc import Mapping
 from types import MappingProxyType
 
+from video_auto_editor.runtime._classified_failure import (
+    PreservedApplicationFailure,
+)
 from video_auto_editor.runtime.errors import (
     ERROR_REGISTRY,
     ErrorCode,
@@ -12,7 +15,7 @@ from video_auto_editor.runtime.errors import (
 )
 
 
-class DiagnosticsFailure(RuntimeError):
+class DiagnosticsFailure(PreservedApplicationFailure):
     """不包含物理路径、异常文本或用户内容的诊断持久化失败。"""
 
     __slots__ = ("diagnostics", "error_code")
