@@ -1,346 +1,446 @@
-"""直播拆条产物解释器。
+"""skill 调度器的机器清单解释边界。
 
-只读 ``plan.json`` 与 ``metadata.json`` 产物，生成结构化解释结果，供调度器
-skill 渲染给用户。解释器不重新计算候选时间、不重新判定发布就绪，缺失 metadata
-时按计划态解释，不伪造已生成文件。
+本模块只投影已经由 CLI 底座形成的 ``run.json`` 与
+``delivery/manifest.json``。它不接收终端文本或进程退出码，也不重做
+媒体处理、主题判定、导出选择或交付判断。
 """
 
+from __future__ import annotations
+
+import errno
 import json
 import os
-import shlex
+import stat
+from pathlib import Path
+from typing import Any
+
+from video_auto_editor.delivery import (
+    DeliveryManifestReadReason,
+    DeliveryManifestReadResult,
+    DeliveryManifestReadState,
+    DeliveryManifestReader,
+    DeliveryManifestSummary,
+)
+from video_auto_editor.diagnostics import (
+    DiagnosticPackageReader,
+    DiagnosticPackageSnapshot,
+)
+from video_auto_editor.runtime.identity import RunId
+from video_auto_editor.runtime.result import ResultKind
 
 
-RUN_MODE_LABELS = {
-    "reviewed_export": "已评审且实际导出（reviewed 非 dry-run）",
-    "reviewed_dry_run": "已评审的 dry-run 方案（未导出视频）",
-    "unreviewed_no_export": "未评审、默认不导出",
-    "unreviewed_compatibility": "未评审兼容导出（--allow-unreviewed-export）",
-}
-
-REASON_LABELS = {
-    "duplicate": "与已选片段内容重复",
-    "missing_review": "缺少评审结论",
-    "needs_human_review": "评审标记需人工复核",
-    "boundary_fix_needs_human_review": "边界修复建议需人工确认",
-    "publish_ready_score_below_threshold": "发布就绪评分低于阈值",
-    "topic_incomplete": "主题不完整",
-    "max_clips_limit": "超出最大导出数量限制",
-    "unreviewed_export_not_allowed": "未评审且未允许兼容导出",
-    "legacy_score_not_selected": "旧评分未入选",
-}
-
-HUMAN_REVIEW_REASONS = {"needs_human_review", "boundary_fix_needs_human_review"}
+RunInterpretation = dict[str, Any]
 
 
-def load_artifacts(output_dir):
-    """读取产物目录中的 plan.json 与 metadata.json（存在时）。"""
-    plan = _read_json(os.path.join(output_dir, "plan.json"))
-    if plan is None:
-        raise ValueError(f"未找到 plan.json：{output_dir}")
-    metadata = _read_json(os.path.join(output_dir, "metadata.json"))
-    return plan, metadata
+class _ManifestSymlink(RuntimeError):
+    pass
 
 
-def interpret_output_dir(output_dir):
-    """读取产物目录并返回结构化解释结果。"""
-    plan, metadata = load_artifacts(output_dir)
-    return interpret_artifacts(plan, metadata)
+def interpret_run(
+    workspace_dir: str | Path,
+    run_id: str | RunId,
+) -> RunInterpretation:
+    """仅从指定运行的诊断清单与关联交付清单解释结果。
 
-
-def interpret_artifacts(plan, metadata=None):
-    """根据 plan.json 与可选 metadata.json 生成结构化解释。"""
-    plan = plan or {}
-    has_metadata = metadata is not None
-    run_mode = _run_mode(plan, has_metadata)
-
-    exports = _interpret_exports(plan, metadata)
-    not_exported = _interpret_not_exported(plan, metadata)
-    human_review = _interpret_human_review(exports, not_exported, metadata)
-    series = _interpret_series(exports, not_exported)
-    warnings = _interpret_warnings(plan)
-
-    return {
-        "run_mode": run_mode,
-        "run_mode_label": RUN_MODE_LABELS.get(run_mode, run_mode),
-        "status": plan.get("status", ""),
-        "source_video": plan.get("source_video", ""),
-        "publish_ready_threshold": plan.get("publish_ready_threshold"),
-        "exports_generated": has_metadata,
-        "export_count": len(exports),
-        "exports": exports,
-        "not_exported": not_exported,
-        "human_review": human_review,
-        "series": series,
-        "warnings": warnings,
-    }
-
-
-def _run_mode(plan, has_metadata):
-    status = plan.get("status")
-    export_mode = plan.get("export_mode")
-    dry_run = bool(plan.get("dry_run"))
-    if status == "reviewed":
-        if dry_run or not has_metadata:
-            return "reviewed_dry_run"
-        return "reviewed_export"
-    if export_mode == "unreviewed_compatibility":
-        return "unreviewed_compatibility"
-    return "unreviewed_no_export"
-
-
-def _interpret_exports(plan, metadata):
-    if metadata is not None:
-        if "clips" in metadata:
-            clips = metadata.get("clips") or []
-        else:
-            clips = metadata.get("exports") or []
-        return [_export_from_metadata(clip) for clip in clips]
-    return [_export_from_plan(item) for item in plan.get("exports", [])]
-
-
-def _export_from_metadata(clip):
-    return {
-        "index": clip.get("index", 0),
-        "title": clip.get("title") or "",
-        "topic_name": clip.get("topic_name") or "",
-        "publish_ready_score": clip.get("publish_ready_score"),
-        "final_start": clip.get("final_start"),
-        "final_end": clip.get("final_end"),
-        "video_path": clip.get("output_path") or "",
-        "subtitle_path": clip.get("subtitle_path") or "",
-        "series_key": clip.get("series_key") or "",
-        "needs_human_review": bool(clip.get("needs_human_review")),
-        "generated": True,
-    }
-
-
-def _export_from_plan(item):
-    selection = item.get("export_selection") or {}
-    return {
-        "index": item.get("export_index", 0),
-        "title": item.get("title") or "",
-        "topic_name": selection.get("topic_name") or "",
-        "publish_ready_score": selection.get("publish_ready_score"),
-        "final_start": selection.get("final_start"),
-        "final_end": selection.get("final_end"),
-        "video_path": item.get("video_path") or "",
-        "subtitle_path": item.get("subtitle_path") or "",
-        "series_key": selection.get("series_key") or "",
-        "needs_human_review": bool(selection.get("needs_human_review")),
-        "generated": bool(item.get("generated")),
-    }
-
-
-def _interpret_not_exported(plan, metadata):
-    if metadata is not None and metadata.get("not_exported") is not None:
-        return [_not_exported_entry(entry) for entry in metadata.get("not_exported", [])]
-    entries = []
-    for candidate in plan.get("candidates", []):
-        selection = candidate.get("export_selection")
-        if selection is None or selection.get("selected_for_export"):
-            continue
-        merged = dict(selection)
-        merged.setdefault("candidate_index", candidate.get("index"))
-        entries.append(_not_exported_entry(merged))
-    return entries
-
-
-def _not_exported_entry(entry):
-    reason = entry.get("reason") or ""
-    needs_human_review = bool(entry.get("needs_human_review")) or reason in HUMAN_REVIEW_REASONS
-    return {
-        "candidate_index": entry.get("candidate_index"),
-        "decision": entry.get("decision") or "",
-        "reason": reason,
-        "reason_label": REASON_LABELS.get(reason, reason or "未说明原因"),
-        "topic_name": entry.get("topic_name") or "",
-        "publish_ready_score": entry.get("publish_ready_score"),
-        "needs_human_review": needs_human_review,
-        "boundary_fix_suggestion": entry.get("boundary_fix_suggestion") or "",
-        "series_key": entry.get("series_key") or "",
-    }
-
-
-def _interpret_human_review(exports, not_exported, metadata):
-    items = []
-    for export in exports:
-        if export.get("needs_human_review"):
-            items.append(
-                {
-                    "source": "export",
-                    "index": export.get("index"),
-                    "title": export.get("title"),
-                    "topic_name": export.get("topic_name"),
-                    "boundary_fix_suggestion": "",
-                }
-            )
-    for entry in not_exported:
-        if entry.get("needs_human_review"):
-            items.append(
-                {
-                    "source": "not_exported",
-                    "index": entry.get("candidate_index"),
-                    "title": "",
-                    "topic_name": entry.get("topic_name"),
-                    "boundary_fix_suggestion": entry.get("boundary_fix_suggestion") or "",
-                }
-            )
-    return items
-
-
-def _interpret_series(exports, not_exported):
-    groups = {}
-    order = []
-    for export in exports:
-        _add_to_series(groups, order, export.get("series_key"), {
-            "type": "export",
-            "title": export.get("title"),
-            "index": export.get("index"),
-        })
-    for entry in not_exported:
-        _add_to_series(groups, order, entry.get("series_key"), {
-            "type": "not_exported",
-            "title": entry.get("topic_name") or "",
-            "index": entry.get("candidate_index"),
-        })
-    return [{"series_key": key, "items": groups[key]} for key in order if len(groups[key]) > 1]
-
-
-def _add_to_series(groups, order, series_key, item):
-    if not series_key:
-        return
-    if series_key not in groups:
-        groups[series_key] = []
-        order.append(series_key)
-    groups[series_key].append(item)
-
-
-def _interpret_warnings(plan):
-    return [{"message": str(message)} for message in plan.get("warnings", [])]
-
-
-def diagnose_run(
-    exit_code=0,
-    has_transcript=True,
-    plan=None,
-    warnings=None,
-    video_path="<video>",
-    output_dir="out/live",
-    work_dir="work/live",
-    context_file="out/live/course-context.json",
-):
-    """基于退出码、warnings 与缺失产物给出结构化失败诊断与二次运行建议。
-
-    诊断只解释既有信号，不臆造未在产物或退出码中体现的失败原因。
+    调用方必须传入已关联到本次 CLI 调用的 ``run_id``；本边界不通过
+    扫描历史运行目录或解析终端文本猜测运行归属。
     """
-    plan = plan or {}
-    warnings = list(warnings if warnings is not None else plan.get("warnings", []))
-    base_cmd = _base_command(video_path, output_dir, work_dir, context_file)
-
-    diagnoses = []
-
-    # 1. ASR 失败：进程异常退出且没有产出 transcript.srt，属于中止类失败。
-    if exit_code != 0 and not has_transcript:
-        diagnoses.append(
-            {
-                "category": "asr_failed",
-                "severity": "abort",
-                "detail": "未生成 transcript.srt，ASR 不可用或识别失败，处理已中止。",
-                "hint": "确认已设置 STEPFUN_API_KEY 且网络可达；或将 ASR provider 切换为本地 whisper 后重跑。",
-                "rerun_command": f"export STEPFUN_API_KEY=sk-...\n{base_cmd}",
-            }
+    expected_run_id = RunId(str(run_id))
+    workspace = Path(workspace_dir)
+    run_parts = ("work", "runs", str(expected_run_id))
+    try:
+        events = (
+            _read_managed_file(workspace, (*run_parts, "events.jsonl"))
+            or b""
         )
-        return diagnoses
+    except _ManifestSymlink:
+        return _interpret_corrupt_diagnostics(
+            workspace,
+            expected_run_id,
+            reason="event_log_symlink",
+        )
+    except OSError:
+        return _interpret_incomplete_diagnostics(
+            workspace,
+            expected_run_id,
+            reason="event_log_unreadable",
+        )
+    try:
+        manifest_bytes = _read_managed_file(
+            workspace,
+            (*run_parts, "run.json"),
+        )
+    except _ManifestSymlink:
+        return _interpret_corrupt_diagnostics(
+            workspace,
+            expected_run_id,
+            reason="manifest_symlink",
+        )
+    except OSError:
+        return _interpret_incomplete_diagnostics(
+            workspace,
+            expected_run_id,
+            reason="manifest_unreadable",
+        )
+    diagnostic_result = DiagnosticPackageReader.read(
+        DiagnosticPackageSnapshot(
+            events=events,
+            manifest=manifest_bytes,
+        )
+    )
 
-    status = plan.get("status")
-    export_count = plan.get("export_count", len(plan.get("exports", [])))
-
-    # 2. 评审降级：评审关闭、不可用或缺少 API Key，输出未评审方案。
-    if status == "unreviewed":
-        diagnoses.append(_review_degraded_diagnosis(warnings, base_cmd, video_path, output_dir, work_dir, context_file))
-
-    # 3. 评审成功但无发布就绪候选：正常结束、导出为空，而非失败。
-    elif status == "reviewed" and export_count == 0:
-        diagnoses.append(
-            {
-                "category": "no_publish_ready",
-                "severity": "info",
-                "detail": "评审完成但没有发布就绪候选，正常结束、导出为空，并非失败。",
-                "hint": "可降低发布就绪阈值或补充更优质的直播素材；如需先看完整方案，加 --dry-run 复跑。",
-                "rerun_command": f"{base_cmd} --dry-run",
-            }
+    if diagnostic_result.run_id not in {None, expected_run_id}:
+        return _interpret_corrupt_diagnostics(
+            workspace,
+            expected_run_id,
+            reason="run_id_directory_mismatch",
         )
 
-    # 4. 缺少课程上下文：评审质量下降提示（仅提示，不视为失败）。
-    if not _context_loaded(plan):
-        diagnoses.append(
-            {
-                "category": "missing_context",
-                "severity": "info",
-                "detail": "未提供课程上下文，主题评审缺少课程信息，可能影响标题与主题判定质量。",
-                "hint": "整理课程标题、讲师、重点主题等信息生成 --context-file 后重跑，可提升评审质量。",
-                "rerun_command": base_cmd,
-            }
+    diagnostic_state = diagnostic_result.state.value
+    diagnostic_reason = diagnostic_result.reason.value
+    if diagnostic_state == "corrupt":
+        return _interpret_corrupt_diagnostics(
+            workspace,
+            expected_run_id,
+            reason=diagnostic_reason,
+        )
+    if diagnostic_state == "incomplete":
+        return _interpret_incomplete_diagnostics(
+            workspace,
+            expected_run_id,
+            reason=diagnostic_reason,
         )
 
-    return diagnoses
+    assert manifest_bytes is not None
+    run_manifest = json.loads(manifest_bytes)
+    lifecycle = run_manifest["lifecycle"]
+    errors = run_manifest["errors"]
+    if lifecycle["outcome"] == "succeeded":
+        expected_result_kind = ResultKind(
+            lifecycle["result_kind"]["value"]
+        )
+        delivery_result = _read_delivery_manifest(
+            workspace,
+            expected_run_id,
+            expected_result_kind=expected_result_kind,
+        )
+        if delivery_result.state is not DeliveryManifestReadState.COMPLETE:
+            return _unknown_run_interpretation(
+                expected_run_id,
+                diagnostic_state=diagnostic_state,
+                diagnostic_reason=diagnostic_reason,
+                delivery_result=delivery_result,
+            )
+        return _successful_run_interpretation(
+            expected_run_id,
+            diagnostic_state=diagnostic_state,
+            diagnostic_reason=diagnostic_reason,
+            exit_code=lifecycle["exit_code"],
+            recovery_incomplete=errors["recovery_incomplete"],
+            delivery_result=delivery_result,
+        )
 
-
-def _review_degraded_diagnosis(warnings, base_cmd, video_path, output_dir, work_dir, context_file):
-    joined = " ".join(str(message) for message in warnings)
-    if "缺少 API Key" in joined:
-        detail = "主题评审因缺少 API Key 不可用，已输出未评审方案，默认不导出。"
-        hint = "设置 STEPFUN_API_KEY 后重跑以启用评审；或显式允许未评审兼容导出。"
-        rerun = f"export STEPFUN_API_KEY=sk-...\n{base_cmd}"
-    elif "已关闭" in joined:
-        detail = "主题评审已关闭，已输出未评审方案，默认不导出。"
-        hint = "启用 topic_review_enabled 并配置评审模型；或显式允许未评审兼容导出。"
-        rerun = _command_with_flag(video_path, output_dir, work_dir, context_file, "--allow-unreviewed-export")
-    elif "评审失败" in joined or "配置错误" in joined:
-        detail = "主题评审请求失败或配置错误，已降级输出未评审方案。"
-        hint = "检查评审模型配置与网络后重跑；或显式允许未评审兼容导出。"
-        rerun = f"{base_cmd}"
-    else:
-        detail = "评审未生效，已输出未评审方案，默认不导出。"
-        hint = "确认评审已启用且凭据齐备后重跑；或显式允许未评审兼容导出。"
-        rerun = f"{base_cmd}"
+    interruption = lifecycle["interruption"]
+    primary_error = errors["primary_error"]
     return {
-        "category": "review_degraded",
-        "severity": "degraded",
-        "detail": detail,
-        "hint": hint,
-        "rerun_command": rerun,
-        "compatibility_command": _command_with_flag(
-            video_path, output_dir, work_dir, context_file, "--allow-unreviewed-export"
+        "run_id": str(expected_run_id),
+        "diagnostics": {
+            "state": diagnostic_state,
+            "reason": diagnostic_reason,
+        },
+        "terminal_state": lifecycle["outcome"],
+        "exit_code": lifecycle["exit_code"],
+        "result_kind": None,
+        "interruption_signal": (
+            interruption["signal"]
+            if interruption["status"] == "available"
+            else None
         ),
+        "primary_error": (
+            _project_run_error(primary_error)
+            if primary_error.get("status") != "not_applicable"
+            else None
+        ),
+        "associated_errors": [
+            _project_run_error(error)
+            for error in errors["associated_errors"]
+        ],
+        "recovery_incomplete": errors["recovery_incomplete"],
+        "delivery_manifest": {
+            "state": "not_applicable",
+            "reason": "terminal_not_succeeded",
+        },
+        "delivery": None,
     }
 
 
-def _context_loaded(plan):
-    context = plan.get("context") or {}
-    return bool(context.get("loaded"))
+def _read_managed_file(
+    workspace: Path,
+    parts: tuple[str, ...],
+) -> bytes | None:
+    """通过逐级 ``openat`` 读取受管文件，全程不跟随符号链接。"""
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    directory_descriptors: list[int] = []
+    file_descriptor: int | None = None
+    try:
+        try:
+            root_descriptor = os.open(workspace, directory_flags)
+        except FileNotFoundError:
+            return None
+        except OSError as failure:
+            _raise_if_unsafe_path(failure)
+            raise
+        directory_descriptors.append(root_descriptor)
+
+        for component in parts[:-1]:
+            try:
+                descriptor = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=directory_descriptors[-1],
+                )
+            except FileNotFoundError:
+                return None
+            except OSError as failure:
+                _raise_if_unsafe_path(failure)
+                raise
+            directory_descriptors.append(descriptor)
+
+        try:
+            file_descriptor = os.open(
+                parts[-1],
+                file_flags,
+                dir_fd=directory_descriptors[-1],
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as failure:
+            _raise_if_unsafe_path(failure)
+            raise
+        if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+            raise _ManifestSymlink
+        stream = os.fdopen(file_descriptor, "rb")
+        file_descriptor = None
+        with stream:
+            return stream.read()
+    finally:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+        for descriptor in reversed(directory_descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
-def _base_command(video_path, output_dir, work_dir, context_file):
-    return (
-        f"video-auto-editor live {shlex.quote(video_path)} "
-        f"--output-dir {shlex.quote(output_dir)} "
-        f"--work-dir {shlex.quote(work_dir)} "
-        f"--context-file {shlex.quote(context_file)}"
+def _raise_if_unsafe_path(failure: OSError) -> None:
+    if failure.errno in {errno.ELOOP, errno.ENOTDIR}:
+        raise _ManifestSymlink from None
+
+
+def _read_delivery_manifest(
+    workspace: Path,
+    run_id: RunId,
+    *,
+    expected_result_kind: ResultKind | None = None,
+) -> DeliveryManifestReadResult:
+    try:
+        manifest = _read_managed_file(
+            workspace,
+            ("delivery", "manifest.json"),
+        )
+    except _ManifestSymlink:
+        return DeliveryManifestReadResult(
+            DeliveryManifestReadState.CORRUPT,
+            DeliveryManifestReadReason.MANIFEST_SYMLINK,
+            None,
+        )
+    except OSError:
+        return DeliveryManifestReadResult(
+            DeliveryManifestReadState.INCOMPLETE,
+            DeliveryManifestReadReason.MANIFEST_UNREADABLE,
+            None,
+        )
+    return DeliveryManifestReader.read(
+        manifest,
+        expected_run_id=run_id,
+        expected_result_kind=expected_result_kind,
     )
 
 
-def _command_with_flag(video_path, output_dir, work_dir, context_file, flag):
-    return f"{_base_command(video_path, output_dir, work_dir, context_file)} {flag}"
+def _interpret_incomplete_diagnostics(
+    workspace: Path,
+    run_id: RunId,
+    *,
+    reason: str,
+) -> RunInterpretation:
+    return _interpret_unresolved_diagnostics(
+        workspace,
+        run_id,
+        state="incomplete",
+        reason=reason,
+    )
 
 
-def _read_json(path):
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"{os.path.basename(path)} 不是合法 JSON：{exc.msg}") from exc
-    except (OSError, UnicodeDecodeError) as exc:
-        raise ValueError(f"无法读取产物文件 {os.path.basename(path)}：{exc}") from exc
+def _interpret_corrupt_diagnostics(
+    workspace: Path,
+    run_id: RunId,
+    *,
+    reason: str,
+) -> RunInterpretation:
+    return _interpret_unresolved_diagnostics(
+        workspace,
+        run_id,
+        state="corrupt",
+        reason=reason,
+    )
+
+
+def _interpret_unresolved_diagnostics(
+    workspace: Path,
+    run_id: RunId,
+    *,
+    state: str,
+    reason: str,
+) -> RunInterpretation:
+    delivery_result = _read_delivery_manifest(workspace, run_id)
+    if delivery_result.state is DeliveryManifestReadState.COMPLETE:
+        return _successful_run_interpretation(
+            run_id,
+            diagnostic_state=state,
+            diagnostic_reason=reason,
+            exit_code=None,
+            recovery_incomplete=None,
+            delivery_result=delivery_result,
+        )
+    return _unknown_run_interpretation(
+        run_id,
+        diagnostic_state=state,
+        diagnostic_reason=reason,
+        delivery_result=delivery_result,
+    )
+
+
+def _project_run_error(error: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "error_code": error["error_code"],
+        "safe_message": error["safe_message"],
+        "retryable_in_new_run": error["retryable_in_new_run"],
+        "operator_action": error["operator_action"],
+    }
+
+
+def _successful_run_interpretation(
+    run_id: RunId,
+    *,
+    diagnostic_state: str,
+    diagnostic_reason: str,
+    exit_code: int | None,
+    recovery_incomplete: bool | None,
+    delivery_result: DeliveryManifestReadResult,
+) -> RunInterpretation:
+    summary = delivery_result.summary
+    assert summary is not None
+    return {
+        "run_id": str(run_id),
+        "diagnostics": {
+            "state": diagnostic_state,
+            "reason": diagnostic_reason,
+        },
+        "terminal_state": "succeeded",
+        "exit_code": exit_code,
+        "result_kind": summary.result_kind.value,
+        "interruption_signal": None,
+        "primary_error": None,
+        "associated_errors": [],
+        "recovery_incomplete": recovery_incomplete,
+        "delivery_manifest": _project_delivery_manifest_state(
+            delivery_result
+        ),
+        "delivery": _project_delivery_summary(summary),
+    }
+
+
+def _unknown_run_interpretation(
+    run_id: RunId,
+    *,
+    diagnostic_state: str,
+    diagnostic_reason: str,
+    delivery_result: DeliveryManifestReadResult | None = None,
+    delivery_state: str | None = None,
+    delivery_reason: str | None = None,
+) -> RunInterpretation:
+    if delivery_result is not None:
+        delivery_manifest = _project_delivery_manifest_state(
+            delivery_result
+        )
+    else:
+        assert delivery_state is not None
+        assert delivery_reason is not None
+        delivery_manifest = {
+            "state": delivery_state,
+            "reason": delivery_reason,
+        }
+    return {
+        "run_id": str(run_id),
+        "diagnostics": {
+            "state": diagnostic_state,
+            "reason": diagnostic_reason,
+        },
+        "terminal_state": None,
+        "exit_code": None,
+        "result_kind": None,
+        "interruption_signal": None,
+        "primary_error": None,
+        "associated_errors": [],
+        "recovery_incomplete": None,
+        "delivery_manifest": delivery_manifest,
+        "delivery": None,
+    }
+
+
+def _project_delivery_manifest_state(
+    delivery_result: DeliveryManifestReadResult,
+) -> dict[str, str]:
+    return {
+        "state": delivery_result.state.value,
+        "reason": delivery_result.reason.value,
+    }
+
+
+def _project_delivery_summary(
+    summary: DeliveryManifestSummary,
+) -> dict[str, Any]:
+    return {
+        "manifest_path": "delivery/manifest.json",
+        "schema_version": "delivery_manifest.v1",
+        "run_id": str(summary.run_id),
+        "result_kind": summary.result_kind.value,
+        "application_version": summary.application_version,
+        "started_at": summary.started_at,
+        "published_at": summary.published_at,
+        "source": {
+            "sha256": summary.source_sha256,
+            "byte_length": summary.source_byte_length,
+            "duration_ms": summary.source_duration_ms,
+        },
+        "short_video_count": summary.short_video_count,
+        "file_count": summary.file_count,
+    }
+
+
+__all__ = ["RunInterpretation", "interpret_run"]

@@ -777,6 +777,52 @@ def test_verification_rejects_a_business_id_with_the_wrong_type_prefix(
     }
 
 
+def test_verification_preserves_manifest_identity_error_classification(
+    empty_delivery,
+):
+    unverified, _run_workspace, staging = empty_delivery
+    manifest_path = staging / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["documents"]["transcript"]["transcript_id"] = "not-an-id"
+    manifest_path.write_bytes(_json_bytes(manifest))
+
+    with pytest.raises(DeliveryVerificationFailure) as captured:
+        DeliveryVerification.verify(
+            unverified,
+            CancellationSource().token,
+        )
+
+    assert dict(captured.value.diagnostics) == {
+        "operation": "delivery.verify_references",
+        "artifact_role": "delivery_manifest",
+        "reason_code": "verification.identity_invalid",
+    }
+
+
+def test_verification_preserves_manifest_reference_error_classification(
+    empty_delivery,
+):
+    unverified, _run_workspace, staging = empty_delivery
+    manifest_path = staging / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["documents"]["transcript_rendering"]["transcript_id"] = (
+        "transcript_99999999-9999-4999-8999-999999999999"
+    )
+    manifest_path.write_bytes(_json_bytes(manifest))
+
+    with pytest.raises(DeliveryVerificationFailure) as captured:
+        DeliveryVerification.verify(
+            unverified,
+            CancellationSource().token,
+        )
+
+    assert dict(captured.value.diagnostics) == {
+        "operation": "delivery.verify_references",
+        "artifact_role": "delivery_manifest",
+        "reason_code": "verification.reference_dangling",
+    }
+
+
 def test_verification_rejects_a_duplicate_typed_business_id(
     clips_delivery,
 ):

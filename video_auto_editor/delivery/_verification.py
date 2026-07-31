@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, DecimalException
+from enum import Enum
 from time import monotonic
 from typing import Any
 
@@ -32,6 +33,7 @@ from video_auto_editor.runtime.identity import (
     TranscriptChunkId,
     TranscriptId,
 )
+from video_auto_editor.runtime.result import ResultKind
 from video_auto_editor.workspace import (
     ManagedBinaryFile,
     ManagedDirectoryCapability,
@@ -203,6 +205,200 @@ class _SchemaInvalid(ValueError):
     pass
 
 
+class _NonFiniteJsonNumber(ValueError):
+    pass
+
+
+class _DeliveryManifestParseFailure(ValueError):
+    __slots__ = ("reason",)
+
+    def __init__(self, reason: "DeliveryManifestReadReason") -> None:
+        self.reason = reason
+        super().__init__(reason.value)
+
+
+class DeliveryManifestReadState(str, Enum):
+    """交付运行清单的封闭读取状态。"""
+
+    COMPLETE = "complete"
+    INCOMPLETE = "incomplete"
+    CORRUPT = "corrupt"
+
+
+class DeliveryManifestReadReason(str, Enum):
+    """不回显清单正文或解析异常的稳定读取原因。"""
+
+    VALID = "valid"
+    MANIFEST_MISSING = "manifest_missing"
+    MANIFEST_UNREADABLE = "manifest_unreadable"
+    MANIFEST_SYMLINK = "manifest_symlink"
+    MANIFEST_ENCODING_INVALID = "manifest_encoding_invalid"
+    MANIFEST_JSON_INVALID = "manifest_json_invalid"
+    MANIFEST_DUPLICATE_FIELD = "manifest_duplicate_field"
+    MANIFEST_NON_FINITE_NUMBER = "manifest_non_finite_number"
+    MANIFEST_SCHEMA_INVALID = "manifest_schema_invalid"
+    MANIFEST_RUN_ID_MISMATCH = "manifest_run_id_mismatch"
+    MANIFEST_RESULT_KIND_MISMATCH = "manifest_result_kind_mismatch"
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryManifestSummary:
+    """只投影交付运行清单中的长期审计摘要。"""
+
+    run_id: RunId
+    result_kind: ResultKind
+    application_version: str
+    started_at: str
+    published_at: str
+    source_sha256: str
+    source_byte_length: int
+    source_duration_ms: int
+    short_video_count: int
+    file_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryManifestReadResult:
+    """严格读取交付运行清单后的封闭结果。"""
+
+    state: DeliveryManifestReadState
+    reason: DeliveryManifestReadReason
+    summary: DeliveryManifestSummary | None
+
+
+class DeliveryManifestReader:
+    """复用交付验证 schema，只读取可长期审计的清单摘要。"""
+
+    __slots__ = ()
+
+    @classmethod
+    def read(
+        cls,
+        manifest: bytes | None,
+        *,
+        expected_run_id: RunId,
+        expected_result_kind: ResultKind | None = None,
+    ) -> DeliveryManifestReadResult:
+        if manifest is not None and not isinstance(manifest, bytes):
+            raise TypeError("交付运行清单快照必须是 bytes 或 None")
+        if not isinstance(expected_run_id, RunId):
+            raise TypeError("交付运行清单必须绑定 RunId")
+        if expected_result_kind is not None and not isinstance(
+            expected_result_kind,
+            ResultKind,
+        ):
+            raise TypeError("预期交付结果必须使用 ResultKind")
+        if manifest is None:
+            return DeliveryManifestReadResult(
+                DeliveryManifestReadState.INCOMPLETE,
+                DeliveryManifestReadReason.MANIFEST_MISSING,
+                None,
+            )
+        try:
+            document = _parse_delivery_manifest_bytes(manifest)
+        except _DeliveryManifestParseFailure as failure:
+            return _corrupt_delivery_manifest(failure.reason)
+        try:
+            _validate_manifest_paths(document)
+        except DeliveryVerificationFailure:
+            return _corrupt_delivery_manifest(
+                DeliveryManifestReadReason.MANIFEST_SCHEMA_INVALID
+            )
+        try:
+            _validate_manifest_summary_identities(document)
+        except _SchemaInvalid:
+            return _corrupt_delivery_manifest(
+                DeliveryManifestReadReason.MANIFEST_SCHEMA_INVALID
+            )
+        if not _manifest_result_summary_is_consistent(document):
+            return _corrupt_delivery_manifest(
+                DeliveryManifestReadReason.MANIFEST_SCHEMA_INVALID
+            )
+        if document["run_id"] != str(expected_run_id):
+            return _corrupt_delivery_manifest(
+                DeliveryManifestReadReason.MANIFEST_RUN_ID_MISMATCH
+            )
+        result_kind = ResultKind(document["result_kind"])
+        if (
+            expected_result_kind is not None
+            and result_kind is not expected_result_kind
+        ):
+            return _corrupt_delivery_manifest(
+                DeliveryManifestReadReason.MANIFEST_RESULT_KIND_MISMATCH
+            )
+        source = document["source"]
+        execution = document["execution"]["subtitle_optimization"]
+        return DeliveryManifestReadResult(
+            DeliveryManifestReadState.COMPLETE,
+            DeliveryManifestReadReason.VALID,
+            DeliveryManifestSummary(
+                run_id=expected_run_id,
+                result_kind=result_kind,
+                application_version=document["application_version"],
+                started_at=document["started_at"],
+                published_at=document["published_at"],
+                source_sha256=source["sha256"],
+                source_byte_length=source["byte_length"],
+                source_duration_ms=source["duration_ms"],
+                short_video_count=execution["short_video_count"],
+                file_count=len(document["files"]),
+            ),
+        )
+
+
+def _reject_non_finite_json_number(_value: str) -> None:
+    raise _NonFiniteJsonNumber
+
+
+def _corrupt_delivery_manifest(
+    reason: DeliveryManifestReadReason,
+) -> DeliveryManifestReadResult:
+    return DeliveryManifestReadResult(
+        DeliveryManifestReadState.CORRUPT,
+        reason,
+        None,
+    )
+
+
+def _parse_delivery_manifest_bytes(
+    manifest: bytes,
+) -> dict[str, Any]:
+    """严格解析并验证交付运行清单的共享 schema 部分。"""
+    try:
+        document = json.loads(
+            manifest,
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_non_finite_json_number,
+        )
+    except UnicodeDecodeError:
+        raise _DeliveryManifestParseFailure(
+            DeliveryManifestReadReason.MANIFEST_ENCODING_INVALID
+        ) from None
+    except _DuplicateJsonField:
+        raise _DeliveryManifestParseFailure(
+            DeliveryManifestReadReason.MANIFEST_DUPLICATE_FIELD
+        ) from None
+    except _NonFiniteJsonNumber:
+        raise _DeliveryManifestParseFailure(
+            DeliveryManifestReadReason.MANIFEST_NON_FINITE_NUMBER
+        ) from None
+    except (ValueError, RecursionError):
+        raise _DeliveryManifestParseFailure(
+            DeliveryManifestReadReason.MANIFEST_JSON_INVALID
+        ) from None
+    if not isinstance(document, dict) or set(document) != _MANIFEST_FIELDS:
+        raise _DeliveryManifestParseFailure(
+            DeliveryManifestReadReason.MANIFEST_SCHEMA_INVALID
+        )
+    try:
+        _validate_manifest_schema(document)
+    except _SchemaInvalid:
+        raise _DeliveryManifestParseFailure(
+            DeliveryManifestReadReason.MANIFEST_SCHEMA_INVALID
+        ) from None
+    return document
+
+
 class DeliveryVerification:
     """验证标准交付物并签发只可由本模块形成的发布能力。"""
 
@@ -237,25 +433,8 @@ class DeliveryVerification:
             artifact_role="delivery_manifest",
         )
         try:
-            manifest = json.loads(
-                manifest_bytes,
-                object_pairs_hook=_strict_json_object,
-            )
-        except (ValueError, RecursionError):
-            raise _verification_failure(
-                operation="delivery.verify_schema",
-                artifact_role="delivery_manifest",
-                reason_code="verification.schema_invalid",
-            ) from None
-        if not isinstance(manifest, dict) or set(manifest) != _MANIFEST_FIELDS:
-            raise _verification_failure(
-                operation="delivery.verify_schema",
-                artifact_role="delivery_manifest",
-                reason_code="verification.schema_invalid",
-            )
-        try:
-            _validate_manifest_schema(manifest)
-        except _SchemaInvalid:
+            manifest = _parse_delivery_manifest_bytes(manifest_bytes)
+        except _DeliveryManifestParseFailure:
             raise _verification_failure(
                 operation="delivery.verify_schema",
                 artifact_role="delivery_manifest",
@@ -646,7 +825,6 @@ def _validate_manifest_schema(manifest: dict[str, Any]) -> None:
             _string(document["transcript_id"], nonempty=True)
         if "plan_id" in fields:
             _string(document["plan_id"], nonempty=True)
-
     execution = _object(
         manifest["execution"],
         frozenset({"subtitle_optimization"}),
@@ -683,6 +861,25 @@ def _validate_manifest_schema(manifest: dict[str, Any]) -> None:
         _nonnegative_integer(artifact["byte_length"])
         if _SHA256.fullmatch(_string(artifact["sha256"])) is None:
             raise _SchemaInvalid
+
+
+def _validate_manifest_summary_identities(
+    manifest: dict[str, Any],
+) -> None:
+    documents = manifest["documents"]
+    try:
+        RunId(manifest["run_id"])
+        transcript_id = TranscriptId(
+            documents["transcript"]["transcript_id"]
+        )
+        rendering_transcript_id = TranscriptId(
+            documents["transcript_rendering"]["transcript_id"]
+        )
+        PlanId(documents["plan"]["plan_id"])
+    except ValueError:
+        raise _SchemaInvalid from None
+    if transcript_id != rendering_transcript_id:
+        raise _SchemaInvalid
 
 
 def _validate_manifest_paths(manifest: dict[str, Any]) -> None:
@@ -1439,6 +1636,8 @@ def _validate_result_kind(
     plan: dict[str, Any],
     metadata: dict[str, Any],
 ) -> None:
+    if not _manifest_result_summary_is_consistent(manifest):
+        raise _result_kind_failure("delivery_manifest")
     result_kind = manifest["result_kind"]
     if {
         result_kind,
@@ -1469,6 +1668,22 @@ def _validate_result_kind(
             raise _result_kind_failure("delivery_manifest")
     elif not published_candidates or not short_videos:
         raise _result_kind_failure("delivery_manifest")
+
+
+def _manifest_result_summary_is_consistent(
+    manifest: dict[str, Any],
+) -> bool:
+    counts = manifest["execution"]["subtitle_optimization"]
+    short_video_count = counts["short_video_count"]
+    media_count = sum(
+        artifact["role"] == "short_video_media"
+        for artifact in manifest["files"]
+    )
+    if short_video_count != media_count:
+        return False
+    if manifest["result_kind"] == "empty":
+        return not any(counts.values())
+    return short_video_count > 0
 
 
 def _result_kind_failure(
