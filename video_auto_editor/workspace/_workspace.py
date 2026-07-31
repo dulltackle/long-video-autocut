@@ -7,6 +7,7 @@
 import ctypes
 import errno
 import fcntl
+import hashlib
 import os
 import secrets
 import stat
@@ -25,6 +26,8 @@ from video_auto_editor.runtime.identity import RunId
 from ._capability import (
     ManagedDirectoryCapability,
     ManagedDirectoryRole,
+    ManagedTreeEntry,
+    ManagedTreeEntryKind,
     _claim_workspace_issuer,
     _ManagedOperations,
 )
@@ -121,6 +124,17 @@ class _CreatedEntry:
     name: str
     identity: _Identity
     is_directory: bool
+
+
+_TreeStatSnapshot = tuple[int, int, int, int, int, int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _ManagedTreeSnapshot:
+    name: str
+    kind: ManagedTreeEntryKind
+    status: _TreeStatSnapshot
+    children: tuple["_ManagedTreeSnapshot", ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -761,6 +775,241 @@ class Workspace:
             if descriptor >= 0:
                 os.close(descriptor)
         self._validate_lease_root(root_descriptor)
+
+    def _inspect_managed_tree(
+        self,
+        root_descriptor: int,
+        base_parts: tuple[str, ...],
+        base_identities: tuple[_Identity, ...],
+    ) -> tuple[ManagedTreeEntry, ...]:
+        _validate_effect_parts(base_parts, allow_empty=False)
+        self._validate_lease_root(root_descriptor)
+        descriptor = -1
+        try:
+            descriptor = _open_bound_directory(
+                root_descriptor,
+                base_parts,
+                base_identities,
+                expected_mount_id=self._layout.mount_id,
+            )
+            snapshot = self._inspect_managed_tree_directory(
+                descriptor,
+                name="",
+            )
+            self._revalidate_managed_tree_directory(
+                descriptor,
+                snapshot,
+            )
+            self._revalidate_managed_parent(
+                root_descriptor,
+                base_parts,
+                base_identities,
+                (),
+                descriptor,
+            )
+            entries: list[ManagedTreeEntry] = []
+            _append_managed_tree_entries(snapshot, (), entries)
+            return tuple(
+                sorted(entries, key=lambda entry: entry.relative_path)
+            )
+        except WorkspaceFailure:
+            raise
+        except PermissionError as exc:
+            raise _workspace_access_failure(
+                "workspace.permission_denied"
+            ) from exc
+        except RecursionError as exc:
+            raise _workspace_access_failure(
+                "workspace.ownership_changed"
+            ) from exc
+        except OSError as exc:
+            raise _workspace_access_failure("workspace.io_failed") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def _inspect_managed_tree_directory(
+        self,
+        descriptor: int,
+        *,
+        name: str,
+    ) -> _ManagedTreeSnapshot:
+        opened_status = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened_status.st_mode)
+            or _descriptor_mount_id(descriptor) != self._layout.mount_id
+        ):
+            raise _workspace_access_failure(
+                "workspace.ownership_changed"
+            )
+        expected_status = _tree_stat_snapshot(opened_status)
+        names = _managed_tree_names(descriptor)
+        children: list[_ManagedTreeSnapshot] = []
+        for child_name in names:
+            child_status = _managed_tree_entry_status(
+                descriptor,
+                child_name,
+            )
+            if stat.S_ISLNK(child_status.st_mode):
+                raise _workspace_access_failure(
+                    "workspace.symlink_encountered"
+                )
+            if stat.S_ISREG(child_status.st_mode):
+                if child_status.st_nlink != 1:
+                    raise _workspace_access_failure(
+                        "workspace.ownership_changed"
+                    )
+                child_descriptor = _open_managed_tree_file(
+                    descriptor,
+                    child_name,
+                    child_status,
+                    expected_mount_id=self._layout.mount_id,
+                )
+                try:
+                    stable_status = os.fstat(child_descriptor)
+                    _assert_managed_tree_name_snapshot(
+                        descriptor,
+                        child_name,
+                        _tree_stat_snapshot(stable_status),
+                    )
+                    children.append(
+                        _ManagedTreeSnapshot(
+                            name=child_name,
+                            kind=ManagedTreeEntryKind.REGULAR_FILE,
+                            status=_tree_stat_snapshot(stable_status),
+                        )
+                    )
+                finally:
+                    os.close(child_descriptor)
+                continue
+            if stat.S_ISDIR(child_status.st_mode):
+                child_descriptor = _open_managed_tree_directory(
+                    descriptor,
+                    child_name,
+                    child_status,
+                    expected_mount_id=self._layout.mount_id,
+                )
+                try:
+                    child_snapshot = self._inspect_managed_tree_directory(
+                        child_descriptor,
+                        name=child_name,
+                    )
+                    if _tree_stat_snapshot(
+                        os.fstat(child_descriptor)
+                    ) != child_snapshot.status:
+                        raise _workspace_access_failure(
+                            "workspace.ownership_changed"
+                        )
+                    _assert_managed_tree_name_snapshot(
+                        descriptor,
+                        child_name,
+                        child_snapshot.status,
+                    )
+                    children.append(child_snapshot)
+                finally:
+                    os.close(child_descriptor)
+                continue
+            raise _workspace_access_failure(
+                "workspace.ownership_changed"
+            )
+        if (
+            _managed_tree_names(descriptor) != names
+            or _tree_stat_snapshot(os.fstat(descriptor)) != expected_status
+        ):
+            raise _workspace_access_failure(
+                "workspace.ownership_changed"
+            )
+        return _ManagedTreeSnapshot(
+            name=name,
+            kind=ManagedTreeEntryKind.DIRECTORY,
+            status=expected_status,
+            children=tuple(children),
+        )
+
+    def _revalidate_managed_tree_directory(
+        self,
+        descriptor: int,
+        snapshot: _ManagedTreeSnapshot,
+    ) -> None:
+        if (
+            snapshot.kind is not ManagedTreeEntryKind.DIRECTORY
+            or _tree_stat_snapshot(os.fstat(descriptor)) != snapshot.status
+            or _descriptor_mount_id(descriptor) != self._layout.mount_id
+        ):
+            raise _workspace_access_failure(
+                "workspace.ownership_changed"
+            )
+        expected_names = tuple(child.name for child in snapshot.children)
+        if _managed_tree_names(descriptor) != expected_names:
+            raise _workspace_access_failure(
+                "workspace.ownership_changed"
+            )
+        for child in snapshot.children:
+            child_status = _managed_tree_entry_status(
+                descriptor,
+                child.name,
+            )
+            if stat.S_ISLNK(child_status.st_mode):
+                raise _workspace_access_failure(
+                    "workspace.symlink_encountered"
+                )
+            if _tree_stat_snapshot(child_status) != child.status:
+                raise _workspace_access_failure(
+                    "workspace.ownership_changed"
+                )
+            if child.kind is ManagedTreeEntryKind.REGULAR_FILE:
+                child_descriptor = _open_managed_tree_file(
+                    descriptor,
+                    child.name,
+                    child_status,
+                    expected_mount_id=self._layout.mount_id,
+                )
+                try:
+                    if (
+                        _tree_stat_snapshot(os.fstat(child_descriptor))
+                        != child.status
+                    ):
+                        raise _workspace_access_failure(
+                            "workspace.ownership_changed"
+                        )
+                    _assert_managed_tree_name_snapshot(
+                        descriptor,
+                        child.name,
+                        child.status,
+                    )
+                finally:
+                    os.close(child_descriptor)
+                continue
+            if child.kind is ManagedTreeEntryKind.DIRECTORY:
+                child_descriptor = _open_managed_tree_directory(
+                    descriptor,
+                    child.name,
+                    child_status,
+                    expected_mount_id=self._layout.mount_id,
+                )
+                try:
+                    self._revalidate_managed_tree_directory(
+                        child_descriptor,
+                        child,
+                    )
+                    _assert_managed_tree_name_snapshot(
+                        descriptor,
+                        child.name,
+                        child.status,
+                    )
+                finally:
+                    os.close(child_descriptor)
+                continue
+            raise _workspace_access_failure(
+                "workspace.ownership_changed"
+            )
+        if (
+            _managed_tree_names(descriptor) != expected_names
+            or _tree_stat_snapshot(os.fstat(descriptor)) != snapshot.status
+        ):
+            raise _workspace_access_failure(
+                "workspace.ownership_changed"
+            )
 
     def _open_managed_file(
         self,
@@ -1776,6 +2025,28 @@ class _LeaseGuard:
                 )
             )
 
+        def inspect_tree() -> tuple[ManagedTreeEntry, ...]:
+            try:
+                return self._execute(
+                    lambda root_descriptor: (
+                        self._workspace._inspect_managed_tree(
+                            root_descriptor,
+                            base_parts,
+                            base_identities,
+                        )
+                    )
+                )
+            except WorkspaceFailure:
+                raise
+            except PermissionError as exc:
+                raise _workspace_access_failure(
+                    "workspace.permission_denied"
+                ) from exc
+            except OSError as exc:
+                raise _workspace_access_failure(
+                    "workspace.io_failed"
+                ) from exc
+
         def publish_file(
             relative_parts: tuple[str, ...],
             contents: bytes,
@@ -1850,6 +2121,7 @@ class _LeaseGuard:
             publish_file=publish_file,
             validate_directory=validate_directory,
             make_directory=make_directory,
+            inspect_tree=inspect_tree,
             use_exclusive_lock=use_exclusive_lock,
             quarantine_file=quarantine_file,
             workspace_identity=workspace_identity,
@@ -3398,6 +3670,207 @@ def _directory_names(descriptor: int) -> list[str]:
             return [entry.name for entry in entries]
     finally:
         os.close(scan_descriptor)
+
+
+def _managed_tree_names(descriptor: int) -> tuple[str, ...]:
+    names = _directory_names(descriptor)
+    try:
+        for name in names:
+            status = _managed_tree_entry_status(descriptor, name)
+            if stat.S_ISLNK(status.st_mode):
+                raise _workspace_access_failure(
+                    "workspace.symlink_encountered"
+                )
+            _validate_effect_parts((name,), allow_empty=False)
+    except (UnicodeError, ValueError) as exc:
+        raise _workspace_access_failure(
+            "workspace.ownership_changed"
+        ) from exc
+    return tuple(sorted(names))
+
+
+def _managed_tree_entry_status(
+    parent_descriptor: int,
+    name: str,
+) -> os.stat_result:
+    try:
+        return os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise _managed_tree_component_failure(
+            parent_descriptor,
+            name,
+            exc,
+        ) from exc
+
+
+def _open_managed_tree_file(
+    parent_descriptor: int,
+    name: str,
+    before_status: os.stat_result,
+    *,
+    expected_mount_id: int,
+) -> int:
+    descriptor = -1
+    try:
+        descriptor, opened_status = _open_regular_at(
+            parent_descriptor,
+            name,
+            expected=_identity(before_status),
+        )
+        if (
+            _tree_stat_snapshot(opened_status)
+            != _tree_stat_snapshot(before_status)
+            or _descriptor_mount_id(descriptor) != expected_mount_id
+        ):
+            raise _workspace_access_failure(
+                "workspace.ownership_changed"
+            )
+        return descriptor
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise _managed_tree_component_failure(
+            parent_descriptor,
+            name,
+            exc,
+        ) from exc
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def _open_managed_tree_directory(
+    parent_descriptor: int,
+    name: str,
+    before_status: os.stat_result,
+    *,
+    expected_mount_id: int,
+) -> int:
+    descriptor = -1
+    try:
+        descriptor = _open_directory_at(
+            parent_descriptor,
+            name,
+            expected=_identity(before_status),
+        )
+        opened_status = os.fstat(descriptor)
+        if (
+            _tree_stat_snapshot(opened_status)
+            != _tree_stat_snapshot(before_status)
+            or _descriptor_mount_id(descriptor) != expected_mount_id
+        ):
+            raise _workspace_access_failure(
+                "workspace.ownership_changed"
+            )
+        return descriptor
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise _managed_tree_component_failure(
+            parent_descriptor,
+            name,
+            exc,
+        ) from exc
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def _assert_managed_tree_name_snapshot(
+    parent_descriptor: int,
+    name: str,
+    expected: _TreeStatSnapshot,
+) -> None:
+    status = _managed_tree_entry_status(parent_descriptor, name)
+    if stat.S_ISLNK(status.st_mode):
+        raise _workspace_access_failure(
+            "workspace.symlink_encountered"
+        )
+    if _tree_stat_snapshot(status) != expected:
+        raise _workspace_access_failure(
+            "workspace.ownership_changed"
+        )
+
+
+def _managed_tree_component_failure(
+    parent_descriptor: int,
+    name: str,
+    exception: OSError,
+) -> WorkspaceFailure:
+    reason_code = _managed_reason_code(
+        parent_descriptor,
+        name,
+        exception,
+    )
+    if reason_code == "workspace.symlink_encountered":
+        return _workspace_access_failure(reason_code)
+    if isinstance(exception, PermissionError):
+        return _workspace_access_failure(
+            "workspace.permission_denied"
+        )
+    if isinstance(exception, FileNotFoundError) or exception.errno in {
+        errno.EINVAL,
+        errno.EISDIR,
+        errno.ENOTDIR,
+        errno.ESTALE,
+    }:
+        return _workspace_access_failure(
+            "workspace.ownership_changed"
+        )
+    return _workspace_access_failure("workspace.io_failed")
+
+
+def _tree_stat_snapshot(status: os.stat_result) -> _TreeStatSnapshot:
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_mode,
+        status.st_nlink,
+        status.st_uid,
+        status.st_gid,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
+def _append_managed_tree_entries(
+    snapshot: _ManagedTreeSnapshot,
+    parent_parts: tuple[str, ...],
+    entries: list[ManagedTreeEntry],
+) -> None:
+    for child in snapshot.children:
+        relative_parts = (*parent_parts, child.name)
+        entries.append(
+            ManagedTreeEntry(
+                relative_path="/".join(relative_parts),
+                kind=child.kind,
+                byte_length=(
+                    child.status[6]
+                    if child.kind is ManagedTreeEntryKind.REGULAR_FILE
+                    else None
+                ),
+                revision=_managed_tree_revision(child.status),
+            )
+        )
+        if child.kind is ManagedTreeEntryKind.DIRECTORY:
+            _append_managed_tree_entries(
+                child,
+                relative_parts,
+                entries,
+            )
+
+
+def _managed_tree_revision(status: _TreeStatSnapshot) -> str:
+    """把物理身份与修订时间压缩为不泄漏原值的比较令牌。"""
+    encoded = ",".join(str(value) for value in status).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _validate_effect_parts(

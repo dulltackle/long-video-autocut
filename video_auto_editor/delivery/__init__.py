@@ -2,6 +2,10 @@
 
 from ._build import DeliveryBuild
 from ._model import DeliveryBuildFailure, DeliveryBuildRequest
+from ._verification import (
+    DeliveryVerification,
+    DeliveryVerificationFailure,
+)
 from .capability import (
     PublishedDelivery,
     UnverifiedDelivery,
@@ -12,6 +16,8 @@ __all__ = [
     "DeliveryBuild",
     "DeliveryBuildFailure",
     "DeliveryBuildRequest",
+    "DeliveryVerification",
+    "DeliveryVerificationFailure",
     "PublishedDelivery",
     "UnverifiedDelivery",
     "VerifiedDelivery",

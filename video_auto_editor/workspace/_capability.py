@@ -31,6 +31,7 @@ _UseFile = Callable[[tuple[str, ...], _FileMode, _FileEffect], object]
 _PublishFile = Callable[[tuple[str, ...], bytes], int]
 _ValidateDirectory = Callable[[tuple[str, ...]], None]
 _MakeDirectory = Callable[[tuple[str, ...]], None]
+_InspectTree = Callable[[], tuple["ManagedTreeEntry", ...]]
 _UseExclusiveLock = Callable[
     [tuple[str, ...], CancellationToken, Callable[[], object]],
     object,
@@ -40,6 +41,23 @@ _QuarantineFile = Callable[
     None,
 ]
 _CAPABILITY_SEAL = object()
+
+
+class ManagedTreeEntryKind(str, Enum):
+    """受管目录树中可公开观察的条目类型。"""
+
+    REGULAR_FILE = "regular_file"
+    DIRECTORY = "directory"
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedTreeEntry:
+    """不包含物理路径的不可变受管目录树条目。"""
+
+    relative_path: str
+    kind: ManagedTreeEntryKind
+    byte_length: int | None
+    revision: str
 
 
 class ManagedBinaryFile:
@@ -97,6 +115,7 @@ class _ManagedAuthority:
     publish_file: _PublishFile
     validate_directory: _ValidateDirectory
     make_directory: _MakeDirectory
+    inspect_tree: _InspectTree
     use_exclusive_lock: _UseExclusiveLock
     quarantine_file: _QuarantineFile
     workspace_identity: object
@@ -110,6 +129,7 @@ class _ManagedOperations:
     _publish_file: _PublishFile = field(repr=False)
     _validate_directory: _ValidateDirectory = field(repr=False)
     _make_directory: _MakeDirectory = field(repr=False)
+    _inspect_tree: _InspectTree = field(repr=False)
     _use_exclusive_lock: _UseExclusiveLock = field(repr=False)
     _quarantine_file: _QuarantineFile = field(repr=False)
     _seal: object = field(repr=False)
@@ -156,6 +176,10 @@ class _ManagedOperations:
             lambda: self._make_directory(relative_parts)
         )
 
+    def inspect_tree(self) -> tuple[ManagedTreeEntry, ...]:
+        self._assert_authentic()
+        return _without_sensitive_exception_context(self._inspect_tree)
+
     def use_exclusive_lock(
         self,
         relative_parts: tuple[str, ...],
@@ -196,6 +220,7 @@ class _ManagedOperations:
             or self._publish_file is not authority.publish_file
             or self._validate_directory is not authority.validate_directory
             or self._make_directory is not authority.make_directory
+            or self._inspect_tree is not authority.inspect_tree
             or self._use_exclusive_lock is not authority.use_exclusive_lock
             or self._quarantine_file is not authority.quarantine_file
         ):
@@ -376,6 +401,11 @@ class ManagedDirectoryCapability:
         object.__setattr__(instance, "_seal", _CAPABILITY_SEAL)
         return instance
 
+    def inspect_tree(self) -> tuple[ManagedTreeEntry, ...]:
+        """只读检查整棵受管子树，返回按相对路径排序的不可变快照。"""
+        self._assert_authentic()
+        return self._operations.inspect_tree()
+
     @property
     def bound_run_id(self) -> RunId | None:
         """返回签发时绑定的运行标识；维护 capability 返回 ``None``。"""
@@ -429,6 +459,7 @@ class _WorkspaceCapabilityIssuer:
         publish_file: _PublishFile,
         validate_directory: _ValidateDirectory,
         make_directory: _MakeDirectory,
+        inspect_tree: _InspectTree,
         use_exclusive_lock: _UseExclusiveLock,
         quarantine_file: _QuarantineFile,
         workspace_identity: object,
@@ -447,6 +478,7 @@ class _WorkspaceCapabilityIssuer:
             validate_directory,
         )
         object.__setattr__(operations, "_make_directory", make_directory)
+        object.__setattr__(operations, "_inspect_tree", inspect_tree)
         object.__setattr__(
             operations,
             "_use_exclusive_lock",
@@ -463,6 +495,7 @@ class _WorkspaceCapabilityIssuer:
             publish_file=publish_file,
             validate_directory=validate_directory,
             make_directory=make_directory,
+            inspect_tree=inspect_tree,
             use_exclusive_lock=use_exclusive_lock,
             quarantine_file=quarantine_file,
             workspace_identity=workspace_identity,
