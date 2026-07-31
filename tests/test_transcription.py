@@ -14,8 +14,12 @@ from video_auto_editor.runtime.cancellation import (
     CancellationRequested,
     CancellationSource,
 )
-from video_auto_editor.runtime.errors import ErrorCategory, ErrorCode
-from video_auto_editor.runtime.identity import RunId
+from video_auto_editor.runtime.errors import (
+    ErrorCategory,
+    ErrorCode,
+    RemoteRequestId,
+)
+from video_auto_editor.runtime.identity import OperationId, RunId
 from video_auto_editor.source_analysis import SourceDescription
 from video_auto_editor.transcription import (
     CacheUse,
@@ -29,6 +33,8 @@ from video_auto_editor.transcription import (
     SpeechRecognition,
     TranscriptionChunk,
     TranscriptionFailure,
+    TranscriptionRemoteRequestEvent,
+    TranscriptionRemoteRequestEventKind,
     TranscriptionRequest,
     TranscriptionResult,
 )
@@ -70,6 +76,14 @@ def test_speech_recognition_interface_exposes_only_stage_inputs_and_neutral_fact
         "execution_facts",
         "speech_presence",
     }
+    assert set(TranscriptionRemoteRequestEvent.__dataclass_fields__) == {
+        "correlation_id",
+        "kind",
+        "reason_code",
+        "remote_request_id",
+        "retry_delay_ms",
+        "transport_attempt_count",
+    }
     assert list(
         inspect.signature(SpeechRecognition.check_readiness).parameters
     ) == ["self"]
@@ -92,6 +106,119 @@ def test_speech_recognition_interface_exposes_only_stage_inputs_and_neutral_fact
     assert forbidden_details.isdisjoint(
         TranscriptionResult.__dataclass_fields__
     )
+    assert forbidden_details.isdisjoint(
+        TranscriptionRemoteRequestEvent.__dataclass_fields__
+    )
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        TranscriptionRemoteRequestEvent(
+            kind=TranscriptionRemoteRequestEventKind.STARTED,
+            correlation_id=OperationId.new(),
+            transport_attempt_count=0,
+        ),
+        TranscriptionRemoteRequestEvent(
+            kind=TranscriptionRemoteRequestEventKind.ATTEMPT_FAILED,
+            correlation_id=OperationId.new(),
+            transport_attempt_count=1,
+            remote_request_id=RemoteRequestId.from_adapter("request-1"),
+            reason_code="service.server_error",
+        ),
+        TranscriptionRemoteRequestEvent(
+            kind=TranscriptionRemoteRequestEventKind.RETRY_PLANNED,
+            correlation_id=OperationId.new(),
+            transport_attempt_count=2,
+            reason_code="timeout.read",
+            retry_delay_ms=100,
+        ),
+        TranscriptionRemoteRequestEvent(
+            kind=TranscriptionRemoteRequestEventKind.SUCCEEDED,
+            correlation_id=OperationId.new(),
+            transport_attempt_count=3,
+            remote_request_id=RemoteRequestId.from_adapter("request-1"),
+        ),
+        TranscriptionRemoteRequestEvent(
+            kind=TranscriptionRemoteRequestEventKind.FAILED,
+            correlation_id=OperationId.new(),
+            transport_attempt_count=3,
+            remote_request_id=RemoteRequestId.from_adapter("request-1"),
+            reason_code="output.incomplete",
+        ),
+        TranscriptionRemoteRequestEvent(
+            kind=TranscriptionRemoteRequestEventKind.INTERRUPTED,
+            correlation_id=OperationId.new(),
+            transport_attempt_count=1,
+            remote_request_id=RemoteRequestId.from_adapter("request-1"),
+            reason_code="cancellation.root_requested",
+        ),
+        TranscriptionRemoteRequestEvent(
+            kind=(
+                TranscriptionRemoteRequestEventKind.CANCELLED_DUE_TO_PRIMARY
+            ),
+            correlation_id=OperationId.new(),
+            transport_attempt_count=1,
+            remote_request_id=RemoteRequestId.from_adapter("request-1"),
+            reason_code="concurrency.primary_failed",
+        ),
+    ],
+)
+def test_remote_request_event_accepts_only_safe_closed_lifecycle(event):
+    representation = repr(event)
+    assert "request-1" not in representation
+    assert "sha256:" not in representation
+    if event.remote_request_id is not None:
+        assert str(event.remote_request_id).startswith("sha256:")
+
+
+@pytest.mark.parametrize(
+    "attributes",
+    [
+        {
+            "kind": TranscriptionRemoteRequestEventKind.STARTED,
+            "transport_attempt_count": 1,
+        },
+        {
+            "kind": TranscriptionRemoteRequestEventKind.SUCCEEDED,
+            "transport_attempt_count": 0,
+        },
+        {
+            "kind": TranscriptionRemoteRequestEventKind.FAILED,
+            "transport_attempt_count": 1,
+        },
+        {
+            "kind": TranscriptionRemoteRequestEventKind.SUCCEEDED,
+            "transport_attempt_count": 1,
+            "reason_code": "secret failure text",
+        },
+        {
+            "kind": TranscriptionRemoteRequestEventKind.RETRY_PLANNED,
+            "transport_attempt_count": 1,
+            "reason_code": "timeout.read",
+        },
+        {
+            "kind": TranscriptionRemoteRequestEventKind.ATTEMPT_FAILED,
+            "transport_attempt_count": 4,
+            "reason_code": "timeout.read",
+        },
+        {
+            "kind": TranscriptionRemoteRequestEventKind.RETRY_PLANNED,
+            "transport_attempt_count": 1,
+            "remote_request_id": RemoteRequestId.from_adapter("request-2"),
+            "reason_code": "timeout.read",
+            "retry_delay_ms": 50,
+        },
+    ],
+)
+def test_remote_request_event_rejects_incoherent_or_unbounded_fields(
+    attributes,
+):
+    with pytest.raises((TypeError, ValueError)):
+        TranscriptionRemoteRequestEvent(
+            correlation_id=OperationId.new(),
+            **attributes,
+        )
 
 
 def test_readiness_report_contains_only_frozen_stable_issues():

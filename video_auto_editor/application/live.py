@@ -12,7 +12,6 @@ from types import MappingProxyType
 from typing import NoReturn, Protocol, runtime_checkable
 
 from video_auto_editor.configuration import LoadedConfiguration
-from video_auto_editor.delivery import Publication
 from video_auto_editor.delivery.capability import (
     PublishedDelivery,
     UnverifiedDelivery,
@@ -387,6 +386,12 @@ class _CommitState:
 
 @runtime_checkable
 class _RunAssembly(Protocol):
+    def finalize_terminal_diagnostics(
+        self,
+        stage: StageDiagnostics,
+        outcome: StageOutcome,
+    ) -> None: ...
+
     def preflight(
         self,
         stage: StageDiagnostics,
@@ -526,11 +531,54 @@ class _LifecycleCursor:
 
 
 class _StageTerminated(Exception):
-    __slots__ = ("outcome",)
+    __slots__ = ("diagnostics_incomplete", "outcome")
 
-    def __init__(self, outcome: RunOutcome) -> None:
+    def __init__(
+        self,
+        outcome: RunOutcome,
+        *,
+        diagnostics_incomplete: bool = False,
+    ) -> None:
         self.outcome = outcome
+        self.diagnostics_incomplete = diagnostics_incomplete
         super().__init__("直播拆条运行阶段已经形成终态")
+
+
+_TerminalDiagnosticsHook = Callable[
+    [StageDiagnostics, StageOutcome],
+    None,
+]
+
+
+class _TerminalDiagnosticsFinalizer:
+    __slots__ = ("_finalized", "_hook")
+
+    def __init__(
+        self,
+        hook: _TerminalDiagnosticsHook | None = None,
+    ) -> None:
+        self._hook = hook
+        self._finalized = False
+
+    def register(self, hook: _TerminalDiagnosticsHook) -> None:
+        if not callable(hook):
+            raise TypeError("终态诊断收尾必须可调用")
+        if self._hook is not None:
+            raise RuntimeError("终态诊断收尾只能注册一次")
+        if self._finalized:
+            raise RuntimeError("终态诊断收尾已经完成")
+        self._hook = hook
+
+    def finalize(
+        self,
+        stage: StageDiagnostics,
+        outcome: StageOutcome,
+    ) -> None:
+        hook = self._hook
+        if hook is None or self._finalized:
+            return
+        self._finalized = True
+        hook(stage, outcome)
 
 
 class _ApplicationFailure(RuntimeError):
@@ -858,6 +906,8 @@ class LiveApplication:
             raise RuntimeError("直播拆条运行缺少素材 capability")
 
         postcommit_cleanup_incomplete = False
+        terminal_diagnostics_incomplete = False
+        preflight_finalizer = _TerminalDiagnosticsFinalizer()
         try:
             assembly_work = self._run_stage(
                 cursor,
@@ -871,9 +921,15 @@ class LiveApplication:
                     run_workspace=run_workspace,
                     stage=stage,
                     cancellation=token,
+                    terminal_diagnostics=preflight_finalizer,
                 ),
+                terminal_diagnostics=preflight_finalizer,
             )
+            if not isinstance(assembly_work, _StageWork):
+                raise TypeError("预检阶段必须形成常规阶段结果")
             assembly = assembly_work.value
+            if not isinstance(assembly, _RunAssembly):
+                raise TypeError("预检阶段必须返回固定运行组合")
             source = self._run_stage(
                 cursor,
                 diagnostics,
@@ -886,6 +942,9 @@ class LiveApplication:
                     token,
                 ),
                 expected_value=SourceDescription,
+                terminal_diagnostics=_TerminalDiagnosticsFinalizer(
+                    assembly.finalize_terminal_diagnostics,
+                ),
             )
             transcript = self._run_stage(
                 cursor,
@@ -900,6 +959,9 @@ class LiveApplication:
                     cancellation=token,
                 ),
                 expected_value=CompleteTranscript,
+                terminal_diagnostics=_TerminalDiagnosticsFinalizer(
+                    assembly.finalize_terminal_diagnostics,
+                ),
             )
             plan = self._run_stage(
                 cursor,
@@ -912,6 +974,9 @@ class LiveApplication:
                     stage,
                     token,
                 ),
+                terminal_diagnostics=_TerminalDiagnosticsFinalizer(
+                    assembly.finalize_terminal_diagnostics,
+                ),
             )
             reviewed_plan = self._run_stage(
                 cursor,
@@ -923,6 +988,9 @@ class LiveApplication:
                     plan.value,
                     stage,
                     token,
+                ),
+                terminal_diagnostics=_TerminalDiagnosticsFinalizer(
+                    assembly.finalize_terminal_diagnostics,
                 ),
             )
             built = self._run_stage(
@@ -937,6 +1005,9 @@ class LiveApplication:
                     token,
                 ),
                 expected_result=_DeliveryBuildWork,
+                terminal_diagnostics=_TerminalDiagnosticsFinalizer(
+                    assembly.finalize_terminal_diagnostics,
+                ),
             )
             if not isinstance(built, _DeliveryBuildWork):
                 raise RuntimeError("交付构建结果类型验证失效")
@@ -953,6 +1024,9 @@ class LiveApplication:
                     token,
                 ),
                 expected_value=VerifiedDelivery,
+                terminal_diagnostics=_TerminalDiagnosticsFinalizer(
+                    assembly.finalize_terminal_diagnostics,
+                ),
             )
             if not isinstance(verified.value, VerifiedDelivery):
                 raise RuntimeError("交付验证结果类型验证失效")
@@ -975,6 +1049,9 @@ class LiveApplication:
                 ),
                 expected_value=PublishedDelivery,
                 commit_state=commit_state,
+                terminal_diagnostics=_TerminalDiagnosticsFinalizer(
+                    assembly.finalize_terminal_diagnostics,
+                ),
             )
             cursor.complete()
             run_outcome = commit_state.outcome()
@@ -985,12 +1062,21 @@ class LiveApplication:
                 postcommit_cleanup_incomplete = True
         except _StageTerminated as terminal:
             run_outcome = terminal.outcome
+            terminal_diagnostics_incomplete = (
+                terminal.diagnostics_incomplete
+            )
         if postcommit_cleanup_incomplete:
             return LiveRunOutcome._from_run_outcome(
                 run_id,
                 run_outcome,
                 diagnostics_incomplete=True,
                 recovery_incomplete=True,
+            )
+        if terminal_diagnostics_incomplete:
+            return LiveRunOutcome._from_run_outcome(
+                run_id,
+                run_outcome,
+                diagnostics_incomplete=True,
             )
         try:
             finalization = diagnostics.finish(run_outcome)
@@ -1118,6 +1204,7 @@ class LiveApplication:
         ),
         expected_value: type[object] | None = None,
         commit_state: _CommitState | None = None,
+        terminal_diagnostics: _TerminalDiagnosticsFinalizer | None = None,
     ) -> _StageWork | _DeliveryBuildWork:
         cursor.enter(stage)
         stage_diagnostics = diagnostics.start_stage(stage)
@@ -1181,6 +1268,7 @@ class LiveApplication:
                 run_workspace,
                 stage,
                 interruption.signal_number,
+                terminal_diagnostics,
             )
         except Exception as failure:
             if commit_state is not None and commit_state.committed:
@@ -1195,8 +1283,12 @@ class LiveApplication:
                     run_workspace,
                     stage,
                     signal_number,
+                    terminal_diagnostics,
                 )
             self._record_delivery_failed(stage_diagnostics, stage)
+            declared_associated_failures = (
+                _declared_associated_failures(failure)
+            )
             recordable_failure = _recordable_failure(failure)
             error_module = _failure_module(
                 recordable_failure,
@@ -1205,28 +1297,50 @@ class LiveApplication:
             primary_error = stage_diagnostics.scope(
                 error_module
             ).record_failure(recordable_failure)
-            associated_errors, recovery_incomplete = (
+            associated_errors = tuple(
+                stage_diagnostics.scope(
+                    _failure_module(
+                        associated_failure,
+                        stage,
+                    )
+                ).record_failure(associated_failure)
+                for associated_failure in map(
+                    _recordable_failure,
+                    declared_associated_failures,
+                )
+            )
+            cleanup_errors, recovery_incomplete = (
                 self._cleanup_before_terminal(
                     stage_diagnostics,
                     run_workspace,
                 )
             )
+            associated_errors = associated_errors + cleanup_errors
             recovery_incomplete = recovery_incomplete or (
                 getattr(recordable_failure, "error_code", None)
                 is ErrorCode.PUBLICATION_ROLLBACK_FAILED
             )
+            run_outcome = RunOutcome.failed(
+                primary_error,
+                associated_errors=associated_errors,
+                recovery_incomplete=recovery_incomplete,
+            )
+            if self._terminal_diagnostics_failed(
+                terminal_diagnostics,
+                stage_diagnostics,
+                StageOutcome.FAILED,
+            ):
+                cursor.terminate()
+                raise _StageTerminated(
+                    run_outcome,
+                    diagnostics_incomplete=True,
+                ) from None
             stage_diagnostics.complete(
                 StageOutcome.FAILED,
                 work_item_count=0,
             )
             cursor.terminate()
-            raise _StageTerminated(
-                RunOutcome.failed(
-                    primary_error,
-                    associated_errors=associated_errors,
-                    recovery_incomplete=recovery_incomplete,
-                )
-            ) from None
+            raise _StageTerminated(run_outcome) from None
 
     def _terminate_interrupted_stage(
         self,
@@ -1235,12 +1349,27 @@ class LiveApplication:
         run_workspace: RunWorkspace,
         stage: RunStage,
         signal_number: int | None,
+        terminal_diagnostics: _TerminalDiagnosticsFinalizer | None,
     ) -> NoReturn:
         run_outcome = self._complete_interrupted_stage(
             stage_diagnostics,
             run_workspace,
             stage,
             signal_number,
+        )
+        if self._terminal_diagnostics_failed(
+            terminal_diagnostics,
+            stage_diagnostics,
+            StageOutcome.INTERRUPTED,
+        ):
+            cursor.terminate()
+            raise _StageTerminated(
+                run_outcome,
+                diagnostics_incomplete=True,
+            ) from None
+        stage_diagnostics.complete(
+            StageOutcome.INTERRUPTED,
+            work_item_count=0,
         )
         cursor.terminate()
         raise _StageTerminated(run_outcome) from None
@@ -1270,16 +1399,40 @@ class LiveApplication:
             0,
             int((cleanup_completed - cleanup_started) * 1000),
         )
-        stage_diagnostics.complete(
-            StageOutcome.INTERRUPTED,
-            work_item_count=0,
-        )
         return RunOutcome.interrupted(
             interruption_signal,
             cleanup_duration_ms=cleanup_duration_ms,
             associated_errors=associated_errors,
             recovery_incomplete=recovery_incomplete,
         )
+
+    @staticmethod
+    def _terminal_diagnostics_failed(
+        terminal_diagnostics: _TerminalDiagnosticsFinalizer | None,
+        stage_diagnostics: StageDiagnostics,
+        outcome: StageOutcome,
+    ) -> bool:
+        if terminal_diagnostics is None:
+            return False
+        try:
+            terminal_diagnostics.finalize(
+                stage_diagnostics,
+                outcome,
+            )
+        except Exception as failure:
+            recordable_failure = _recordable_failure(failure)
+            try:
+                stage_diagnostics.scope(
+                    _failure_module(
+                        recordable_failure,
+                        stage_diagnostics.stage,
+                    )
+                ).record_failure(recordable_failure)
+            except Exception:
+                # 终态诊断自身已不可用时，只能由返回值标记不完整。
+                pass
+            return True
+        return False
 
     def _record_interruption(
         self,
@@ -1410,12 +1563,8 @@ class LiveApplication:
         run_workspace: RunWorkspace,
         stage: StageDiagnostics,
         cancellation: CancellationToken,
+        terminal_diagnostics: _TerminalDiagnosticsFinalizer,
     ) -> _StageWork:
-        Publication.check_destination(
-            run_workspace.published_delivery,
-            overwrite=request.overwrite,
-            cancellation=cancellation,
-        )
         configuration = self._load_configuration(source.path)
         stage.scope(ErrorModule.CONFIGURATION).record(
             Facts.configuration(
@@ -1429,6 +1578,9 @@ class LiveApplication:
         )
         if not isinstance(assembly, _RunAssembly):
             raise TypeError("运行组合必须满足固定阶段级接口")
+        terminal_diagnostics.register(
+            assembly.finalize_terminal_diagnostics
+        )
         preflight = assembly.preflight(stage, cancellation)
         if not isinstance(preflight, _StageWork):
             raise TypeError("聚合预检必须返回类型化阶段结果")
@@ -1575,3 +1727,17 @@ def _recordable_failure(failure: Exception) -> Exception:
             "line": location.line,
         },
     )
+
+
+def _declared_associated_failures(
+    failure: Exception,
+) -> tuple[Exception, ...]:
+    try:
+        associated = getattr(failure, "associated_failures", ())
+    except Exception:
+        return ()
+    if not isinstance(associated, tuple) or any(
+        not isinstance(item, Exception) for item in associated
+    ):
+        return ()
+    return associated

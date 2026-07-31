@@ -31,12 +31,20 @@ from video_auto_editor.cache import (
     CacheRepository,
     CacheResolution,
 )
+from video_auto_editor.runtime._classified_failure import (
+    PreservedApplicationFailure,
+)
 from video_auto_editor.runtime.cancellation import (
     CancellationRequested,
     CancellationSource,
     CancellationToken,
 )
-from video_auto_editor.runtime.errors import ErrorCode, RemoteRequestId
+from video_auto_editor.runtime.errors import (
+    ErrorCode,
+    InternalLocation,
+    RemoteRequestId,
+)
+from video_auto_editor.runtime.identity import OperationId
 
 from ._normalized_audio import (
     AUDIO_NORMALIZATION_VERSION,
@@ -66,6 +74,9 @@ from .interface import (
     SpeechPresence,
     TranscriptionChunk,
     TranscriptionFailure,
+    TranscriptionRemoteRequestEvent,
+    TranscriptionRemoteRequestEventKind,
+    TranscriptionRemoteRequestEventSink,
     TranscriptionRequest,
     TranscriptionResult,
     validate_result_for_source,
@@ -88,6 +99,7 @@ _COVERAGE_VERSION = "coverage-ledger.v1"
 _DEDUPLICATION_VERSION = "utterance-deduplication.v1"
 _RESULT_VALIDATION_VERSION = "transcription-result.v1"
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
+_MAX_CREDENTIAL_HEADER_VALUE_LENGTH = 8 * 1024
 _MAX_TRANSPORT_ATTEMPTS = 3
 _RETRY_DELAYS_SECONDS = (0.05, 0.1)
 _ERROR_ORDER = {code: index for index, code in enumerate(ErrorCode)}
@@ -347,6 +359,7 @@ class StepAudioSpeechRecognition:
         "_audio_preparer",
         "_cache",
         "_credential",
+        "_event_sink",
         "_settings",
         "_transport",
     )
@@ -359,6 +372,7 @@ class StepAudioSpeechRecognition:
         cache_repository: CacheRepository,
         audio_preparer: StepAudioAudioPreparer | None = None,
         transport: StepAudioTransport | None = None,
+        event_sink: TranscriptionRemoteRequestEventSink | None = None,
     ) -> None:
         if not isinstance(settings, StepAudioSettings):
             raise TypeError("StepAudio 语音识别必须使用 StepAudioSettings")
@@ -382,11 +396,16 @@ class StepAudioSpeechRecognition:
             getattr(transport, "send", None)
         ):
             raise TypeError("StepAudio 语音识别必须使用传输端口")
+        if event_sink is not None and not callable(
+            getattr(event_sink, "record", None)
+        ):
+            raise TypeError("StepAudio 语音识别必须使用远程请求事件接收端")
         self._settings = settings
         self._credential = credential
         self._cache = cache_repository
         self._audio_preparer = audio_preparer
         self._transport = transport
+        self._event_sink = event_sink
 
     def check_readiness(self) -> ReadinessReport:
         """聚合本地只读检查，不准备音频、不查询缓存、不发送请求。"""
@@ -396,6 +415,16 @@ class StepAudioSpeechRecognition:
                 ReadinessIssue(
                     ErrorCode.CONFIG_CREDENTIAL_MISSING,
                     {"capability": "transcription"},
+                )
+            )
+        elif not _safe_credential_header_value(self._credential):
+            issues.append(
+                ReadinessIssue(
+                    ErrorCode.CONFIG_VALUE_INVALID,
+                    {
+                        "field": "transcription_provider_config.credential",
+                        "reason_code": "value.invalid_format",
+                    },
                 )
             )
         if not _valid_https_endpoint(self._settings.endpoint):
@@ -470,6 +499,7 @@ class StepAudioSpeechRecognition:
                 credential=self._credential,
                 cache_repository=self._cache,
                 transport=self._transport,
+                event_sink=self._event_sink,
             )
             result = complete_transcription(
                 source_duration_ms=audio.duration_ms,
@@ -523,6 +553,15 @@ class StepAudioSpeechRecognition:
                 execution_facts=ExecutionFacts(cache_use=CacheUse.MISS),
                 diagnostics={"capability": "transcription"},
             )
+        if not _safe_credential_header_value(self._credential):
+            raise TranscriptionFailure(
+                ErrorCode.CONFIG_VALUE_INVALID,
+                execution_facts=ExecutionFacts(cache_use=CacheUse.MISS),
+                diagnostics={
+                    "field": "transcription_provider_config.credential",
+                    "reason_code": "value.invalid_format",
+                },
+            )
         if not _valid_https_endpoint(self._settings.endpoint):
             raise TranscriptionFailure(
                 ErrorCode.CONFIG_HTTPS_REQUIRED,
@@ -533,11 +572,27 @@ class StepAudioSpeechRecognition:
             )
 
 
+def _safe_credential_header_value(value: str) -> bool:
+    if (
+        not 1 <= len(value) <= _MAX_CREDENTIAL_HEADER_VALUE_LENGTH
+        or not value.isprintable()
+        or "\r" in value
+        or "\n" in value
+    ):
+        return False
+    try:
+        value.encode("latin-1")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 class _StepAudioObservationSource:
     __slots__ = (
         "_audio",
         "_cache",
         "_credential",
+        "_event_sink",
         "_settings",
         "_transport",
     )
@@ -550,12 +605,14 @@ class _StepAudioObservationSource:
         credential: str,
         cache_repository: CacheRepository,
         transport: StepAudioTransport,
+        event_sink: TranscriptionRemoteRequestEventSink | None = None,
     ) -> None:
         self._audio = audio
         self._settings = settings
         self._credential = credential
         self._cache = cache_repository
         self._transport = transport
+        self._event_sink = event_sink
 
     def observe(
         self,
@@ -719,6 +776,7 @@ class _StepAudioObservationSource:
                 attempt_started=lambda: attempt_ledger.record(
                     work.sequence
                 ),
+                event_sink=self._event_sink,
             )
             computed_retries.append(retries)
             return payload
@@ -780,6 +838,7 @@ def _request_shard(
     transport: StepAudioTransport,
     cancellation: _CancellationView,
     attempt_started: Callable[[], None],
+    event_sink: TranscriptionRemoteRequestEventSink | None,
 ) -> tuple[_CachedShard, int]:
     cancellation.raise_if_cancelled()
     request = StepAudioTransportRequest(
@@ -788,55 +847,257 @@ def _request_shard(
         body=_request_body(pcm, settings),
         timeout_seconds=settings.timeout_seconds,
     )
+    cancellation.raise_if_cancelled()
+    correlation_id = OperationId.new()
+    _record_remote_request_event(
+        event_sink,
+        TranscriptionRemoteRequestEvent(
+            kind=TranscriptionRemoteRequestEventKind.STARTED,
+            correlation_id=correlation_id,
+            transport_attempt_count=0,
+        ),
+    )
     for attempt in range(1, _MAX_TRANSPORT_ATTEMPTS + 1):
-        cancellation.raise_if_cancelled()
         attempt_started()
+        response: StepAudioTransportResponse | None = None
+        chunks: tuple[TranscriptionChunk, ...] | None = None
+        root_cancellation: CancellationRequested | None = None
+        sibling_cancelled = False
+        request_failure: TranscriptionFailure | None = None
+        retryable = False
+        unexpected_failure: Exception | None = None
         try:
-            response = transport.send(request, cancellation)
-        except StepAudioTransportFailure as failure:
-            mapped = _transport_failure(failure.kind, attempt=attempt)
-            if (
-                failure.kind not in _RETRYABLE_TRANSPORT_FAILURES
-                or attempt == _MAX_TRANSPORT_ATTEMPTS
-            ):
-                raise mapped from None
-            _wait_before_retry(cancellation, attempt)
-            continue
-        cancellation.raise_if_cancelled()
-        if not isinstance(response, StepAudioTransportResponse):
-            raise _provider_failure(
-                ErrorCode.TRANSCRIPTION_RESPONSE_PROTOCOL_INVALID,
-                reason_code="protocol.body_invalid",
-                attempt=attempt,
-            )
-        try:
+            returned = transport.send(request, cancellation)
+            if isinstance(returned, StepAudioTransportResponse):
+                response = returned
+            cancellation.raise_if_cancelled()
+            if response is None:
+                raise _provider_failure(
+                    ErrorCode.TRANSCRIPTION_RESPONSE_PROTOCOL_INVALID,
+                    reason_code="protocol.body_invalid",
+                    attempt=attempt,
+                )
             chunks = _parse_response(
                 response,
                 duration_ms=duration_ms,
                 attempt=attempt,
             )
+            if not chunks and confirmed_speech_intervals(
+                NormalizedPcmAudio(pcm=pcm, duration_ms=duration_ms),
+                cancellation,
+            ):
+                raise _provider_failure(
+                    ErrorCode.TRANSCRIPTION_OUTPUT_INVALID,
+                    reason_code="output.empty_with_speech",
+                    attempt=attempt,
+                    http_status=response.status_code,
+                    remote_request_id=response.remote_request_id,
+                    finish_reason="stop",
+                )
+        except CancellationRequested as failure:
+            root_cancellation = failure
+        except _SiblingCancelled:
+            sibling_cancelled = True
+        except StepAudioTransportFailure as failure:
+            request_failure = _transport_failure(
+                failure.kind,
+                attempt=attempt,
+            )
+            retryable = (
+                failure.kind in _RETRYABLE_TRANSPORT_FAILURES
+                and attempt < _MAX_TRANSPORT_ATTEMPTS
+            )
         except TranscriptionFailure as failure:
-            if (
+            request_failure = failure
+            retryable = (
                 failure.error_code in _TRANSIENT_PROVIDER_ERRORS
                 and attempt < _MAX_TRANSPORT_ATTEMPTS
-            ):
-                _wait_before_retry(cancellation, attempt)
-                continue
-            raise
-        if not chunks and confirmed_speech_intervals(
-            NormalizedPcmAudio(pcm=pcm, duration_ms=duration_ms),
-            cancellation,
-        ):
-            raise _provider_failure(
-                ErrorCode.TRANSCRIPTION_OUTPUT_INVALID,
-                reason_code="output.empty_with_speech",
-                attempt=attempt,
-                http_status=response.status_code,
-                remote_request_id=response.remote_request_id,
-                finish_reason="stop",
             )
+        except Exception as failure:  # noqa: BLE001
+            unexpected_failure = failure
+
+        remote_request_id = _safe_remote_request_id(
+            response.remote_request_id if response is not None else None
+        )
+        if root_cancellation is not None:
+            _record_request_terminal(
+                event_sink,
+                correlation_id=correlation_id,
+                kind=TranscriptionRemoteRequestEventKind.INTERRUPTED,
+                attempt=attempt,
+                reason_code="cancellation.root_requested",
+                remote_request_id=remote_request_id,
+            )
+            raise root_cancellation
+        if sibling_cancelled:
+            _record_request_terminal(
+                event_sink,
+                correlation_id=correlation_id,
+                kind=(
+                    TranscriptionRemoteRequestEventKind.CANCELLED_DUE_TO_PRIMARY
+                ),
+                attempt=attempt,
+                reason_code="concurrency.primary_failed",
+                remote_request_id=remote_request_id,
+            )
+            raise _SiblingCancelled() from None
+        if unexpected_failure is not None:
+            _record_request_terminal(
+                event_sink,
+                correlation_id=correlation_id,
+                kind=TranscriptionRemoteRequestEventKind.FAILED,
+                attempt=attempt,
+                reason_code="internal.unexpected",
+                remote_request_id=remote_request_id,
+            )
+            raise unexpected_failure
+        if request_failure is not None:
+            reason_code = _request_failure_reason(request_failure)
+            _record_remote_request_event(
+                event_sink,
+                TranscriptionRemoteRequestEvent(
+                    kind=TranscriptionRemoteRequestEventKind.ATTEMPT_FAILED,
+                    correlation_id=correlation_id,
+                    transport_attempt_count=attempt,
+                    remote_request_id=remote_request_id,
+                    reason_code=reason_code,
+                ),
+            )
+            if retryable:
+                delay = _RETRY_DELAYS_SECONDS[attempt - 1]
+                _record_remote_request_event(
+                    event_sink,
+                    TranscriptionRemoteRequestEvent(
+                        kind=TranscriptionRemoteRequestEventKind.RETRY_PLANNED,
+                        correlation_id=correlation_id,
+                        transport_attempt_count=attempt,
+                        reason_code=reason_code,
+                        retry_delay_ms=int(delay * 1000),
+                    ),
+                )
+                _wait_before_retry(
+                    cancellation,
+                    attempt,
+                    correlation_id=correlation_id,
+                    event_sink=event_sink,
+                    remote_request_id=remote_request_id,
+                )
+                continue
+            _record_request_terminal(
+                event_sink,
+                correlation_id=correlation_id,
+                kind=TranscriptionRemoteRequestEventKind.FAILED,
+                attempt=attempt,
+                reason_code=reason_code,
+                remote_request_id=remote_request_id,
+            )
+            raise request_failure from None
+
+        if chunks is None:
+            raise AssertionError("StepAudio 成功传输缺少已验证响应")
+        _record_remote_request_event(
+            event_sink,
+            TranscriptionRemoteRequestEvent(
+                kind=TranscriptionRemoteRequestEventKind.SUCCEEDED,
+                correlation_id=correlation_id,
+                transport_attempt_count=attempt,
+                remote_request_id=remote_request_id,
+            ),
+        )
         return _CachedShard(chunks), attempt - 1
     raise AssertionError("StepAudio 传输尝试循环不应自然结束")
+
+
+def _record_request_terminal(
+    event_sink: TranscriptionRemoteRequestEventSink | None,
+    *,
+    correlation_id: OperationId,
+    kind: TranscriptionRemoteRequestEventKind,
+    attempt: int,
+    reason_code: str,
+    remote_request_id: RemoteRequestId | None,
+) -> None:
+    _record_remote_request_event(
+        event_sink,
+        TranscriptionRemoteRequestEvent(
+            kind=kind,
+            correlation_id=correlation_id,
+            transport_attempt_count=attempt,
+            remote_request_id=remote_request_id,
+            reason_code=reason_code,
+        ),
+    )
+
+
+def _request_failure_reason(failure: TranscriptionFailure) -> str:
+    reason_code = failure.diagnostics.get("reason_code")
+    return reason_code if isinstance(reason_code, str) else "internal.unexpected"
+
+
+def _record_remote_request_event(
+    sink: TranscriptionRemoteRequestEventSink | None,
+    event: TranscriptionRemoteRequestEvent,
+) -> None:
+    if sink is None:
+        return
+    internal_location: InternalLocation | None = None
+    try:
+        sink.record(event)
+    except PreservedApplicationFailure:
+        raise
+    except Exception as failure:  # noqa: BLE001
+        internal_location = _event_sink_internal_location(failure)
+    if internal_location is not None:
+        raise TranscriptionFailure(
+            ErrorCode.INTERNAL_UNEXPECTED,
+            execution_facts=ExecutionFacts(
+                cache_use=CacheUse.MISS,
+                retry_count=max(event.transport_attempt_count - 1, 0),
+            ),
+            diagnostics={
+                "source_module": internal_location.source_module,
+                "function": internal_location.function,
+                "line": internal_location.line,
+            },
+        ) from None
+
+
+def _event_sink_internal_location(failure: Exception) -> InternalLocation:
+    source_module = "video_auto_editor.transcription.stepaudio"
+    function = "_record_remote_request_event"
+    line = 1
+    traceback = failure.__traceback__
+    while traceback is not None:
+        candidate_module = traceback.tb_frame.f_globals.get("__name__")
+        if (
+            isinstance(candidate_module, str)
+            and candidate_module.startswith("video_auto_editor.")
+        ):
+            source_module = candidate_module
+            function = traceback.tb_frame.f_code.co_name
+            line = traceback.tb_lineno
+        traceback = traceback.tb_next
+    try:
+        return InternalLocation.from_runtime(
+            source_module=source_module,
+            function=function,
+            line=line,
+        )
+    except (TypeError, ValueError):
+        return InternalLocation.from_runtime(
+            source_module="video_auto_editor.transcription.stepaudio",
+            function="_record_remote_request_event",
+            line=1,
+        )
+
+
+def _safe_remote_request_id(value: str | None) -> RemoteRequestId | None:
+    if not value:
+        return None
+    try:
+        return RemoteRequestId.from_adapter(value)
+    except (TypeError, ValueError):
+        return None
 
 
 _TRANSIENT_PROVIDER_ERRORS = frozenset(
@@ -852,10 +1113,43 @@ _TRANSIENT_PROVIDER_ERRORS = frozenset(
 def _wait_before_retry(
     cancellation: _CancellationView,
     attempt: int,
+    *,
+    correlation_id: OperationId,
+    event_sink: TranscriptionRemoteRequestEventSink | None,
+    remote_request_id: RemoteRequestId | None,
 ) -> None:
     delay = _RETRY_DELAYS_SECONDS[attempt - 1]
-    if cancellation.wait(delay):
-        cancellation.raise_if_cancelled()
+    root_cancellation: CancellationRequested | None = None
+    sibling_cancelled = False
+    try:
+        if cancellation.wait(delay):
+            cancellation.raise_if_cancelled()
+    except CancellationRequested as failure:
+        root_cancellation = failure
+    except _SiblingCancelled:
+        sibling_cancelled = True
+    if root_cancellation is not None:
+        _record_request_terminal(
+            event_sink,
+            correlation_id=correlation_id,
+            kind=TranscriptionRemoteRequestEventKind.INTERRUPTED,
+            attempt=attempt,
+            reason_code="cancellation.root_requested",
+            remote_request_id=remote_request_id,
+        )
+        raise root_cancellation
+    if sibling_cancelled:
+        _record_request_terminal(
+            event_sink,
+            correlation_id=correlation_id,
+            kind=(
+                TranscriptionRemoteRequestEventKind.CANCELLED_DUE_TO_PRIMARY
+            ),
+            attempt=attempt,
+            reason_code="concurrency.primary_failed",
+            remote_request_id=remote_request_id,
+        )
+        raise _SiblingCancelled() from None
 
 
 def _transport_failure(

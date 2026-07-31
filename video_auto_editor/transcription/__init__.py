@@ -16,6 +16,9 @@ from .interface import (
     TranscriptChunk,
     TranscriptionChunk,
     TranscriptionFailure,
+    TranscriptionRemoteRequestEvent,
+    TranscriptionRemoteRequestEventKind,
+    TranscriptionRemoteRequestEventSink,
     TranscriptionRequest,
     TranscriptionResult,
 )
@@ -40,6 +43,9 @@ __all__ = [
     "TranscriptChunk",
     "TranscriptionChunk",
     "TranscriptionFailure",
+    "TranscriptionRemoteRequestEvent",
+    "TranscriptionRemoteRequestEventKind",
+    "TranscriptionRemoteRequestEventSink",
     "TranscriptionRequest",
     "TranscriptionResult",
 ]

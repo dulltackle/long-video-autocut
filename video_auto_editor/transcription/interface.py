@@ -1,5 +1,6 @@
 """供应商无感知的语音识别阶段契约。"""
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -9,10 +10,12 @@ from video_auto_editor.runtime.cancellation import CancellationToken
 from video_auto_editor.runtime.errors import (
     ErrorCategory,
     ErrorCode,
+    RemoteRequestId,
     freeze_error_diagnostics,
     get_error_definition,
 )
 from video_auto_editor.runtime.identity import (
+    OperationId,
     TranscriptChunkId,
     TranscriptId,
 )
@@ -20,6 +23,10 @@ from video_auto_editor.source_analysis import SourceDescription
 from video_auto_editor.workspace import (
     ManagedDirectoryCapability,
     ManagedDirectoryRole,
+)
+
+_EVENT_REASON_CODE = re.compile(
+    r"[a-z][a-z0-9_]{0,31}(?:\.[a-z][a-z0-9_]{0,31}){0,7}"
 )
 
 
@@ -114,6 +121,101 @@ class ExecutionFacts:
             self.retry_count != 0 or self.recovery_count != 0
         ):
             raise ValueError("整场转写缓存命中时不得发生内部重试或覆盖补救")
+
+
+class TranscriptionRemoteRequestEventKind(str, Enum):
+    """一个逻辑识别分片请求的供应商无感知状态。"""
+
+    STARTED = "started"
+    ATTEMPT_FAILED = "attempt_failed"
+    RETRY_PLANNED = "retry_planned"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+    CANCELLED_DUE_TO_PRIMARY = "cancelled_due_to_primary"
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptionRemoteRequestEvent:
+    """只携带可并发关联的安全远程请求事实。"""
+
+    kind: TranscriptionRemoteRequestEventKind
+    correlation_id: OperationId
+    transport_attempt_count: int
+    remote_request_id: RemoteRequestId | None = field(
+        default=None,
+        repr=False,
+    )
+    reason_code: str | None = None
+    retry_delay_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, TranscriptionRemoteRequestEventKind):
+            raise TypeError("语音识别远程请求事件必须使用稳定 kind")
+        if not isinstance(self.correlation_id, OperationId):
+            raise TypeError("语音识别远程请求事件必须使用 OperationId 关联")
+        if (
+            not isinstance(self.transport_attempt_count, int)
+            or isinstance(self.transport_attempt_count, bool)
+        ):
+            raise TypeError("语音识别远程请求传输次数必须是整数")
+        if not 0 <= self.transport_attempt_count <= 3:
+            raise ValueError("语音识别远程请求累计传输次数必须位于 0 到 3")
+        if self.kind is TranscriptionRemoteRequestEventKind.STARTED:
+            if self.transport_attempt_count != 0:
+                raise ValueError("逻辑识别分片请求开始时尚未发生传输")
+        elif self.transport_attempt_count < 1:
+            raise ValueError("逻辑识别分片请求后续事件必须包含累计传输次数")
+        if self.remote_request_id is not None and not isinstance(
+            self.remote_request_id,
+            RemoteRequestId,
+        ):
+            raise TypeError("远端请求标识必须先由 Adapter 脱敏")
+        if (
+            self.kind
+            in {
+                TranscriptionRemoteRequestEventKind.STARTED,
+                TranscriptionRemoteRequestEventKind.RETRY_PLANNED,
+            }
+            and self.remote_request_id is not None
+        ):
+            raise ValueError("尚未完成的传输事件不得携带远端请求标识")
+        failure_events = {
+            TranscriptionRemoteRequestEventKind.ATTEMPT_FAILED,
+            TranscriptionRemoteRequestEventKind.RETRY_PLANNED,
+            TranscriptionRemoteRequestEventKind.FAILED,
+            TranscriptionRemoteRequestEventKind.INTERRUPTED,
+            TranscriptionRemoteRequestEventKind.CANCELLED_DUE_TO_PRIMARY,
+        }
+        if self.kind in failure_events:
+            if (
+                not isinstance(self.reason_code, str)
+                or _EVENT_REASON_CODE.fullmatch(self.reason_code) is None
+            ):
+                raise ValueError("失败类语音识别请求事件必须携带稳定原因码")
+        elif self.reason_code is not None:
+            raise ValueError("成功类语音识别请求事件不得携带失败原因")
+        if self.kind is TranscriptionRemoteRequestEventKind.RETRY_PLANNED:
+            if (
+                not isinstance(self.retry_delay_ms, int)
+                or isinstance(self.retry_delay_ms, bool)
+                or not 0 <= self.retry_delay_ms <= 60_000
+            ):
+                raise ValueError("重试计划必须携带安全的毫秒退避时长")
+        elif self.retry_delay_ms is not None:
+            raise ValueError("非重试计划事件不得携带退避时长")
+
+
+class TranscriptionRemoteRequestEventSink(Protocol):
+    """由组合根可选注入、可被并发调用的必需事件接收端。
+
+    一旦注入，事件写入即为 fail-closed：已分类的应用失败保持原样，其他
+    ``record`` 异常由 Adapter 映射为不含异常文本的稳定内部失败。
+    """
+
+    def record(self, event: TranscriptionRemoteRequestEvent) -> None:
+        """记录一次实际远程传输请求的状态。"""
+        ...
 
 
 @dataclass(frozen=True, slots=True)

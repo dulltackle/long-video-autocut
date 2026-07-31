@@ -19,8 +19,17 @@ from video_auto_editor.application._deterministic import (
     compose_deterministic_live_application,
 )
 from video_auto_editor.application.live import _CommitState
-from video_auto_editor.diagnostics import InterruptionSignal, ResultKind
-from video_auto_editor.runtime.errors import ErrorCode, ExitCode, RunStage
+from video_auto_editor.diagnostics import (
+    InterruptionSignal,
+    ResultKind,
+    StageOutcome,
+)
+from video_auto_editor.runtime.errors import (
+    ErrorCode,
+    ErrorModule,
+    ExitCode,
+    RunStage,
+)
 from video_auto_editor.runtime.identity import (
     RunId,
     TranscriptChunkId,
@@ -505,6 +514,91 @@ def test_configuration_failure_is_a_formal_run_with_usage_exit_code(
         / str(outcome.run_id)
         / "run.json"
     ).is_file()
+
+
+def test_configuration_failure_precedes_publication_destination_preflight(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    source.with_suffix(".config.json").write_text(
+        '{"schema_version":"configuration.v1","unknown":true}'
+    )
+    workspace = tmp_path / "workspace"
+    Workspace.open(source, workspace)
+    existing_delivery = workspace / "delivery" / "existing.txt"
+    existing_delivery.write_bytes(b"existing delivery")
+
+    outcome = compose_deterministic_live_application().execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.exit_code is ExitCode.INVALID_USAGE
+    assert outcome.primary_error_code is ErrorCode.CONFIG_SCHEMA_INVALID
+    assert existing_delivery.read_bytes() == b"existing delivery"
+
+
+def test_preflight_return_cancellation_finalizes_diagnostics_once(
+    tmp_path,
+):
+    finalized = []
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    application = compose_deterministic_live_application(
+        interrupt_after_preflight_return=True,
+        terminal_diagnostics_observer=(
+            lambda stage, outcome: finalized.append(
+                (stage.stage, outcome)
+            )
+        ),
+    )
+
+    outcome = application.execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.INTERRUPTED
+    assert outcome.exit_code is ExitCode.SIGINT
+    assert finalized == [
+        (RunStage.PREFLIGHT, StageOutcome.INTERRUPTED)
+    ]
+    manifest = json.loads(
+        (
+            workspace
+            / "work"
+            / "runs"
+            / str(outcome.run_id)
+            / "run.json"
+        ).read_text()
+    )
+    assert manifest["stages"]["preflight"]["status"] == "interrupted"
+
+
+def test_preflight_failure_finalizes_diagnostics_once(tmp_path):
+    finalized = []
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    application = compose_deterministic_live_application(
+        failure_stage=RunStage.PREFLIGHT,
+        terminal_diagnostics_observer=(
+            lambda stage, outcome: finalized.append(
+                (stage.stage, outcome)
+            )
+        ),
+    )
+
+    outcome = application.execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.primary_error_code is (
+        ErrorCode.ENVIRONMENT_FFMPEG_UNAVAILABLE
+    )
+    assert finalized == [(RunStage.PREFLIGHT, StageOutcome.FAILED)]
 
 
 @pytest.mark.parametrize(
@@ -1156,6 +1250,119 @@ def test_cleanup_failure_is_associated_after_primary_stage_failure(
     assert not (workspace / "work" / "tmp" / str(outcome.run_id)).exists()
 
 
+def test_aggregate_stage_failure_records_ordered_associated_errors(
+    tmp_path,
+):
+    class RecordableFailure(RuntimeError):
+        def __init__(self, error_code, module, associated_failures=()):
+            self.error_code = error_code
+            self.module = module
+            self.diagnostics = {}
+            self.associated_failures = associated_failures
+            super().__init__("sensitive aggregate failure")
+
+    associated_failures = (
+        RecordableFailure(
+            ErrorCode.ENVIRONMENT_FFPROBE_UNAVAILABLE,
+            ErrorModule.READINESS,
+        ),
+        RecordableFailure(
+            ErrorCode.ENVIRONMENT_FONT_UNAVAILABLE,
+            ErrorModule.READINESS,
+        ),
+    )
+
+    def fail_source_analysis(*_args):
+        raise RecordableFailure(
+            ErrorCode.INPUT_MEDIA_INVALID,
+            ErrorModule.SOURCE_ANALYSIS,
+            associated_failures,
+        )
+
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    application = compose_deterministic_live_application(
+        source_analyzer=fail_source_analysis,
+    )
+
+    outcome = application.execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.exit_code is ExitCode.INPUT_FAILED
+    assert outcome.primary_error_code is ErrorCode.INPUT_MEDIA_INVALID
+    assert tuple(
+        error.error_code for error in outcome.associated_errors
+    ) == (
+        ErrorCode.ENVIRONMENT_FFPROBE_UNAVAILABLE,
+        ErrorCode.ENVIRONMENT_FONT_UNAVAILABLE,
+    )
+    assert outcome.primary_error is not None
+    assert [
+        outcome.primary_error.event_sequence,
+        *(error.event_sequence for error in outcome.associated_errors),
+    ] == sorted(
+        [
+            outcome.primary_error.event_sequence,
+            *(error.event_sequence for error in outcome.associated_errors),
+        ]
+    )
+    assert outcome.recovery_incomplete is False
+
+    manifest = json.loads(
+        (
+            workspace
+            / "work"
+            / "runs"
+            / str(outcome.run_id)
+            / "run.json"
+        ).read_text()
+    )
+    assert [
+        error["error_code"]
+        for error in manifest["errors"]["associated_errors"]
+    ] == [
+        "environment.ffprobe_unavailable",
+        "environment.font_unavailable",
+    ]
+
+
+def test_malformed_associated_failures_do_not_mask_primary_failure(
+    tmp_path,
+):
+    class MalformedAggregateFailure(RuntimeError):
+        def __init__(self):
+            self.error_code = ErrorCode.INPUT_MEDIA_INVALID
+            self.module = ErrorModule.SOURCE_ANALYSIS
+            self.diagnostics = {}
+            self.associated_failures = ["not-an-exception"]
+            super().__init__("sensitive malformed aggregate")
+
+    def fail_source_analysis(*_args):
+        raise MalformedAggregateFailure
+
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    application = compose_deterministic_live_application(
+        source_analyzer=fail_source_analysis,
+    )
+
+    outcome = application.execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.exit_code is ExitCode.INPUT_FAILED
+    assert outcome.primary_error_code is ErrorCode.INPUT_MEDIA_INVALID
+    assert outcome.primary_error is not None
+    assert outcome.associated_errors == ()
+    assert outcome.recovery_incomplete is False
+    assert outcome.diagnostics_incomplete is False
+    assert not (workspace / "work" / "tmp" / str(outcome.run_id)).exists()
+
+
 def test_cleanup_failure_does_not_replace_interruption_exit_code(
     tmp_path,
 ):
@@ -1204,6 +1411,113 @@ def test_precommit_diagnostics_failure_returns_typed_local_failure(
     assert outcome.diagnostics_incomplete is True
     assert not (workspace / "work" / "tmp" / str(outcome.run_id)).exists()
     assert not any((workspace / "delivery").iterdir())
+
+
+def test_terminal_diagnostics_hook_failure_preserves_primary_failure(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    application = compose_deterministic_live_application(
+        failure_stage=RunStage.SOURCE_ANALYSIS,
+        terminal_diagnostics_failure=True,
+    )
+
+    outcome = application.execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.exit_code is ExitCode.INPUT_FAILED
+    assert outcome.primary_error_code is ErrorCode.INPUT_MEDIA_INVALID
+    assert outcome.primary_error is not None
+    assert outcome.diagnostics_incomplete is True
+    events = [
+        json.loads(line)
+        for line in (
+            workspace
+            / "work"
+            / "runs"
+            / str(outcome.run_id)
+            / "events.jsonl"
+        ).read_text().splitlines()
+    ]
+    recorded_error_codes = {
+        event["attributes"]["error_code"]
+        for event in events
+        if event["event_code"] == "error.recorded"
+        and event["stage"] == "source_analysis"
+    }
+    assert recorded_error_codes == {
+        "diagnostics.write_failed",
+        "input.media_invalid",
+    }
+    assert not any(
+        event["event_code"] == "stage.completed"
+        and event["stage"] == "source_analysis"
+        for event in events
+    )
+    assert not (
+        workspace
+        / "work"
+        / "runs"
+        / str(outcome.run_id)
+        / "run.json"
+    ).exists()
+
+
+def test_terminal_diagnostics_hook_failure_preserves_interruption(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    application = compose_deterministic_live_application(
+        interruption_stage=RunStage.SOURCE_ANALYSIS,
+        interruption_signal=InterruptionSignal.SIGINT,
+        terminal_diagnostics_failure=True,
+    )
+
+    outcome = application.execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.INTERRUPTED
+    assert outcome.exit_code is ExitCode.SIGINT
+    assert outcome.interruption_signal is InterruptionSignal.SIGINT
+    assert outcome.primary_error is None
+    assert outcome.diagnostics_incomplete is True
+    assert outcome.recovery_incomplete is False
+    assert not (workspace / "work" / "tmp" / str(outcome.run_id)).exists()
+    events = [
+        json.loads(line)
+        for line in (
+            workspace
+            / "work"
+            / "runs"
+            / str(outcome.run_id)
+            / "events.jsonl"
+        ).read_text().splitlines()
+    ]
+    assert any(
+        event["event_code"] == "error.recorded"
+        and event["attributes"]["error_code"]
+        == "diagnostics.write_failed"
+        for event in events
+    )
+    assert not any(
+        event["event_code"] == "stage.completed"
+        and event["stage"] == "source_analysis"
+        for event in events
+    )
+    assert not (
+        workspace
+        / "work"
+        / "runs"
+        / str(outcome.run_id)
+        / "run.json"
+    ).exists()
 
 
 def test_postcommit_diagnostics_failure_does_not_revoke_success(
@@ -1728,9 +2042,11 @@ def test_physical_publication_failure_discards_reserved_commit_proof(
     assert not (workspace / "work" / "tmp" / str(outcome.run_id)).exists()
 
 
+@pytest.mark.parametrize("terminal_diagnostics_failure", [False, True])
 def test_publication_rollback_failure_marks_recovery_incomplete(
     tmp_path,
     monkeypatch,
+    terminal_diagnostics_failure,
 ):
     source = tmp_path / "course.mp4"
     source.write_bytes(b"deterministic source")
@@ -1774,13 +2090,18 @@ def test_publication_rollback_failure_marks_recovery_incomplete(
         observe_exchange,
     )
 
-    outcome = compose_deterministic_live_application().execute(
-        LiveRunRequest(source, workspace_dir=workspace)
-    )
+    outcome = compose_deterministic_live_application(
+        terminal_diagnostics_failure=terminal_diagnostics_failure,
+    ).execute(LiveRunRequest(source, workspace_dir=workspace))
 
     assert outcome.state is LiveRunState.FAILED
     assert outcome.primary_error_code is ErrorCode.PUBLICATION_ROLLBACK_FAILED
+    assert outcome.exit_code is ExitCode.PUBLICATION_FAILED
     assert outcome.recovery_incomplete is True
+    assert (
+        outcome.diagnostics_incomplete
+        is terminal_diagnostics_failure
+    )
     assert not any((workspace / "delivery").iterdir())
     assert not any((workspace / "delivery.previous").iterdir())
     assert len(outcome.associated_errors) == 1
@@ -1794,6 +2115,14 @@ def test_publication_rollback_failure_marks_recovery_incomplete(
     assert (
         interrupted_temporary / ".publication-transaction.json"
     ).is_file()
+    run_manifest = (
+        workspace
+        / "work"
+        / "runs"
+        / str(outcome.run_id)
+        / "run.json"
+    )
+    assert run_manifest.exists() is not terminal_diagnostics_failure
 
     monkeypatch.undo()
     recovered = Workspace.open(source, workspace)

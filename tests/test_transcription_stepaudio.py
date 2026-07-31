@@ -9,12 +9,13 @@ from time import sleep
 import pytest
 
 from video_auto_editor.cache import CacheFailure, CacheRepository
+from video_auto_editor.diagnostics import DiagnosticsFailure
 from video_auto_editor.runtime.cancellation import (
     CancellationRequested,
     CancellationSource,
 )
-from video_auto_editor.runtime.errors import ErrorCode
-from video_auto_editor.runtime.identity import RunId
+from video_auto_editor.runtime.errors import ErrorCode, RemoteRequestId
+from video_auto_editor.runtime.identity import OperationId, RunId
 from video_auto_editor.source_analysis import SourceDescription
 from video_auto_editor.transcription import (
     CacheUse,
@@ -23,6 +24,8 @@ from video_auto_editor.transcription import (
     StepAudioSettings,
     StepAudioSpeechRecognition,
     TranscriptionFailure,
+    TranscriptionRemoteRequestEvent,
+    TranscriptionRemoteRequestEventKind,
     TranscriptionRequest,
 )
 from video_auto_editor.transcription._reconciliation import (
@@ -112,6 +115,30 @@ class _ScriptedTransport:
         return outcome
 
 
+class _RecordingRemoteRequestEventSink:
+    def __init__(self) -> None:
+        self.events: list[TranscriptionRemoteRequestEvent] = []
+
+    def record(self, event: TranscriptionRemoteRequestEvent) -> None:
+        self.events.append(event)
+
+
+class _FailingRemoteRequestEventSink(_RecordingRemoteRequestEventSink):
+    def __init__(
+        self,
+        target: TranscriptionRemoteRequestEventKind,
+        failure: RuntimeError,
+    ) -> None:
+        super().__init__()
+        self._target = target
+        self._failure = failure
+
+    def record(self, event: TranscriptionRemoteRequestEvent) -> None:
+        super().record(event)
+        if event.kind is self._target:
+            raise self._failure
+
+
 def _settings() -> StepAudioSettings:
     return StepAudioSettings(
         endpoint="https://stepaudio.example.test/v1/audio/asr/sse",
@@ -186,8 +213,10 @@ def _transcription_request(
         tmp_path / f"workspace-path-canary-do-not-send{label}",
     )
     run_workspace = workspace.acquire_run(RunId.new())
+    source_file = workspace.source
+    assert source_file is not None
     source = SourceDescription._from_analysis(
-        source_file=workspace.source,
+        source_file=source_file,
         sha256="sha256:" + ("0" * 64),
         byte_length=len(source_bytes),
         duration_ms=duration_ms,
@@ -235,6 +264,7 @@ def test_stepaudio_readiness_aggregates_all_local_issues_repeatably_without_busi
     )
     audio_preparer = _FakeAudioPreparer(readiness=(audio_issue,))
     transport = _FakeTransport(readiness=(transport_issue,))
+    sink = _RecordingRemoteRequestEventSink()
     recognition = StepAudioSpeechRecognition(
         StepAudioSettings(
             endpoint="http://stepaudio.example.test/v1/audio/asr/sse",
@@ -246,6 +276,7 @@ def test_stepaudio_readiness_aggregates_all_local_issues_repeatably_without_busi
         cache_repository=_cache_repository(),
         audio_preparer=audio_preparer,
         transport=transport,
+        event_sink=sink,
     )
     before = _tree_snapshot(workspace)
 
@@ -272,7 +303,59 @@ def test_stepaudio_readiness_aggregates_all_local_issues_repeatably_without_busi
     assert transport.readiness_calls == 2
     assert audio_preparer.prepare_calls == []
     assert transport.send_calls == []
+    assert sink.events == []
     assert _tree_snapshot(workspace) == before
+
+
+@pytest.mark.parametrize(
+    ("credential", "leak_fragment"),
+    [
+        ("credential\r\nX-Leaked: secret", "X-Leaked: secret"),
+        ("credential\x00secret", "secret"),
+        ("x" * 8_193, "x" * 128),
+    ],
+)
+def test_stepaudio_rejects_unsafe_credential_header_before_business_io(
+    tmp_path,
+    credential,
+    leak_fragment,
+):
+    audio_preparer = _FakeAudioPreparer(audio=_speech_audio())
+    transport = _FakeTransport(response=_successful_response())
+    recognition = StepAudioSpeechRecognition(
+        _settings(),
+        credential=credential,
+        cache_repository=_cache_repository(),
+        audio_preparer=audio_preparer,
+        transport=transport,
+    )
+    request, run_workspace = _transcription_request(tmp_path)
+
+    try:
+        report = recognition.check_readiness()
+        with pytest.raises(TranscriptionFailure) as captured:
+            recognition.transcribe(request)
+
+        expected_diagnostics = {
+            "field": "transcription_provider_config.credential",
+            "reason_code": "value.invalid_format",
+        }
+        assert report.ready is False
+        assert report.issues == (
+            ReadinessIssue(
+                ErrorCode.CONFIG_VALUE_INVALID,
+                expected_diagnostics,
+            ),
+        )
+        assert captured.value.error_code is ErrorCode.CONFIG_VALUE_INVALID
+        assert captured.value.diagnostics == expected_diagnostics
+        assert audio_preparer.prepare_calls == []
+        assert transport.send_calls == []
+        assert leak_fragment not in repr(report)
+        assert leak_fragment not in repr(captured.value)
+    finally:
+        run_workspace.cleanup()
+        run_workspace.close()
 
 
 def test_stepaudio_default_production_readiness_is_local_and_repeatable(
@@ -400,6 +483,301 @@ def test_stepaudio_success_sends_only_current_normalized_pcm_and_protocol_whitel
         assert credential not in request_repr
         assert pcm_canary.decode("ascii") not in request_repr
         assert encoded_pcm not in request_repr
+    finally:
+        run_workspace.cleanup()
+        run_workspace.close()
+
+
+def test_stepaudio_observes_one_safe_correlated_remote_request_on_success(
+    tmp_path,
+):
+    sink = _RecordingRemoteRequestEventSink()
+    remote_request_id = "remote-request-event-canary"
+    response = _successful_response()
+    response = StepAudioTransportResponse(
+        status_code=response.status_code,
+        content_type=response.content_type,
+        body=response.body,
+        remote_request_id=remote_request_id,
+    )
+    recognition = StepAudioSpeechRecognition(
+        _settings(),
+        credential="credential-canary-must-not-leak",
+        cache_repository=_cache_repository(),
+        audio_preparer=_FakeAudioPreparer(audio=_speech_audio()),
+        transport=_ScriptedTransport([response]),
+        event_sink=sink,
+    )
+    request, run_workspace = _transcription_request(tmp_path)
+
+    try:
+        recognition.transcribe(request)
+
+        assert [event.kind for event in sink.events] == [
+            TranscriptionRemoteRequestEventKind.STARTED,
+            TranscriptionRemoteRequestEventKind.SUCCEEDED,
+        ]
+        assert isinstance(sink.events[0].correlation_id, OperationId)
+        assert sink.events[1].correlation_id == sink.events[0].correlation_id
+        assert [event.transport_attempt_count for event in sink.events] == [
+            0,
+            1,
+        ]
+        assert sink.events[0].remote_request_id is None
+        assert sink.events[1].remote_request_id == RemoteRequestId.from_adapter(
+            remote_request_id
+        )
+        rendered = repr(sink.events)
+        assert remote_request_id not in rendered
+        assert "credential-canary-must-not-leak" not in rendered
+        assert str(request.source.source_file.path) not in rendered
+    finally:
+        run_workspace.cleanup()
+        run_workspace.close()
+
+
+def test_stepaudio_observes_one_logical_request_across_transport_retry(
+    tmp_path,
+):
+    sink = _RecordingRemoteRequestEventSink()
+    failed_remote_id = "failed-remote-request-canary"
+    successful_remote_id = "successful-remote-request-canary"
+    success = _successful_response()
+
+    class _RetryOrderTransport(_ScriptedTransport):
+        def send(self, request, cancellation):
+            if self.send_calls:
+                assert (
+                    sink.events[-1].kind
+                    is TranscriptionRemoteRequestEventKind.RETRY_PLANNED
+                )
+            return super().send(request, cancellation)
+
+    transport = _RetryOrderTransport(
+        [
+            StepAudioTransportResponse(
+                status_code=503,
+                content_type="application/json",
+                body=b"",
+                remote_request_id=failed_remote_id,
+            ),
+            StepAudioTransportResponse(
+                status_code=success.status_code,
+                content_type=success.content_type,
+                body=success.body,
+                remote_request_id=successful_remote_id,
+            ),
+        ]
+    )
+    recognition = StepAudioSpeechRecognition(
+        _settings(),
+        credential="credential",
+        cache_repository=_cache_repository(),
+        audio_preparer=_FakeAudioPreparer(audio=_speech_audio()),
+        transport=transport,
+        event_sink=sink,
+    )
+    request, run_workspace = _transcription_request(tmp_path)
+
+    try:
+        result = recognition.transcribe(request)
+
+        assert result.execution_facts.retry_count == 1
+        assert [event.kind for event in sink.events] == [
+            TranscriptionRemoteRequestEventKind.STARTED,
+            TranscriptionRemoteRequestEventKind.ATTEMPT_FAILED,
+            TranscriptionRemoteRequestEventKind.RETRY_PLANNED,
+            TranscriptionRemoteRequestEventKind.SUCCEEDED,
+        ]
+        assert len({event.correlation_id for event in sink.events}) == 1
+        assert [event.transport_attempt_count for event in sink.events] == [
+            0,
+            1,
+            1,
+            2,
+        ]
+        assert sink.events[1].remote_request_id == (
+            RemoteRequestId.from_adapter(failed_remote_id)
+        )
+        assert sink.events[1].reason_code == "service.server_error"
+        assert sink.events[2].reason_code == "service.server_error"
+        assert sink.events[2].retry_delay_ms == 50
+        assert sink.events[3].remote_request_id == (
+            RemoteRequestId.from_adapter(successful_remote_id)
+        )
+    finally:
+        run_workspace.cleanup()
+        run_workspace.close()
+
+
+def test_stepaudio_observes_transport_exception_as_failed_remote_request(
+    tmp_path,
+):
+    sink = _RecordingRemoteRequestEventSink()
+    transport = _ScriptedTransport(
+        [StepAudioTransportFailure(StepAudioTransportFailureKind.TLS_FAILED)]
+    )
+    recognition = StepAudioSpeechRecognition(
+        _settings(),
+        credential="credential",
+        cache_repository=_cache_repository(),
+        audio_preparer=_FakeAudioPreparer(audio=_speech_audio()),
+        transport=transport,
+        event_sink=sink,
+    )
+    request, run_workspace = _transcription_request(tmp_path)
+
+    try:
+        with pytest.raises(TranscriptionFailure):
+            recognition.transcribe(request)
+
+        assert [event.kind for event in sink.events] == [
+            TranscriptionRemoteRequestEventKind.STARTED,
+            TranscriptionRemoteRequestEventKind.ATTEMPT_FAILED,
+            TranscriptionRemoteRequestEventKind.FAILED,
+        ]
+        assert len({event.correlation_id for event in sink.events}) == 1
+        assert [event.transport_attempt_count for event in sink.events] == [
+            0,
+            1,
+            1,
+        ]
+        assert sink.events[1].reason_code == "transport.tls_failed"
+        assert sink.events[2].reason_code == "transport.tls_failed"
+        assert sink.events[1].remote_request_id is None
+        assert sink.events[2].remote_request_id is None
+        assert len(transport.send_calls) == 1
+    finally:
+        run_workspace.cleanup()
+        run_workspace.close()
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_send_count", "response"),
+    [
+        (
+            TranscriptionRemoteRequestEventKind.STARTED,
+            0,
+            _successful_response(),
+        ),
+        (
+            TranscriptionRemoteRequestEventKind.RETRY_PLANNED,
+            1,
+            StepAudioTransportResponse(
+                status_code=503,
+                content_type="application/json",
+                body=b"",
+            ),
+        ),
+        (
+            TranscriptionRemoteRequestEventKind.SUCCEEDED,
+            1,
+            _successful_response(),
+        ),
+    ],
+)
+def test_stepaudio_maps_event_sink_failure_at_each_lifecycle_phase(
+    tmp_path,
+    target,
+    expected_send_count,
+    response,
+):
+    sink_failure = RuntimeError("event-sink-failure-canary")
+    sink = _FailingRemoteRequestEventSink(target, sink_failure)
+    transport = _ScriptedTransport([response, _successful_response()])
+    recognition = StepAudioSpeechRecognition(
+        _settings(),
+        credential="credential",
+        cache_repository=_cache_repository(),
+        audio_preparer=_FakeAudioPreparer(audio=_speech_audio()),
+        transport=transport,
+        event_sink=sink,
+    )
+    request, run_workspace = _transcription_request(tmp_path)
+
+    try:
+        with pytest.raises(TranscriptionFailure) as captured:
+            recognition.transcribe(request)
+
+        failure = captured.value
+        assert failure.error_code is ErrorCode.INTERNAL_UNEXPECTED
+        assert set(failure.diagnostics) == {
+            "function",
+            "line",
+            "source_module",
+        }
+        assert len(transport.send_calls) == expected_send_count
+        assert sink.events[-1].kind is target
+        assert "event-sink-failure-canary" not in repr(failure)
+        assert failure.__cause__ is None
+        assert failure.__context__ is None
+    finally:
+        run_workspace.cleanup()
+        run_workspace.close()
+
+
+def test_stepaudio_preserves_classified_event_sink_failure(tmp_path):
+    sink_failure = DiagnosticsFailure(
+        ErrorCode.DIAGNOSTICS_WRITE_FAILED,
+        {
+            "operation": "diagnostics.append",
+            "reason_code": "diagnostics.append_failed",
+        },
+    )
+    sink = _FailingRemoteRequestEventSink(
+        TranscriptionRemoteRequestEventKind.STARTED,
+        sink_failure,
+    )
+    transport = _ScriptedTransport([_successful_response()])
+    recognition = StepAudioSpeechRecognition(
+        _settings(),
+        credential="credential",
+        cache_repository=_cache_repository(),
+        audio_preparer=_FakeAudioPreparer(audio=_speech_audio()),
+        transport=transport,
+        event_sink=sink,
+    )
+    request, run_workspace = _transcription_request(tmp_path)
+
+    try:
+        with pytest.raises(DiagnosticsFailure) as captured:
+            recognition.transcribe(request)
+
+        assert captured.value is sink_failure
+        assert transport.send_calls == []
+    finally:
+        run_workspace.cleanup()
+        run_workspace.close()
+
+
+def test_stepaudio_emits_no_remote_request_event_when_already_cancelled(
+    tmp_path,
+):
+    cancellation = CancellationSource(clock=lambda: 1.0)
+    cancellation.request(signal.SIGTERM)
+    sink = _RecordingRemoteRequestEventSink()
+    transport = _ScriptedTransport([_successful_response()])
+    recognition = StepAudioSpeechRecognition(
+        _settings(),
+        credential="credential",
+        cache_repository=_cache_repository(),
+        audio_preparer=_FakeAudioPreparer(audio=_speech_audio()),
+        transport=transport,
+        event_sink=sink,
+    )
+    request, run_workspace = _transcription_request(tmp_path)
+    cancelled_request = TranscriptionRequest(
+        source=request.source,
+        temporary_workspace=request.temporary_workspace,
+        cancellation=cancellation.token,
+    )
+
+    try:
+        with pytest.raises(CancellationRequested):
+            recognition.transcribe(cancelled_request)
+
+        assert transport.send_calls == []
+        assert sink.events == []
     finally:
         run_workspace.cleanup()
         run_workspace.close()
@@ -911,6 +1289,7 @@ def test_stepaudio_cancellation_interrupts_retry_backoff_without_another_request
     tmp_path,
 ):
     cancellation = CancellationSource(clock=lambda: 1.0)
+    sink = _RecordingRemoteRequestEventSink()
 
     class _CancelDuringBackoffTransport(_ScriptedTransport):
         def send(self, request, token):
@@ -936,6 +1315,7 @@ def test_stepaudio_cancellation_interrupts_retry_backoff_without_another_request
         cache_repository=_cache_repository(),
         audio_preparer=_FakeAudioPreparer(audio=_speech_audio()),
         transport=transport,
+        event_sink=sink,
     )
     request, run_workspace = _transcription_request(tmp_path)
     request = TranscriptionRequest(
@@ -950,6 +1330,19 @@ def test_stepaudio_cancellation_interrupts_retry_backoff_without_another_request
 
         assert captured.value.signal_number == signal.SIGTERM
         assert len(transport.send_calls) == 1
+        assert [event.kind for event in sink.events] == [
+            TranscriptionRemoteRequestEventKind.STARTED,
+            TranscriptionRemoteRequestEventKind.ATTEMPT_FAILED,
+            TranscriptionRemoteRequestEventKind.RETRY_PLANNED,
+            TranscriptionRemoteRequestEventKind.INTERRUPTED,
+        ]
+        assert len({event.correlation_id for event in sink.events}) == 1
+        assert [event.transport_attempt_count for event in sink.events] == [
+            0,
+            1,
+            1,
+            1,
+        ]
     finally:
         run_workspace.cleanup()
         run_workspace.close()
@@ -1232,12 +1625,14 @@ def test_stepaudio_whole_cache_uses_only_result_affecting_content_identity(
         max_concurrency=7,
     )
     second_transport = _ScriptedTransport([])
+    second_sink = _RecordingRemoteRequestEventSink()
     second = StepAudioSpeechRecognition(
         second_settings,
         credential="different-credential",
         cache_repository=cache,
         audio_preparer=_FakeAudioPreparer(audio=audio),
         transport=second_transport,
+        event_sink=second_sink,
     )
     first_request, first_workspace = _transcription_request(
         tmp_path,
@@ -1259,6 +1654,7 @@ def test_stepaudio_whole_cache_uses_only_result_affecting_content_identity(
         assert cached.chunks == cold.chunks
         assert len(first_transport.send_calls) == 1
         assert second_transport.send_calls == []
+        assert second_sink.events == []
     finally:
         first_workspace.cleanup()
         first_workspace.close()
@@ -1464,6 +1860,7 @@ def test_stepaudio_honors_bounded_concurrency_and_returns_time_ordered_result(
         duration_ms=duration_ms,
     )
     transport = _ConcurrentTransport()
+    sink = _RecordingRemoteRequestEventSink()
     recognition = StepAudioSpeechRecognition(
         StepAudioSettings(
             endpoint=_settings().endpoint,
@@ -1475,6 +1872,7 @@ def test_stepaudio_honors_bounded_concurrency_and_returns_time_ordered_result(
         cache_repository=_cache_repository(),
         audio_preparer=_FakeAudioPreparer(audio=audio),
         transport=transport,
+        event_sink=sink,
     )
     request, run_workspace = _transcription_request(
         tmp_path,
@@ -1494,6 +1892,25 @@ def test_stepaudio_honors_bounded_concurrency_and_returns_time_ordered_result(
         )
         assert transport.send_calls == 2
         assert transport.max_active == 2
+        events_by_request: dict[
+            OperationId,
+            list[TranscriptionRemoteRequestEventKind],
+        ] = {}
+        for event in sink.events:
+            events_by_request.setdefault(event.correlation_id, []).append(
+                event.kind
+            )
+        assert len(events_by_request) == 2
+        assert list(events_by_request.values()) == [
+            [
+                TranscriptionRemoteRequestEventKind.STARTED,
+                TranscriptionRemoteRequestEventKind.SUCCEEDED,
+            ],
+            [
+                TranscriptionRemoteRequestEventKind.STARTED,
+                TranscriptionRemoteRequestEventKind.SUCCEEDED,
+            ],
+        ]
     finally:
         run_workspace.cleanup()
         run_workspace.close()
@@ -1502,6 +1919,7 @@ def test_stepaudio_honors_bounded_concurrency_and_returns_time_ordered_result(
 def test_stepaudio_inflight_request_observes_root_cancellation(tmp_path):
     cancellation = CancellationSource(clock=lambda: 1.0)
     started = Event()
+    sink = _RecordingRemoteRequestEventSink()
 
     class _BlockingTransport:
         def check_readiness(self) -> tuple[ReadinessIssue, ...]:
@@ -1520,6 +1938,7 @@ def test_stepaudio_inflight_request_observes_root_cancellation(tmp_path):
         cache_repository=_cache_repository(),
         audio_preparer=_FakeAudioPreparer(audio=_speech_audio()),
         transport=_BlockingTransport(),
+        event_sink=sink,
     )
     request, run_workspace = _transcription_request(
         tmp_path,
@@ -1549,6 +1968,13 @@ def test_stepaudio_inflight_request_observes_root_cancellation(tmp_path):
         assert len(captured) == 1
         assert isinstance(captured[0], CancellationRequested)
         assert captured[0].signal_number == signal.SIGINT
+        assert [event.kind for event in sink.events] == [
+            TranscriptionRemoteRequestEventKind.STARTED,
+            TranscriptionRemoteRequestEventKind.INTERRUPTED,
+        ]
+        assert sink.events[1].correlation_id == sink.events[0].correlation_id
+        assert sink.events[1].transport_attempt_count == 1
+        assert sink.events[1].reason_code == "cancellation.root_requested"
     finally:
         if worker.is_alive():
             cancellation.request(signal.SIGINT)
@@ -1560,6 +1986,8 @@ def test_stepaudio_inflight_request_observes_root_cancellation(tmp_path):
 def test_stepaudio_fail_fast_cancels_sibling_and_stops_queued_dispatch(
     tmp_path,
 ):
+    sink = _RecordingRemoteRequestEventSink()
+
     class _FailFastTransport:
         def __init__(self) -> None:
             self.barrier = Barrier(2)
@@ -1605,6 +2033,7 @@ def test_stepaudio_fail_fast_cancels_sibling_and_stops_queued_dispatch(
             )
         ),
         transport=transport,
+        event_sink=sink,
     )
     request, run_workspace = _transcription_request(
         tmp_path,
@@ -1622,6 +2051,35 @@ def test_stepaudio_fail_fast_cancels_sibling_and_stops_queued_dispatch(
         )
         assert transport.sibling_cancelled.wait(2)
         assert transport.calls == 2
+        events_by_request: dict[
+            OperationId,
+            list[TranscriptionRemoteRequestEvent],
+        ] = {}
+        for event in sink.events:
+            events_by_request.setdefault(event.correlation_id, []).append(
+                event
+            )
+        assert len(events_by_request) == 2
+        terminal_events = {events[-1].kind for events in events_by_request.values()}
+        assert terminal_events == {
+            TranscriptionRemoteRequestEventKind.FAILED,
+            TranscriptionRemoteRequestEventKind.CANCELLED_DUE_TO_PRIMARY,
+        }
+        cancelled_events = next(
+            events
+            for events in events_by_request.values()
+            if events[-1].kind
+            is TranscriptionRemoteRequestEventKind.CANCELLED_DUE_TO_PRIMARY
+        )
+        assert [event.kind for event in cancelled_events] == [
+            TranscriptionRemoteRequestEventKind.STARTED,
+            TranscriptionRemoteRequestEventKind.CANCELLED_DUE_TO_PRIMARY,
+        ]
+        assert cancelled_events[-1].transport_attempt_count == 1
+        assert (
+            cancelled_events[-1].reason_code
+            == "concurrency.primary_failed"
+        )
     finally:
         run_workspace.cleanup()
         run_workspace.close()

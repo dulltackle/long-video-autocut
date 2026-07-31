@@ -20,12 +20,14 @@ from video_auto_editor.diagnostics import (
     ArtifactRole,
     CacheNamespace,
     CacheOutcome,
+    DiagnosticsFailure,
     Facts,
     InterruptionSignal,
     OperationKind,
     OperationOutcome,
     ResultKind,
     RunDiagnostics,
+    StageOutcome,
 )
 from video_auto_editor.diagnostics._session import (
     DiagnosticScope,
@@ -237,6 +239,8 @@ class _DeterministicRunAssembly:
         "_built_result_kind",
         "_course_context_sha256",
         "_failure_stage",
+        "_interrupt_after_preflight_return",
+        "_interruption_signal",
         "_invalid_result_stage",
         "_invalid_work_count_stage",
         "_overwrite",
@@ -247,6 +251,8 @@ class _DeterministicRunAssembly:
         "_source_analyzer",
         "_speech_recognition",
         "_subtitle_failure",
+        "_terminal_diagnostics_failure",
+        "_terminal_diagnostics_observer",
         "_unexpected_stage",
     )
 
@@ -264,6 +270,14 @@ class _DeterministicRunAssembly:
         invalid_work_count_stage: RunStage | None,
         postcommit_cancellation: bool,
         postcommit_effect_failure: bool,
+        terminal_diagnostics_failure: bool,
+        terminal_diagnostics_observer: Callable[
+            [StageDiagnostics, StageOutcome],
+            None,
+        ]
+        | None,
+        interrupt_after_preflight_return: bool,
+        interruption_signal: InterruptionSignal,
         overwrite: bool,
     ) -> None:
         self._run_workspace = run_workspace
@@ -284,7 +298,41 @@ class _DeterministicRunAssembly:
         self._invalid_work_count_stage = invalid_work_count_stage
         self._postcommit_cancellation = postcommit_cancellation
         self._postcommit_effect_failure = postcommit_effect_failure
+        self._terminal_diagnostics_failure = (
+            terminal_diagnostics_failure
+        )
+        self._terminal_diagnostics_observer = (
+            terminal_diagnostics_observer
+        )
+        self._interrupt_after_preflight_return = (
+            interrupt_after_preflight_return
+        )
+        self._interruption_signal = interruption_signal
         self._overwrite = overwrite
+
+    def finalize_terminal_diagnostics(
+        self,
+        stage: StageDiagnostics,
+        outcome: StageOutcome,
+    ) -> None:
+        if not isinstance(stage, StageDiagnostics):
+            raise TypeError("终态诊断收尾必须绑定活动阶段")
+        if outcome not in {
+            StageOutcome.FAILED,
+            StageOutcome.INTERRUPTED,
+        }:
+            raise ValueError("终态诊断收尾只接受失败或中断")
+        observer = self._terminal_diagnostics_observer
+        if observer is not None:
+            observer(stage, outcome)
+        if self._terminal_diagnostics_failure:
+            raise DiagnosticsFailure(
+                ErrorCode.DIAGNOSTICS_WRITE_FAILED,
+                {
+                    "operation": "diagnostics.append",
+                    "reason_code": "diagnostics.append_failed",
+                },
+            )
 
     def _before_work(self, stage: RunStage) -> None:
         if stage is self._failure_stage:
@@ -310,6 +358,11 @@ class _DeterministicRunAssembly:
     ) -> _StageWork:
         stage.scope(ErrorModule.READINESS)
         cancellation.raise_if_cancelled()
+        Publication.check_destination(
+            self._run_workspace.published_delivery,
+            overwrite=self._overwrite,
+            cancellation=cancellation,
+        )
         self._before_work(RunStage.PREFLIGHT)
         readiness = self._speech_recognition.check_readiness()
         if not readiness.ready:
@@ -317,11 +370,22 @@ class _DeterministicRunAssembly:
                 ErrorCode.INTERNAL_UNEXPECTED,
                 ErrorModule.TRANSCRIPTION,
             )
-        return self._work(
+        work = self._work(
             RunStage.PREFLIGHT,
             _DeterministicFact("readiness"),
             1,
         )
+        if self._interrupt_after_preflight_return:
+            os.kill(
+                os.getpid(),
+                (
+                    signal.SIGINT
+                    if self._interruption_signal
+                    is InterruptionSignal.SIGINT
+                    else signal.SIGTERM
+                ),
+            )
+        return work
 
     def analyze_source(
         self,
@@ -667,6 +731,8 @@ class _DeterministicRunAssembly:
 class _DeterministicAssemblyFactory:
     __slots__ = (
         "_failure_stage",
+        "_interrupt_after_preflight_return",
+        "_interruption_signal",
         "_invalid_result_stage",
         "_invalid_work_count_stage",
         "_postcommit_cancellation",
@@ -674,6 +740,8 @@ class _DeterministicAssemblyFactory:
         "_result_kind",
         "_source_analyzer",
         "_subtitle_failure",
+        "_terminal_diagnostics_failure",
+        "_terminal_diagnostics_observer",
         "_transcription_script",
         "_unexpected_stage",
     )
@@ -690,6 +758,14 @@ class _DeterministicAssemblyFactory:
         invalid_work_count_stage: RunStage | None,
         postcommit_cancellation: bool,
         postcommit_effect_failure: bool,
+        terminal_diagnostics_failure: bool,
+        terminal_diagnostics_observer: Callable[
+            [StageDiagnostics, StageOutcome],
+            None,
+        ]
+        | None,
+        interrupt_after_preflight_return: bool,
+        interruption_signal: InterruptionSignal,
     ) -> None:
         self._source_analyzer = source_analyzer
         self._transcription_script = transcription_script
@@ -701,6 +777,16 @@ class _DeterministicAssemblyFactory:
         self._invalid_work_count_stage = invalid_work_count_stage
         self._postcommit_cancellation = postcommit_cancellation
         self._postcommit_effect_failure = postcommit_effect_failure
+        self._terminal_diagnostics_failure = (
+            terminal_diagnostics_failure
+        )
+        self._terminal_diagnostics_observer = (
+            terminal_diagnostics_observer
+        )
+        self._interrupt_after_preflight_return = (
+            interrupt_after_preflight_return
+        )
+        self._interruption_signal = interruption_signal
 
     def create(
         self,
@@ -724,6 +810,10 @@ class _DeterministicAssemblyFactory:
             self._invalid_work_count_stage,
             self._postcommit_cancellation,
             self._postcommit_effect_failure,
+            self._terminal_diagnostics_failure,
+            self._terminal_diagnostics_observer,
+            self._interrupt_after_preflight_return,
+            self._interruption_signal,
             request.overwrite,
         )
 
@@ -985,6 +1075,13 @@ def compose_deterministic_live_application(
     postcommit_control_failure: bool = False,
     postcommit_cancellation: bool = False,
     postcommit_effect_failure: bool = False,
+    terminal_diagnostics_failure: bool = False,
+    terminal_diagnostics_observer: Callable[
+        [StageDiagnostics, StageOutcome],
+        None,
+    ]
+    | None = None,
+    interrupt_after_preflight_return: bool = False,
     interrupt_during_workspace_open: bool = False,
     interrupt_during_run_id_factory: bool = False,
 ) -> LiveApplication:
@@ -1077,6 +1174,14 @@ def compose_deterministic_live_application(
         raise TypeError("提交点后取消异常选项必须是布尔值")
     if not isinstance(postcommit_effect_failure, bool):
         raise TypeError("提交点后模块故障选项必须是布尔值")
+    if not isinstance(terminal_diagnostics_failure, bool):
+        raise TypeError("终态诊断故障选项必须是布尔值")
+    if terminal_diagnostics_observer is not None and not callable(
+        terminal_diagnostics_observer
+    ):
+        raise TypeError("终态诊断观察器必须可调用")
+    if not isinstance(interrupt_after_preflight_return, bool):
+        raise TypeError("预检返回后中断选项必须是布尔值")
     if not isinstance(interrupt_during_workspace_open, bool):
         raise TypeError("workspace 打开中断选项必须是布尔值")
     if not isinstance(interrupt_during_run_id_factory, bool):
@@ -1099,6 +1204,7 @@ def compose_deterministic_live_application(
             int(postcommit_effect_failure),
             int(interrupt_during_workspace_open),
             int(interrupt_during_run_id_factory),
+            int(interrupt_after_preflight_return),
         )
     )
     if selected_injections > 1:
@@ -1119,6 +1225,10 @@ def compose_deterministic_live_application(
             invalid_work_count_stage,
             postcommit_cancellation,
             postcommit_effect_failure,
+            terminal_diagnostics_failure,
+            terminal_diagnostics_observer,
+            interrupt_after_preflight_return,
+            interruption_signal,
         ),
         open_workspace=(
             _SignalDuringWorkspaceOpen(interruption_signal)
