@@ -8,9 +8,15 @@ from video_auto_editor.runtime.identity import RunId
 from video_auto_editor.workspace import (
     ManagedDirectoryCapability,
     ManagedDirectoryRole,
+    ManagedTreeEntry,
 )
 
-_DeliveryState = Literal["unverified", "verified", "published"]
+_DeliveryState = Literal[
+    "unverified",
+    "verified",
+    "publishing",
+    "published",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +25,7 @@ class _DeliveryAuthority:
     run_id: RunId
     managed_directory: ManagedDirectoryCapability
     verification_snapshot: str | None
+    verification_tree: tuple[ManagedTreeEntry, ...] | None
 
 
 @dataclass(frozen=True, init=False, eq=False)
@@ -43,6 +50,7 @@ def _binding(
     *,
     state: _DeliveryState,
     verification_snapshot: str | None = None,
+    verification_tree: tuple[ManagedTreeEntry, ...] | None = None,
 ) -> _DeliveryBinding:
     if not isinstance(run_id, RunId):
         raise TypeError("交付 capability 必须绑定 RunId")
@@ -69,6 +77,7 @@ def _binding(
         run_id=run_id,
         managed_directory=managed_directory,
         verification_snapshot=verification_snapshot,
+        verification_tree=verification_tree,
     )
     return instance
 
@@ -100,6 +109,79 @@ def _snapshot(value: str) -> str:
     if not value.isprintable():
         raise ValueError("验证快照标识只能包含可打印字符")
     return value
+
+
+def _tree_snapshot(
+    value: tuple[ManagedTreeEntry, ...] | None,
+) -> tuple[ManagedTreeEntry, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, tuple) or any(
+        not isinstance(item, ManagedTreeEntry) for item in value
+    ):
+        raise TypeError("验证目录快照必须是受管目录树条目元组")
+    return value
+
+
+def _verification_evidence(
+    delivery: "VerifiedDelivery",
+) -> tuple[str, tuple[ManagedTreeEntry, ...] | None]:
+    """供 Publication 重新确认验证时绑定的内容与目录树。"""
+    if not isinstance(delivery, VerifiedDelivery):
+        raise TypeError("发布只能读取 VerifiedDelivery 的验证证据")
+    authority = _delivery_authority(
+        delivery._binding,
+        expected_state="verified",
+        message="VerifiedDelivery 只能由 DeliveryVerification 创建",
+    )
+    snapshot = authority.verification_snapshot
+    if snapshot is None:
+        raise TypeError("VerifiedDelivery 只能由 DeliveryVerification 创建")
+    return snapshot, authority.verification_tree
+
+
+def _pending_publication_evidence(
+    delivery: "PublishedDelivery",
+) -> tuple[RunId, ManagedDirectoryCapability]:
+    """供应用在提交效果前验证尚未激活的发布证明。"""
+    if not isinstance(delivery, PublishedDelivery):
+        raise TypeError("发布提交回调只接受 PublishedDelivery")
+    authority = _delivery_authority(
+        delivery._binding,
+        expected_state="publishing",
+        message="PublishedDelivery 只能由 Publication 创建",
+    )
+    return authority.run_id, authority.managed_directory
+
+
+def _activate_publication(delivery: "PublishedDelivery") -> None:
+    """只在目录事务越过提交点后激活最终交付能力。"""
+    if not isinstance(delivery, PublishedDelivery):
+        raise TypeError("只能激活 Publication 创建的 PublishedDelivery")
+    authority = _delivery_authority(
+        delivery._binding,
+        expected_state="publishing",
+        message="PublishedDelivery 只能由 Publication 创建",
+    )
+    _DELIVERY_AUTHORITIES[delivery._binding] = _DeliveryAuthority(
+        state="published",
+        run_id=authority.run_id,
+        managed_directory=authority.managed_directory,
+        verification_snapshot=authority.verification_snapshot,
+        verification_tree=authority.verification_tree,
+    )
+
+
+def _revoke_publication(delivery: "PublishedDelivery") -> None:
+    """撤销没有越过提交点却被回调暂时观察到的发布证明。"""
+    if not isinstance(delivery, PublishedDelivery):
+        raise TypeError("只能撤销 Publication 创建的 PublishedDelivery")
+    _delivery_authority(
+        delivery._binding,
+        expected_state="publishing",
+        message="PublishedDelivery 只能由 Publication 创建",
+    )
+    del _DELIVERY_AUTHORITIES[delivery._binding]
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -166,6 +248,7 @@ class VerifiedDelivery:
         delivery: UnverifiedDelivery,
         *,
         verification_snapshot: str,
+        verification_tree: tuple[ManagedTreeEntry, ...] | None = None,
     ) -> "VerifiedDelivery":
         """只接受未验证交付并绑定不可变验证快照。"""
         if not isinstance(delivery, UnverifiedDelivery):
@@ -177,6 +260,7 @@ class VerifiedDelivery:
         )
         delivery.managed_directory._assert_current_directory()
         snapshot = _snapshot(verification_snapshot)
+        tree = _tree_snapshot(verification_tree)
         instance = object.__new__(cls)
         object.__setattr__(
             instance,
@@ -187,6 +271,7 @@ class VerifiedDelivery:
                 ManagedDirectoryRole.DELIVERY_STAGING,
                 state="verified",
                 verification_snapshot=snapshot,
+                verification_tree=tree,
             ),
         )
         object.__setattr__(instance, "verification_snapshot", snapshot)
@@ -256,12 +341,39 @@ class PublishedDelivery:
                 ManagedDirectoryRole.PUBLISHED_DELIVERY,
                 state="published",
                 verification_snapshot=verification_snapshot,
+                verification_tree=authority.verification_tree,
             ),
         )
         object.__setattr__(
             instance,
             "verification_snapshot",
             verification_snapshot,
+        )
+        return instance
+
+    @classmethod
+    def _prepare_publication(
+        cls,
+        delivery: VerifiedDelivery,
+        *,
+        published_directory: ManagedDirectoryCapability,
+    ) -> "PublishedDelivery":
+        """形成提交回调可验证、但尚不能使用最终目录的临时证明。"""
+        instance = cls._from_publication(
+            delivery,
+            published_directory=published_directory,
+        )
+        authority = _delivery_authority(
+            instance._binding,
+            expected_state="published",
+            message="PublishedDelivery 只能由 Publication 创建",
+        )
+        _DELIVERY_AUTHORITIES[instance._binding] = _DeliveryAuthority(
+            state="publishing",
+            run_id=authority.run_id,
+            managed_directory=authority.managed_directory,
+            verification_snapshot=authority.verification_snapshot,
+            verification_tree=authority.verification_tree,
         )
         return instance
 

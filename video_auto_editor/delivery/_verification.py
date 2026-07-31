@@ -416,6 +416,7 @@ class DeliveryVerification:
             return VerifiedDelivery._from_verification(
                 delivery,
                 verification_snapshot="sha256:" + snapshot.hexdigest(),
+                verification_tree=final_tree_entries,
             )
         except WorkspaceFailure as failure:
             raise _file_access_failure(

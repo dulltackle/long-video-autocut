@@ -244,7 +244,7 @@ def test_typed_transcription_failure_stops_before_planning_and_new_delivery(
     )
 
     outcome = application.execute(
-        LiveRunRequest(source, workspace_dir=workspace)
+        LiveRunRequest(source, workspace_dir=workspace, overwrite=True)
     )
 
     assert outcome.state is LiveRunState.FAILED
@@ -342,7 +342,7 @@ def test_incomplete_coverage_fails_the_run_without_partial_delivery_or_recovery_
     )
 
     outcome = application.execute(
-        LiveRunRequest(source, workspace_dir=workspace)
+        LiveRunRequest(source, workspace_dir=workspace, overwrite=True)
     )
 
     assert outcome.state is LiveRunState.FAILED
@@ -410,7 +410,7 @@ def test_invalid_transcription_output_stops_as_external_failure(
     )
 
     outcome = application.execute(
-        LiveRunRequest(source, workspace_dir=workspace)
+        LiveRunRequest(source, workspace_dir=workspace, overwrite=True)
     )
 
     assert outcome.state is LiveRunState.FAILED
@@ -461,7 +461,7 @@ def test_transcription_cancellation_stops_before_planning_and_new_delivery(
     )
 
     outcome = application.execute(
-        LiveRunRequest(source, workspace_dir=workspace)
+        LiveRunRequest(source, workspace_dir=workspace, overwrite=True)
     )
 
     assert outcome.state is LiveRunState.INTERRUPTED

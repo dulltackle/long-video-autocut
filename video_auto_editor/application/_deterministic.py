@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 
 from video_auto_editor.configuration import Configuration, LoadedConfiguration
+from video_auto_editor.delivery import Publication
 from video_auto_editor.delivery.capability import (
     PublishedDelivery,
     UnverifiedDelivery,
@@ -238,6 +239,7 @@ class _DeterministicRunAssembly:
         "_failure_stage",
         "_invalid_result_stage",
         "_invalid_work_count_stage",
+        "_overwrite",
         "_postcommit_cancellation",
         "_postcommit_effect_failure",
         "_result_kind",
@@ -246,7 +248,6 @@ class _DeterministicRunAssembly:
         "_speech_recognition",
         "_subtitle_failure",
         "_unexpected_stage",
-        "_verified_manifest_bytes",
     )
 
     def __init__(
@@ -263,13 +264,13 @@ class _DeterministicRunAssembly:
         invalid_work_count_stage: RunStage | None,
         postcommit_cancellation: bool,
         postcommit_effect_failure: bool,
+        overwrite: bool,
     ) -> None:
         self._run_workspace = run_workspace
         self._source_analyzer = source_analyzer
         self._speech_recognition = speech_recognition
         self._built_manifest_bytes: bytes | None = None
         self._built_result_kind: ResultKind | None = None
-        self._verified_manifest_bytes: bytes | None = None
         self._course_context_sha256 = (
             None
             if configuration.course_context is None
@@ -283,6 +284,7 @@ class _DeterministicRunAssembly:
         self._invalid_work_count_stage = invalid_work_count_stage
         self._postcommit_cancellation = postcommit_cancellation
         self._postcommit_effect_failure = postcommit_effect_failure
+        self._overwrite = overwrite
 
     def _before_work(self, stage: RunStage) -> None:
         if stage is self._failure_stage:
@@ -589,10 +591,35 @@ class _DeterministicRunAssembly:
                 relative_path="manifest.json",
             )
         )
-        self._verified_manifest_bytes = manifest_bytes
+        try:
+            tree = delivery.managed_directory.inspect_tree()
+            snapshot = hashlib.sha256(b"delivery_snapshot.v1\0")
+            for entry in tree:
+                if entry.byte_length is None:
+                    continue
+                contents = delivery.managed_directory.location(
+                    entry.relative_path
+                ).read_bytes()
+                path_bytes = entry.relative_path.encode("utf-8")
+                snapshot.update(len(path_bytes).to_bytes(8, "big"))
+                snapshot.update(path_bytes)
+                snapshot.update(len(contents).to_bytes(8, "big"))
+                snapshot.update(hashlib.sha256(contents).digest())
+            final_tree = delivery.managed_directory.inspect_tree()
+        except (OSError, WorkspaceFailure):
+            raise _DeterministicFailure(
+                ErrorCode.DELIVERY_VERIFICATION_FAILED,
+                ErrorModule.DELIVERY_VERIFICATION,
+            ) from None
+        if final_tree != tree:
+            raise _DeterministicFailure(
+                ErrorCode.DELIVERY_VERIFICATION_FAILED,
+                ErrorModule.DELIVERY_VERIFICATION,
+            )
         verified = VerifiedDelivery._from_verification(
             delivery,
-            verification_snapshot="deterministic-v1",
+            verification_snapshot="sha256:" + snapshot.hexdigest(),
+            verification_tree=tree,
         )
         return self._work(
             RunStage.DELIVERY_VERIFICATION,
@@ -606,8 +633,8 @@ class _DeterministicRunAssembly:
         stage: StageDiagnostics,
         cancellation: CancellationToken,
         commit: Callable[
-            [_StageWork, Callable[[], None]],
-            _StageWork,
+            [PublishedDelivery, Callable[[], None]],
+            None,
         ],
     ) -> _StageWork:
         stage.scope(ErrorModule.PUBLICATION)
@@ -619,49 +646,22 @@ class _DeterministicRunAssembly:
                 _DeterministicFact("invalid_publication"),
                 1,
             )
-        manifest = self._verified_manifest_bytes
-        if not isinstance(manifest, bytes):
-            raise _DeterministicFailure(
-                ErrorCode.DELIVERY_VERIFICATION_FAILED,
-                ErrorModule.DELIVERY_VERIFICATION,
-            )
-        published = PublishedDelivery._from_publication(
+        if self._invalid_work_count_stage is RunStage.PUBLISHING:
+            return self._work(RunStage.PUBLISHING, delivery, 1)
+        published = Publication.publish(
             delivery,
             published_directory=self._run_workspace.published_delivery,
+            previous_directory=self._run_workspace.previous_delivery,
+            overwrite=self._overwrite,
+            cancellation=cancellation,
+            commit=commit,
         )
         work = self._work(RunStage.PUBLISHING, published, 1)
-        marker = self._run_workspace.published_delivery.location(
-            "manifest.json"
-        )
-
-        def publish_marker() -> None:
-            try:
-                marker.publish_bytes_atomically(manifest)
-            except Exception:
-                # 受管原子写可能在重命名已可见、父目录耐久同步失败
-                # 后报告失败。当前 run_id 唯一标记若已完整可见，则
-                # 逻辑提交点已经越过；真实耐久回滚属于 Publication。
-                try:
-                    visible_manifest = marker.read_bytes()
-                except Exception:
-                    raise _DeterministicFailure(
-                        ErrorCode.PUBLICATION_COMMIT_FAILED,
-                        ErrorModule.PUBLICATION,
-                    ) from None
-                if visible_manifest != manifest:
-                    raise _DeterministicFailure(
-                        ErrorCode.PUBLICATION_COMMIT_FAILED,
-                        ErrorModule.PUBLICATION,
-                    ) from None
-
-        # 先形成全部内存返回值，再把唯一可见写入交给应用拥有的短提交
-        # 临界区；回调会把物理提交与提交证明捕获绑定为一个边界。
-        committed = commit(work, publish_marker)
         if self._postcommit_cancellation:
             raise CancellationRequested(signal.SIGTERM)
         if self._postcommit_effect_failure:
             raise RuntimeError("deterministic postcommit effect failure")
-        return committed
+        return work
 
 
 class _DeterministicAssemblyFactory:
@@ -709,7 +709,6 @@ class _DeterministicAssemblyFactory:
         configuration: LoadedConfiguration,
         run_workspace: RunWorkspace,
     ) -> _RunAssembly:
-        del request
         return _DeterministicRunAssembly(
             run_workspace,
             self._source_analyzer,
@@ -725,6 +724,7 @@ class _DeterministicAssemblyFactory:
             self._invalid_work_count_stage,
             self._postcommit_cancellation,
             self._postcommit_effect_failure,
+            request.overwrite,
         )
 
 

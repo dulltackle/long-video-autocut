@@ -8,6 +8,7 @@ import ctypes
 import errno
 import fcntl
 import hashlib
+import json
 import os
 import secrets
 import stat
@@ -19,7 +20,10 @@ from pathlib import Path
 from threading import Condition, get_ident
 from typing import BinaryIO, Literal, TypeVar
 
-from video_auto_editor.runtime.cancellation import CancellationToken
+from video_auto_editor.runtime.cancellation import (
+    CancellationRequested,
+    CancellationToken,
+)
 from video_auto_editor.runtime.errors import ErrorCode
 from video_auto_editor.runtime.identity import RunId
 
@@ -35,6 +39,10 @@ from ._failure import WorkspaceFailure, _without_sensitive_exception_context
 
 _MARKER_NAME = ".video-auto-editor-workspace.json"
 _MARKER_BYTES = b'{"schema_version":"workspace.v1"}\n'
+_PUBLICATION_JOURNAL_NAME = ".publication-transaction.json"
+_PUBLICATION_JOURNAL_CREATE_PREFIX = ".publication-journal-create-"
+_PUBLICATION_JOURNAL_SCHEMA = "publication_transaction.v1"
+_MAX_PUBLICATION_JOURNAL_BYTES = 1024
 _CREATE_PREFIX = ".workspace-create-"
 _DIRECTORY_MODE = 0o700
 _SENSITIVE_FILE_MODE = 0o600
@@ -57,12 +65,20 @@ _ALLOWED_MANAGED_FILE_FLAGS = frozenset(
 )
 _Identity = tuple[int, int]
 _SourceIdentity = tuple[int, int, int, int, int]
+_PublicationState = Literal[
+    "initial",
+    "fresh_committed",
+    "overwrite_prepared",
+    "overwrite_committed",
+    "unknown",
+]
 _CAPABILITY_ISSUER = _claim_workspace_issuer()
 _LIVE_WORKSPACE = object()
 _DIAGNOSTIC_WORKSPACE = object()
 _MAINTENANCE_WORKSPACE = object()
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -135,6 +151,21 @@ class _ManagedTreeSnapshot:
     kind: ManagedTreeEntryKind
     status: _TreeStatSnapshot
     children: tuple["_ManagedTreeSnapshot", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicationTransactionResult:
+    layout: _LayoutSnapshot
+    staging_identity: _Identity
+    overwrote: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicationJournal:
+    current_identity: _Identity
+    previous_identity: _Identity
+    staging_identity: _Identity
+    overwrite: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -653,7 +684,16 @@ class Workspace:
                 fcntl.LOCK_EX | fcntl.LOCK_NB,
             )
             root_locked = True
-            self._validate_lease_root(root_descriptor)
+            refreshed_layout = _inspect_layout_descriptor(root_descriptor)
+            _assert_refreshable_layout(
+                refreshed_layout,
+                self._layout,
+            )
+            object.__setattr__(
+                self,
+                "_layout",
+                refreshed_layout,
+            )
             work_descriptor = self._open_layout_directory(
                 root_descriptor,
                 ("work",),
@@ -670,6 +710,11 @@ class Workspace:
                 fcntl.LOCK_EX | fcntl.LOCK_NB,
             )
             lock_locked = True
+            recovered_layout = self._recover_publication_transactions(
+                root_descriptor
+            )
+            if recovered_layout is not None:
+                object.__setattr__(self, "_layout", recovered_layout)
             self._validate_lease_root(root_descriptor)
             return _LockHandle(
                 root_descriptor=root_descriptor,
@@ -686,6 +731,8 @@ class Workspace:
             )
             if isinstance(exc, WorkspaceFailure) and (
                 exc.diagnostics.get("operation") == "workspace.verify"
+                or exc.error_code
+                is ErrorCode.PUBLICATION_ROLLBACK_FAILED
             ):
                 raise
             raise _workspace_lock_failure() from exc
@@ -696,10 +743,8 @@ class Workspace:
     def _open_verified_root(self) -> int:
         try:
             descriptor = _open_absolute_directory_no_follow(self.root)
-            _inspect_layout_descriptor(
-                descriptor,
-                expected=self._layout,
-            )
+            if _identity(os.fstat(descriptor)) != self._layout.root:
+                raise _invalid_workspace_marker()
             return descriptor
         except WorkspaceFailure:
             if "descriptor" in locals():
@@ -745,6 +790,75 @@ class Workspace:
             expected_mount_id=self._layout.mount_id,
         )
 
+    def _recover_publication_transactions(
+        self,
+        root_descriptor: int,
+    ) -> _LayoutSnapshot | None:
+        """持锁恢复崩溃时仍带有提交日志的目录交换。"""
+        temporary_descriptor = -1
+        recovered = False
+        try:
+            temporary_descriptor = self._open_layout_directory(
+                root_descriptor,
+                ("work", "tmp"),
+            )
+            for run_name in _directory_names(temporary_descriptor):
+                run_descriptor = -1
+                try:
+                    status = os.stat(
+                        run_name,
+                        dir_fd=temporary_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if not stat.S_ISDIR(status.st_mode):
+                        continue
+                    run_descriptor = _open_directory_at(
+                        temporary_descriptor,
+                        run_name,
+                        expected=_identity(status),
+                    )
+                    journal_record = _read_publication_journal(
+                        run_descriptor,
+                        expected_mount_id=self._layout.mount_id,
+                    )
+                    if journal_record is None:
+                        continue
+                    journal, journal_identity = journal_record
+                    _rollback_publication_directories(
+                        root_descriptor,
+                        run_descriptor,
+                        "delivery",
+                        current_identity=journal.current_identity,
+                        previous_identity=journal.previous_identity,
+                        staging_identity=journal.staging_identity,
+                        expected_mount_id=self._layout.mount_id,
+                        overwrite=journal.overwrite,
+                    )
+                    _remove_publication_journal(
+                        run_descriptor,
+                        journal_identity,
+                    )
+                    recovered = True
+                except WorkspaceFailure:
+                    raise
+                except (OSError, ValueError, TypeError) as exc:
+                    raise _publication_failure(
+                        ErrorCode.PUBLICATION_ROLLBACK_FAILED,
+                        operation="publication.rollback",
+                        reason_code=(
+                            "publication.rollback_state_uncertain"
+                        ),
+                    ) from exc
+                finally:
+                    if run_descriptor >= 0:
+                        _close_publication_descriptor(run_descriptor)
+            if not recovered:
+                return None
+            return _inspect_layout_descriptor(root_descriptor)
+        finally:
+            if temporary_descriptor >= 0:
+                _close_publication_descriptor(temporary_descriptor)
+
     def _validate_managed_directory(
         self,
         root_descriptor: int,
@@ -775,6 +889,194 @@ class Workspace:
             if descriptor >= 0:
                 os.close(descriptor)
         self._validate_lease_root(root_descriptor)
+
+    def _publish_delivery_directories(
+        self,
+        root_descriptor: int,
+        staging_parts: tuple[str, ...],
+        staging_identities: tuple[_Identity, ...],
+        *,
+        overwrite: bool,
+        cancellation: CancellationToken,
+    ) -> _PublicationTransactionResult:
+        """交换完整目录，并在提交失败时恢复三个目录的初始身份。"""
+        if not isinstance(overwrite, bool):
+            raise TypeError("覆盖发布选项必须是布尔值")
+        if not isinstance(cancellation, CancellationToken):
+            raise TypeError("目录发布必须绑定根取消令牌")
+        _validate_effect_parts(staging_parts, allow_empty=False)
+        if (
+            len(staging_parts) < 2
+            or len(staging_parts) != len(staging_identities)
+        ):
+            raise ValueError("发布暂存目录绑定不完整")
+        self._validate_lease_root(root_descriptor)
+        staging_parent_descriptor = -1
+        current_descriptor = -1
+        current_identity = self._layout.directory(("delivery",))
+        previous_identity = self._layout.directory(("delivery.previous",))
+        staging_identity = staging_identities[-1]
+        journal_identity: _Identity | None = None
+        try:
+            staging_parent_descriptor = _open_bound_directory(
+                root_descriptor,
+                staging_parts[:-1],
+                staging_identities[:-1],
+                expected_mount_id=self._layout.mount_id,
+            )
+            current_descriptor = _open_directory_at(
+                root_descriptor,
+                "delivery",
+                expected=current_identity,
+            )
+            _assert_publication_directory(
+                current_descriptor,
+                expected_mount_id=self._layout.mount_id,
+            )
+            _assert_publication_name(
+                root_descriptor,
+                "delivery.previous",
+                previous_identity,
+                expected_mount_id=self._layout.mount_id,
+            )
+            _assert_publication_name(
+                staging_parent_descriptor,
+                staging_parts[-1],
+                staging_identity,
+                expected_mount_id=self._layout.mount_id,
+            )
+            current_nonempty = not _directory_is_empty(current_descriptor)
+            if not overwrite and current_nonempty:
+                raise _publication_failure(
+                    ErrorCode.PUBLICATION_COMMIT_FAILED,
+                    operation="publication.verify_binding",
+                    reason_code="publication.destination_not_empty",
+                )
+
+            phase = (
+                "previous_move" if current_nonempty else "delivery_exchange"
+            )
+            try:
+                cancellation.raise_if_cancelled()
+                journal_identity = _write_publication_journal(
+                    staging_parent_descriptor,
+                    _PublicationJournal(
+                        current_identity=current_identity,
+                        previous_identity=previous_identity,
+                        staging_identity=staging_identity,
+                        overwrite=current_nonempty,
+                    ),
+                )
+                if current_nonempty:
+                    _exchange_publication_directories(
+                        root_descriptor,
+                        "delivery.previous",
+                        staging_parent_descriptor,
+                        staging_parts[-1],
+                    )
+                    phase = "previous_sync"
+                    _sync_publication_directory(root_descriptor)
+                    _sync_publication_directory(staging_parent_descriptor)
+                    cancellation.raise_if_cancelled_or_signal_pending()
+                    phase = "delivery_exchange"
+                    _exchange_publication_directories(
+                        root_descriptor,
+                        "delivery",
+                        root_descriptor,
+                        "delivery.previous",
+                    )
+                else:
+                    _exchange_publication_directories(
+                        root_descriptor,
+                        "delivery",
+                        staging_parent_descriptor,
+                        staging_parts[-1],
+                    )
+                phase = "delivery_sync"
+                _sync_publication_directory(root_descriptor)
+                _sync_publication_directory(staging_parent_descriptor)
+                phase = "commit_verify"
+                _assert_publication_state(
+                    root_descriptor,
+                    staging_parent_descriptor,
+                    staging_parts[-1],
+                    current_identity=current_identity,
+                    previous_identity=previous_identity,
+                    staging_identity=staging_identity,
+                    expected_mount_id=self._layout.mount_id,
+                    expected=(
+                        "overwrite_committed"
+                        if current_nonempty
+                        else "fresh_committed"
+                    ),
+                )
+                layout = _inspect_layout_descriptor(root_descriptor)
+                phase = "commit_cleanup"
+                _remove_publication_journal(
+                    staging_parent_descriptor,
+                    journal_identity,
+                )
+                journal_identity = None
+            except BaseException as failure:
+                interrupted = isinstance(
+                    failure,
+                    CancellationRequested,
+                )
+                must_propagate = interrupted or not isinstance(
+                    failure,
+                    Exception,
+                )
+                original = (
+                    failure
+                    if must_propagate
+                    else _publication_transaction_failure(phase)
+                )
+                try:
+                    _rollback_publication_directories(
+                        root_descriptor,
+                        staging_parent_descriptor,
+                        staging_parts[-1],
+                        current_identity=current_identity,
+                        previous_identity=previous_identity,
+                        staging_identity=staging_identity,
+                        expected_mount_id=self._layout.mount_id,
+                        overwrite=current_nonempty,
+                    )
+                except WorkspaceFailure as rollback_failure:
+                    raise rollback_failure from failure
+                if journal_identity is not None:
+                    try:
+                        _remove_publication_journal(
+                            staging_parent_descriptor,
+                            journal_identity,
+                            allow_missing=True,
+                        )
+                    except OSError as cleanup_failure:
+                        raise _publication_failure(
+                            ErrorCode.PUBLICATION_ROLLBACK_FAILED,
+                            operation="publication.rollback",
+                            reason_code=(
+                                "publication.rollback_state_uncertain"
+                            ),
+                        ) from cleanup_failure
+                if must_propagate:
+                    raise
+                raise original from failure
+
+            return _PublicationTransactionResult(
+                layout=layout,
+                staging_identity=(
+                    previous_identity
+                    if current_nonempty
+                    else current_identity
+                ),
+                overwrote=current_nonempty,
+            )
+        finally:
+            if current_descriptor >= 0:
+                _close_publication_descriptor(current_descriptor)
+            if staging_parent_descriptor >= 0:
+                _close_publication_descriptor(staging_parent_descriptor)
 
     def _inspect_managed_tree(
         self,
@@ -1906,6 +2208,10 @@ class Workspace:
                 raise _workspace_cleanup_failure(
                     "workspace.ownership_changed"
                 )
+            if _publication_journal_present(child_descriptor):
+                raise _workspace_cleanup_failure(
+                    "workspace.remove_failed"
+                )
             _remove_directory_contents(
                 child_descriptor,
                 expected_device=self._layout.root[0],
@@ -2116,7 +2422,144 @@ class _LeaseGuard:
                 )
             )
 
-        return _CAPABILITY_ISSUER.operations(
+        def publish_delivery(
+            staging: ManagedDirectoryCapability,
+            current: ManagedDirectoryCapability,
+            previous: ManagedDirectoryCapability,
+            overwrite: bool,
+            verification_tree: tuple[ManagedTreeEntry, ...],
+            cancellation: CancellationToken,
+        ) -> None:
+            for directory in (staging, current, previous):
+                if not isinstance(directory, ManagedDirectoryCapability):
+                    raise TypeError(
+                        "目录发布必须使用 Workspace 签发的受管目录 capability"
+                    )
+                directory._assert_authentic()
+            if (
+                role is not ManagedDirectoryRole.DELIVERY_STAGING
+                or staging.role is not ManagedDirectoryRole.DELIVERY_STAGING
+                or current.role
+                is not ManagedDirectoryRole.PUBLISHED_DELIVERY
+                or previous.role
+                is not ManagedDirectoryRole.PREVIOUS_DELIVERY
+            ):
+                raise ValueError("目录发布 capability 角色不匹配")
+            if not (
+                staging._belongs_to_same_workspace(current)
+                and staging._belongs_to_same_workspace(previous)
+            ):
+                raise ValueError("发布目录必须属于同一个 Workspace")
+            if (
+                staging.bound_run_id != run_id
+                or current.bound_run_id != run_id
+                or previous.bound_run_id != run_id
+            ):
+                raise ValueError("发布目录必须绑定同一次运行")
+            if not isinstance(verification_tree, tuple) or any(
+                not isinstance(entry, ManagedTreeEntry)
+                for entry in verification_tree
+            ):
+                raise TypeError("发布必须绑定已验证目录树快照")
+            if not isinstance(cancellation, CancellationToken):
+                raise TypeError("目录发布必须绑定根取消令牌")
+
+            current_identity = self._workspace._layout.directory(
+                ("delivery",)
+            )
+            previous_identity = self._workspace._layout.directory(
+                ("delivery.previous",)
+            )
+            staging_identity = base_identities[-1]
+            rebound_current = self.bind(
+                ("delivery",),
+                (staging_identity,),
+                workspace_identity=workspace_identity,
+                run_id=run_id,
+                role=ManagedDirectoryRole.PUBLISHED_DELIVERY,
+            )
+            rebound_previous_after_overwrite = self.bind(
+                ("delivery.previous",),
+                (current_identity,),
+                workspace_identity=workspace_identity,
+                run_id=run_id,
+                role=ManagedDirectoryRole.PREVIOUS_DELIVERY,
+            )
+            rebound_previous_after_fresh = self.bind(
+                ("delivery.previous",),
+                (previous_identity,),
+                workspace_identity=workspace_identity,
+                run_id=run_id,
+                role=ManagedDirectoryRole.PREVIOUS_DELIVERY,
+            )
+            rebound_staging_after_fresh = self.bind(
+                base_parts,
+                (*base_identities[:-1], current_identity),
+                workspace_identity=workspace_identity,
+                run_id=run_id,
+                role=ManagedDirectoryRole.DELIVERY_STAGING,
+            )
+            rebound_staging_after_overwrite = self.bind(
+                base_parts,
+                (*base_identities[:-1], previous_identity),
+                workspace_identity=workspace_identity,
+                run_id=run_id,
+                role=ManagedDirectoryRole.DELIVERY_STAGING,
+            )
+
+            def publish_under_exclusive(root_descriptor: int) -> None:
+                if (
+                    self._workspace._inspect_managed_tree(
+                        root_descriptor,
+                        base_parts,
+                        base_identities,
+                    )
+                    != verification_tree
+                ):
+                    raise _publication_failure(
+                        ErrorCode.PUBLICATION_COMMIT_FAILED,
+                        operation="publication.verify_snapshot",
+                        reason_code="publication.snapshot_changed",
+                    )
+                result = self._workspace._publish_delivery_directories(
+                    root_descriptor,
+                    base_parts,
+                    base_identities,
+                    overwrite=overwrite,
+                    cancellation=cancellation,
+                )
+                object.__setattr__(
+                    self._workspace,
+                    "_layout",
+                    result.layout,
+                )
+                object.__setattr__(
+                    staging,
+                    "_operations",
+                    (
+                        rebound_staging_after_overwrite
+                        if result.overwrote
+                        else rebound_staging_after_fresh
+                    ),
+                )
+                object.__setattr__(
+                    current,
+                    "_operations",
+                    rebound_current,
+                )
+                object.__setattr__(
+                    previous,
+                    "_operations",
+                    (
+                        rebound_previous_after_overwrite
+                        if result.overwrote
+                        else rebound_previous_after_fresh
+                    ),
+                )
+
+            self.execute_publication_exclusive(publish_under_exclusive)
+
+        operations = _CAPABILITY_ISSUER.operations(
             use_file=use_file,
             publish_file=publish_file,
             validate_directory=validate_directory,
@@ -2124,10 +2567,12 @@ class _LeaseGuard:
             inspect_tree=inspect_tree,
             use_exclusive_lock=use_exclusive_lock,
             quarantine_file=quarantine_file,
+            publish_delivery=publish_delivery,
             workspace_identity=workspace_identity,
             run_id=run_id,
             role=role,
         )
+        return operations
 
     def execute(
         self,
@@ -2146,6 +2591,20 @@ class _LeaseGuard:
         finally:
             try:
                 os.close(descriptor)
+            finally:
+                self._finish_exclusive_effect()
+
+    def execute_publication_exclusive(
+        self,
+        effect: Callable[[int], _ResultT],
+    ) -> _ResultT:
+        """提交后的描述符关闭故障不得伪装成可回滚发布失败。"""
+        descriptor = self._begin_exclusive_effect()
+        try:
+            return effect(descriptor)
+        finally:
+            try:
+                _close_publication_descriptor(descriptor)
             finally:
                 self._finish_exclusive_effect()
 
@@ -2892,6 +3351,36 @@ def _assert_layout_identity(
         raise _invalid_workspace_marker()
 
 
+def _assert_refreshable_layout(
+    actual: _LayoutSnapshot,
+    previous: _LayoutSnapshot,
+) -> None:
+    """持有根锁后只允许发布事务改变两个固定交付目录身份。"""
+    publication_parts = {
+        ("delivery",),
+        ("delivery.previous",),
+    }
+    actual_stable_directories = tuple(
+        item
+        for item in actual.directories
+        if item[0] not in publication_parts
+    )
+    previous_stable_directories = tuple(
+        item
+        for item in previous.directories
+        if item[0] not in publication_parts
+    )
+    if actual.lock != previous.lock:
+        raise _workspace_lock_failure()
+    if (
+        actual.root != previous.root
+        or actual.mount_id != previous.mount_id
+        or actual.marker != previous.marker
+        or actual_stable_directories != previous_stable_directories
+    ):
+        raise _invalid_workspace_marker()
+
+
 def _open_absolute_directory_no_follow(path: Path) -> int:
     if not path.is_absolute():
         raise OSError("受管目录必须是绝对路径")
@@ -3564,6 +4053,655 @@ def _quarantine_and_remove(
             )
             os.rmdir(quarantine_name, dir_fd=parent_descriptor)
             _sync_cleanup_directory(parent_descriptor)
+
+
+def _publication_identity_payload(identity: _Identity) -> list[int]:
+    return [identity[0], identity[1]]
+
+
+def _publication_journal_bytes(
+    journal: _PublicationJournal,
+) -> bytes:
+    payload = {
+        "current_identity": _publication_identity_payload(
+            journal.current_identity
+        ),
+        "overwrite": journal.overwrite,
+        "previous_identity": _publication_identity_payload(
+            journal.previous_identity
+        ),
+        "schema_version": _PUBLICATION_JOURNAL_SCHEMA,
+        "staging_identity": _publication_identity_payload(
+            journal.staging_identity
+        ),
+    }
+    return (
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _publication_journal_identity(value: object) -> _Identity:
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or any(
+            isinstance(part, bool)
+            or not isinstance(part, int)
+            or part < 0
+            for part in value
+        )
+    ):
+        raise ValueError("发布事务日志目录身份不合法")
+    return value[0], value[1]
+
+
+def _parse_publication_journal(contents: bytes) -> _PublicationJournal:
+    if (
+        not contents
+        or len(contents) > _MAX_PUBLICATION_JOURNAL_BYTES
+        or not contents.endswith(b"\n")
+    ):
+        raise ValueError("发布事务日志长度不合法")
+    payload = json.loads(contents)
+    if not isinstance(payload, dict) or set(payload) != {
+        "current_identity",
+        "overwrite",
+        "previous_identity",
+        "schema_version",
+        "staging_identity",
+    }:
+        raise ValueError("发布事务日志字段不合法")
+    if payload["schema_version"] != _PUBLICATION_JOURNAL_SCHEMA:
+        raise ValueError("发布事务日志版本不支持")
+    overwrite = payload["overwrite"]
+    if type(overwrite) is not bool:
+        raise ValueError("发布事务日志覆盖标记不合法")
+    return _PublicationJournal(
+        current_identity=_publication_journal_identity(
+            payload["current_identity"]
+        ),
+        previous_identity=_publication_journal_identity(
+            payload["previous_identity"]
+        ),
+        staging_identity=_publication_journal_identity(
+            payload["staging_identity"]
+        ),
+        overwrite=overwrite,
+    )
+
+
+def _write_publication_journal(
+    parent_descriptor: int,
+    journal: _PublicationJournal,
+) -> _Identity:
+    descriptor = -1
+    temporary_name = ""
+    temporary_identity: _Identity | None = None
+    published = False
+    try:
+        for _ in range(16):
+            candidate = (
+                f"{_PUBLICATION_JOURNAL_CREATE_PREFIX}"
+                f"{secrets.token_hex(16)}"
+            )
+            try:
+                descriptor = os.open(
+                    candidate,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC
+                    | os.O_NONBLOCK,
+                    _SENSITIVE_FILE_MODE,
+                    dir_fd=parent_descriptor,
+                )
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if descriptor < 0:
+            raise OSError(
+                errno.EBUSY,
+                "无法分配发布事务日志临时文件",
+            )
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+            raise OSError(errno.EINVAL, "发布事务日志类型不合法")
+        temporary_identity = _identity(status)
+        os.fchmod(descriptor, _SENSITIVE_FILE_MODE)
+        contents = memoryview(_publication_journal_bytes(journal))
+        while contents:
+            written = os.write(descriptor, contents)
+            if written == 0:
+                raise OSError("无法写入发布事务日志")
+            contents = contents[written:]
+        os.fsync(descriptor)
+        _assert_name_identity(
+            parent_descriptor,
+            temporary_name,
+            temporary_identity,
+        )
+        _rename_no_replace(
+            parent_descriptor,
+            temporary_name,
+            parent_descriptor,
+            _PUBLICATION_JOURNAL_NAME,
+        )
+        published = True
+        _assert_name_identity(
+            parent_descriptor,
+            _PUBLICATION_JOURNAL_NAME,
+            temporary_identity,
+        )
+        os.fsync(parent_descriptor)
+        return temporary_identity
+    finally:
+        if descriptor >= 0:
+            _close_publication_descriptor(descriptor)
+        if (
+            temporary_name
+            and temporary_identity is not None
+            and not published
+        ):
+            try:
+                _remove_atomic_publish_temporary(
+                    parent_descriptor,
+                    temporary_name,
+                    temporary_identity,
+                )
+            except (OSError, WorkspaceFailure):
+                pass
+
+
+def _read_publication_journal(
+    parent_descriptor: int,
+    *,
+    expected_mount_id: int,
+) -> tuple[_PublicationJournal, _Identity] | None:
+    try:
+        descriptor, status = _open_regular_at(
+            parent_descriptor,
+            _PUBLICATION_JOURNAL_NAME,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        if (
+            stat.S_IMODE(status.st_mode) != _SENSITIVE_FILE_MODE
+            or _descriptor_mount_id(descriptor) != expected_mount_id
+        ):
+            raise ValueError("发布事务日志归属不合法")
+        contents = os.read(
+            descriptor,
+            _MAX_PUBLICATION_JOURNAL_BYTES + 1,
+        )
+        return _parse_publication_journal(contents), _identity(status)
+    finally:
+        _close_publication_descriptor(descriptor)
+
+
+def _remove_publication_journal(
+    parent_descriptor: int,
+    expected_identity: _Identity,
+    *,
+    allow_missing: bool = False,
+) -> None:
+    try:
+        status = os.stat(
+            _PUBLICATION_JOURNAL_NAME,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        if not allow_missing:
+            raise
+        os.fsync(parent_descriptor)
+        return
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or status.st_nlink != 1
+        or _identity(status) != expected_identity
+    ):
+        raise OSError(errno.ESTALE, "发布事务日志身份已变化")
+    _assert_name_identity(
+        parent_descriptor,
+        _PUBLICATION_JOURNAL_NAME,
+        expected_identity,
+    )
+    os.unlink(
+        _PUBLICATION_JOURNAL_NAME,
+        dir_fd=parent_descriptor,
+    )
+    os.fsync(parent_descriptor)
+
+
+def _publication_journal_present(parent_descriptor: int) -> bool:
+    try:
+        status = os.stat(
+            _PUBLICATION_JOURNAL_NAME,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or status.st_nlink != 1
+        or stat.S_IMODE(status.st_mode) != _SENSITIVE_FILE_MODE
+    ):
+        raise OSError(errno.ESTALE, "发布事务日志身份已变化")
+    return True
+
+
+def _assert_publication_directory(
+    descriptor: int,
+    *,
+    expected_mount_id: int,
+) -> None:
+    status = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(status.st_mode)
+        or _descriptor_mount_id(descriptor) != expected_mount_id
+    ):
+        raise OSError(errno.ESTALE, "发布目录归属已变化")
+
+
+def _close_publication_descriptor(descriptor: int) -> None:
+    """Linux close 失败时描述符状态未定义，不能重试或撤销既有提交。"""
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _assert_publication_name(
+    parent_descriptor: int,
+    name: str,
+    expected_identity: _Identity,
+    *,
+    expected_mount_id: int,
+) -> None:
+    descriptor = _open_directory_at(
+        parent_descriptor,
+        name,
+        expected=expected_identity,
+    )
+    try:
+        _assert_publication_directory(
+            descriptor,
+            expected_mount_id=expected_mount_id,
+        )
+    finally:
+        _close_publication_descriptor(descriptor)
+
+
+def _exchange_publication_directories(
+    first_parent_descriptor: int,
+    first_name: str,
+    second_parent_descriptor: int,
+    second_name: str,
+) -> None:
+    """以 Linux renameat2 的 exchange 语义交换两个完整目录。"""
+    try:
+        renameat2 = _LIBC.renameat2
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "系统缺少 renameat2") from exc
+    result = renameat2(
+        first_parent_descriptor,
+        ctypes.c_char_p(os.fsencode(first_name)),
+        second_parent_descriptor,
+        ctypes.c_char_p(os.fsencode(second_name)),
+        _RENAME_EXCHANGE,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            second_name,
+        )
+
+
+def _sync_publication_directory(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
+def _publication_name_identity(
+    parent_descriptor: int,
+    name: str,
+    *,
+    expected_mount_id: int,
+) -> _Identity:
+    descriptor = _open_directory_at(parent_descriptor, name)
+    try:
+        _assert_publication_directory(
+            descriptor,
+            expected_mount_id=expected_mount_id,
+        )
+        return _identity(os.fstat(descriptor))
+    finally:
+        _close_publication_descriptor(descriptor)
+
+
+def _publication_state(
+    root_descriptor: int,
+    staging_parent_descriptor: int,
+    staging_name: str,
+    *,
+    current_identity: _Identity,
+    previous_identity: _Identity,
+    staging_identity: _Identity,
+    expected_mount_id: int,
+) -> _PublicationState:
+    try:
+        identities = (
+            _publication_name_identity(
+                root_descriptor,
+                "delivery",
+                expected_mount_id=expected_mount_id,
+            ),
+            _publication_name_identity(
+                root_descriptor,
+                "delivery.previous",
+                expected_mount_id=expected_mount_id,
+            ),
+            _publication_name_identity(
+                staging_parent_descriptor,
+                staging_name,
+                expected_mount_id=expected_mount_id,
+            ),
+        )
+    except OSError:
+        return "unknown"
+    if identities == (
+        current_identity,
+        previous_identity,
+        staging_identity,
+    ):
+        return "initial"
+    if identities == (
+        staging_identity,
+        previous_identity,
+        current_identity,
+    ):
+        return "fresh_committed"
+    if identities == (
+        current_identity,
+        staging_identity,
+        previous_identity,
+    ):
+        return "overwrite_prepared"
+    if identities == (
+        staging_identity,
+        current_identity,
+        previous_identity,
+    ):
+        return "overwrite_committed"
+    return "unknown"
+
+
+def _assert_publication_state(
+    root_descriptor: int,
+    staging_parent_descriptor: int,
+    staging_name: str,
+    *,
+    current_identity: _Identity,
+    previous_identity: _Identity,
+    staging_identity: _Identity,
+    expected_mount_id: int,
+    expected: _PublicationState,
+) -> None:
+    actual = _publication_state(
+        root_descriptor,
+        staging_parent_descriptor,
+        staging_name,
+        current_identity=current_identity,
+        previous_identity=previous_identity,
+        staging_identity=staging_identity,
+        expected_mount_id=expected_mount_id,
+    )
+    if actual != expected:
+        raise _publication_failure(
+            ErrorCode.PUBLICATION_COMMIT_FAILED,
+            operation="publication.commit",
+            reason_code="publication.commit_state_uncertain",
+        )
+
+
+def _publication_failure(
+    error_code: ErrorCode,
+    *,
+    operation: str,
+    reason_code: str,
+) -> WorkspaceFailure:
+    return WorkspaceFailure(
+        error_code,
+        {
+            "operation": operation,
+            "reason_code": reason_code,
+        },
+    )
+
+
+def _publication_transaction_failure(phase: str) -> WorkspaceFailure:
+    if phase == "previous_move":
+        return _publication_failure(
+            ErrorCode.PUBLICATION_BACKUP_FAILED,
+            operation="publication.backup",
+            reason_code="publication.backup_move_failed",
+        )
+    if phase == "previous_sync":
+        return _publication_failure(
+            ErrorCode.PUBLICATION_BACKUP_FAILED,
+            operation="publication.sync",
+            reason_code="publication.directory_sync_failed",
+        )
+    if phase == "delivery_sync":
+        return _publication_failure(
+            ErrorCode.PUBLICATION_COMMIT_FAILED,
+            operation="publication.sync",
+            reason_code="publication.directory_sync_failed",
+        )
+    if phase == "commit_verify":
+        return _publication_failure(
+            ErrorCode.PUBLICATION_COMMIT_FAILED,
+            operation="publication.commit",
+            reason_code="publication.commit_state_uncertain",
+        )
+    if phase == "commit_cleanup":
+        return _publication_failure(
+            ErrorCode.PUBLICATION_COMMIT_FAILED,
+            operation="publication.commit",
+            reason_code="publication.commit_state_uncertain",
+        )
+    return _publication_failure(
+        ErrorCode.PUBLICATION_COMMIT_FAILED,
+        operation="publication.commit",
+        reason_code="publication.atomic_replace_failed",
+    )
+
+
+def _rollback_exchange(
+    first_parent_descriptor: int,
+    first_name: str,
+    second_parent_descriptor: int,
+    second_name: str,
+    *,
+    root_descriptor: int,
+    staging_parent_descriptor: int,
+    staging_name: str,
+    current_identity: _Identity,
+    previous_identity: _Identity,
+    staging_identity: _Identity,
+    expected_mount_id: int,
+    before: _PublicationState,
+    after: _PublicationState,
+    reason_code: str,
+) -> None:
+    try:
+        _exchange_publication_directories(
+            first_parent_descriptor,
+            first_name,
+            second_parent_descriptor,
+            second_name,
+        )
+    except OSError as failure:
+        actual = _publication_state(
+            root_descriptor,
+            staging_parent_descriptor,
+            staging_name,
+            current_identity=current_identity,
+            previous_identity=previous_identity,
+            staging_identity=staging_identity,
+            expected_mount_id=expected_mount_id,
+        )
+        if actual == after:
+            return
+        if actual != before:
+            raise _publication_failure(
+                ErrorCode.PUBLICATION_ROLLBACK_FAILED,
+                operation="publication.rollback",
+                reason_code="publication.rollback_state_uncertain",
+            ) from failure
+        raise _publication_failure(
+            ErrorCode.PUBLICATION_ROLLBACK_FAILED,
+            operation="publication.rollback",
+            reason_code=reason_code,
+        ) from failure
+    actual = _publication_state(
+        root_descriptor,
+        staging_parent_descriptor,
+        staging_name,
+        current_identity=current_identity,
+        previous_identity=previous_identity,
+        staging_identity=staging_identity,
+        expected_mount_id=expected_mount_id,
+    )
+    if actual != after:
+        raise _publication_failure(
+            ErrorCode.PUBLICATION_ROLLBACK_FAILED,
+            operation="publication.rollback",
+            reason_code="publication.rollback_state_uncertain",
+        )
+
+
+def _rollback_publication_directories(
+    root_descriptor: int,
+    staging_parent_descriptor: int,
+    staging_name: str,
+    *,
+    current_identity: _Identity,
+    previous_identity: _Identity,
+    staging_identity: _Identity,
+    expected_mount_id: int,
+    overwrite: bool,
+) -> None:
+    state = _publication_state(
+        root_descriptor,
+        staging_parent_descriptor,
+        staging_name,
+        current_identity=current_identity,
+        previous_identity=previous_identity,
+        staging_identity=staging_identity,
+        expected_mount_id=expected_mount_id,
+    )
+    if state == "unknown":
+        raise _publication_failure(
+            ErrorCode.PUBLICATION_ROLLBACK_FAILED,
+            operation="publication.rollback",
+            reason_code="publication.rollback_state_uncertain",
+        )
+    if overwrite and state == "overwrite_committed":
+        _rollback_exchange(
+            root_descriptor,
+            "delivery",
+            root_descriptor,
+            "delivery.previous",
+            root_descriptor=root_descriptor,
+            staging_parent_descriptor=staging_parent_descriptor,
+            staging_name=staging_name,
+            current_identity=current_identity,
+            previous_identity=previous_identity,
+            staging_identity=staging_identity,
+            expected_mount_id=expected_mount_id,
+            before="overwrite_committed",
+            after="overwrite_prepared",
+            reason_code="publication.delivery_restore_failed",
+        )
+        state = "overwrite_prepared"
+    if overwrite and state == "overwrite_prepared":
+        _rollback_exchange(
+            root_descriptor,
+            "delivery.previous",
+            staging_parent_descriptor,
+            staging_name,
+            root_descriptor=root_descriptor,
+            staging_parent_descriptor=staging_parent_descriptor,
+            staging_name=staging_name,
+            current_identity=current_identity,
+            previous_identity=previous_identity,
+            staging_identity=staging_identity,
+            expected_mount_id=expected_mount_id,
+            before="overwrite_prepared",
+            after="initial",
+            reason_code="publication.previous_restore_failed",
+        )
+        state = "initial"
+    if not overwrite and state == "fresh_committed":
+        _rollback_exchange(
+            root_descriptor,
+            "delivery",
+            staging_parent_descriptor,
+            staging_name,
+            root_descriptor=root_descriptor,
+            staging_parent_descriptor=staging_parent_descriptor,
+            staging_name=staging_name,
+            current_identity=current_identity,
+            previous_identity=previous_identity,
+            staging_identity=staging_identity,
+            expected_mount_id=expected_mount_id,
+            before="fresh_committed",
+            after="initial",
+            reason_code="publication.new_delivery_remove_failed",
+        )
+        state = "initial"
+    if state != "initial":
+        raise _publication_failure(
+            ErrorCode.PUBLICATION_ROLLBACK_FAILED,
+            operation="publication.rollback",
+            reason_code="publication.rollback_state_uncertain",
+        )
+    try:
+        _sync_publication_directory(root_descriptor)
+        _sync_publication_directory(staging_parent_descriptor)
+    except OSError as failure:
+        raise _publication_failure(
+            ErrorCode.PUBLICATION_ROLLBACK_FAILED,
+            operation="publication.sync",
+            reason_code="publication.directory_sync_failed",
+        ) from failure
+    final_state = _publication_state(
+        root_descriptor,
+        staging_parent_descriptor,
+        staging_name,
+        current_identity=current_identity,
+        previous_identity=previous_identity,
+        staging_identity=staging_identity,
+        expected_mount_id=expected_mount_id,
+    )
+    if final_state != "initial":
+        raise _publication_failure(
+            ErrorCode.PUBLICATION_ROLLBACK_FAILED,
+            operation="publication.rollback",
+            reason_code="publication.rollback_state_uncertain",
+        )
 
 
 def _rename_no_replace(

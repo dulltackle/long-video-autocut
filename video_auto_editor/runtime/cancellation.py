@@ -123,6 +123,14 @@ class CancellationToken:
         if self.cancelled:
             raise CancellationRequested(self.signal_number)
 
+    def raise_if_cancelled_or_signal_pending(self) -> None:
+        """在屏蔽信号的提交边界观察已经到达的根中断。"""
+        self.raise_if_cancelled()
+        pending_signals = signal.sigpending()
+        for signal_number in (signal.SIGINT, signal.SIGTERM):
+            if signal_number in pending_signals:
+                raise CancellationRequested(signal_number)
+
 
 class CancellationSource:
     """由应用独占、向所有深模块传播的根取消源。"""

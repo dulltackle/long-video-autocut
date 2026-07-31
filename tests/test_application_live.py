@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import video_auto_editor.application as application_api
+import video_auto_editor.workspace._workspace as workspace_effects
 from video_auto_editor.application import (
     LiveApplication,
     LiveRunOutcome,
@@ -21,6 +22,7 @@ from video_auto_editor.application.live import _CommitState
 from video_auto_editor.diagnostics import InterruptionSignal, ResultKind
 from video_auto_editor.runtime.errors import ErrorCode, ExitCode, RunStage
 from video_auto_editor.runtime.identity import (
+    RunId,
     TranscriptChunkId,
     TranscriptId,
 )
@@ -289,6 +291,89 @@ def test_topic_review_failure_stops_later_stages_and_cleans_temporary_content(
     assert manifest["stages"]["publishing"] == {
         "status": "not_started"
     }
+
+
+def test_nonempty_delivery_without_overwrite_is_rejected_after_diagnostics(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    Workspace.open(source, workspace)
+    current = workspace / "delivery" / "current.txt"
+    previous = workspace / "delivery.previous" / "previous.txt"
+    current.write_bytes(b"current delivery")
+    previous.write_bytes(b"previous delivery")
+    application = compose_deterministic_live_application(
+        unexpected_stage=RunStage.SOURCE_ANALYSIS,
+    )
+
+    outcome = application.execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.exit_code is ExitCode.PUBLICATION_FAILED
+    assert outcome.primary_error_code is ErrorCode.PUBLICATION_COMMIT_FAILED
+    assert outcome.primary_error is not None
+    assert outcome.primary_error.stage is RunStage.PREFLIGHT
+    assert outcome.primary_error.diagnostics == {
+        "operation": "publication.verify_binding",
+        "reason_code": "publication.destination_not_empty",
+    }
+    assert current.read_bytes() == b"current delivery"
+    assert previous.read_bytes() == b"previous delivery"
+    run_manifest = json.loads(
+        (
+            workspace
+            / "work"
+            / "runs"
+            / str(outcome.run_id)
+            / "run.json"
+        ).read_text()
+    )
+    assert run_manifest["stages"]["preflight"]["status"] == "failed"
+    assert run_manifest["stages"]["source_analysis"] == {
+        "status": "not_started"
+    }
+
+
+def test_explicit_overwrite_promotes_current_to_the_only_previous_version(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    Workspace.open(source, workspace)
+    current = workspace / "delivery" / "current.txt"
+    older = workspace / "delivery.previous" / "older.txt"
+    current.write_bytes(b"current delivery")
+    older.write_bytes(b"older delivery")
+
+    outcome = compose_deterministic_live_application().execute(
+        LiveRunRequest(
+            source,
+            workspace_dir=workspace,
+            overwrite=True,
+        )
+    )
+
+    assert outcome.state is LiveRunState.SUCCEEDED
+    assert json.loads(
+        (workspace / "delivery" / "manifest.json").read_text()
+    )["run_id"] == str(outcome.run_id)
+    assert sorted(
+        path.name for path in (workspace / "delivery").iterdir()
+    ) == ["manifest.json"]
+    assert (
+        workspace / "delivery.previous" / "current.txt"
+    ).read_bytes() == b"current delivery"
+    assert sorted(
+        path.name for path in (workspace / "delivery.previous").iterdir()
+    ) == ["current.txt"]
+    assert sorted(
+        path.name for path in workspace.iterdir() if path.is_dir()
+    ) == ["delivery", "delivery.previous", "work"]
 
 
 @pytest.mark.parametrize(
@@ -701,21 +786,19 @@ def test_signal_inside_publication_critical_section_observes_commit(
     source = tmp_path / "course.mp4"
     source.write_bytes(b"deterministic source")
     workspace = tmp_path / "workspace"
-    original_publish = ManagedPathCapability.publish_bytes_atomically
-    deterministic_manifest_writes = 0
+    original_exchange = workspace_effects._exchange_publication_directories
+    exchange_count = 0
 
-    def publish_after_signal(path, contents):
-        nonlocal deterministic_manifest_writes
-        if b'"schema_version":"deterministic.v1"' in bytes(contents):
-            deterministic_manifest_writes += 1
-            if deterministic_manifest_writes == 2:
-                os.kill(os.getpid(), signal.SIGTERM)
-        return original_publish(path, contents)
+    def exchange_after_signal(*args):
+        nonlocal exchange_count
+        original_exchange(*args)
+        exchange_count += 1
+        os.kill(os.getpid(), signal.SIGTERM)
 
     monkeypatch.setattr(
-        ManagedPathCapability,
-        "publish_bytes_atomically",
-        publish_after_signal,
+        workspace_effects,
+        "_exchange_publication_directories",
+        exchange_after_signal,
     )
 
     outcome = compose_deterministic_live_application().execute(
@@ -724,7 +807,7 @@ def test_signal_inside_publication_critical_section_observes_commit(
 
     assert outcome.state is LiveRunState.SUCCEEDED
     assert outcome.exit_code is ExitCode.SUCCESS
-    assert deterministic_manifest_writes == 2
+    assert exchange_count == 1
     assert (workspace / "delivery" / "manifest.json").is_file()
     events = [
         json.loads(line)
@@ -755,41 +838,108 @@ def test_signal_inside_publication_critical_section_observes_commit(
     assert committed_index < interruption_index
 
 
-def test_visible_marker_wins_over_post_rename_sync_failure(
+@pytest.mark.parametrize(
+    ("signal_number", "expected_signal", "expected_exit_code"),
+    [
+        (
+            signal.SIGINT,
+            InterruptionSignal.SIGINT,
+            ExitCode.SIGINT,
+        ),
+        (
+            signal.SIGTERM,
+            InterruptionSignal.SIGTERM,
+            ExitCode.SIGTERM,
+        ),
+    ],
+)
+def test_signal_after_overwrite_backup_rolls_back_before_commit(
+    tmp_path,
+    monkeypatch,
+    signal_number,
+    expected_signal,
+    expected_exit_code,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    Workspace.open(source, workspace)
+    current = workspace / "delivery" / "current.txt"
+    previous = workspace / "delivery.previous" / "previous.txt"
+    current.write_bytes(b"current delivery")
+    previous.write_bytes(b"previous delivery")
+    original_exchange = workspace_effects._exchange_publication_directories
+    exchange_count = 0
+
+    def signal_after_backup(*args):
+        nonlocal exchange_count
+        original_exchange(*args)
+        exchange_count += 1
+        if exchange_count == 1:
+            os.kill(os.getpid(), signal_number)
+
+    monkeypatch.setattr(
+        workspace_effects,
+        "_exchange_publication_directories",
+        signal_after_backup,
+    )
+
+    outcome = compose_deterministic_live_application().execute(
+        LiveRunRequest(
+            source,
+            workspace_dir=workspace,
+            overwrite=True,
+        )
+    )
+
+    assert outcome.state is LiveRunState.INTERRUPTED
+    assert outcome.exit_code is expected_exit_code
+    assert outcome.interruption_signal is expected_signal
+    assert exchange_count == 2
+    assert current.read_bytes() == b"current delivery"
+    assert previous.read_bytes() == b"previous delivery"
+    assert sorted(path.name for path in (workspace / "delivery").iterdir()) == [
+        "current.txt"
+    ]
+    assert sorted(
+        path.name for path in (workspace / "delivery.previous").iterdir()
+    ) == ["previous.txt"]
+    assert not (workspace / "work" / "tmp" / str(outcome.run_id)).exists()
+
+
+def test_parent_sync_failure_rolls_back_before_publication_commit(
     tmp_path,
     monkeypatch,
 ):
     source = tmp_path / "course.mp4"
     source.write_bytes(b"deterministic source")
     workspace = tmp_path / "workspace"
-    original_publish = ManagedPathCapability.publish_bytes_atomically
-    deterministic_manifest_writes = 0
+    original_sync = workspace_effects._sync_publication_directory
+    sync_count = 0
 
-    def publish_then_fail(path, contents):
-        nonlocal deterministic_manifest_writes
-        written = original_publish(path, contents)
-        if b'"schema_version":"deterministic.v1"' in bytes(contents):
-            deterministic_manifest_writes += 1
-            if deterministic_manifest_writes == 2:
-                raise OSError("deterministic directory sync failure")
-        return written
+    def fail_first_sync(descriptor):
+        nonlocal sync_count
+        sync_count += 1
+        if sync_count == 1:
+            raise OSError("deterministic directory sync failure")
+        original_sync(descriptor)
 
     monkeypatch.setattr(
-        ManagedPathCapability,
-        "publish_bytes_atomically",
-        publish_then_fail,
+        workspace_effects,
+        "_sync_publication_directory",
+        fail_first_sync,
     )
 
     outcome = compose_deterministic_live_application().execute(
         LiveRunRequest(source, workspace_dir=workspace)
     )
 
-    assert outcome.state is LiveRunState.SUCCEEDED
-    assert outcome.exit_code is ExitCode.SUCCESS
-    assert deterministic_manifest_writes == 2
-    assert json.loads(
-        (workspace / "delivery" / "manifest.json").read_text()
-    )["run_id"] == str(outcome.run_id)
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.exit_code is ExitCode.PUBLICATION_FAILED
+    assert outcome.primary_error_code is ErrorCode.PUBLICATION_COMMIT_FAILED
+    assert sync_count >= 3
+    assert not any((workspace / "delivery").iterdir())
+    assert not any((workspace / "delivery.previous").iterdir())
 
 
 def test_signal_during_terminal_manifest_marks_diagnostics_incomplete(
@@ -1372,7 +1522,7 @@ def test_verification_rejects_transcript_ids_not_created_by_this_run(
     )
 
 
-def test_publication_uses_the_manifest_snapshot_bound_by_verification(
+def test_publication_rejects_manifest_snapshot_changed_after_verification(
     tmp_path,
     monkeypatch,
 ):
@@ -1415,15 +1565,16 @@ def test_publication_uses_the_manifest_snapshot_bound_by_verification(
         LiveRunRequest(source, workspace_dir=workspace)
     )
 
-    published = json.loads(
-        (workspace / "delivery" / "manifest.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert outcome.state is LiveRunState.SUCCEEDED
-    assert manifest_read_count == 1
-    assert published["transcript_id"] != str(forged_transcript_id)
-    assert published["transcript_chunk_ids"] != [str(forged_chunk_id)]
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.exit_code is ExitCode.PUBLICATION_FAILED
+    assert outcome.primary_error_code is ErrorCode.PUBLICATION_COMMIT_FAILED
+    assert outcome.primary_error is not None
+    assert outcome.primary_error.diagnostics == {
+        "operation": "publication.verify_snapshot",
+        "reason_code": "publication.snapshot_changed",
+    }
+    assert manifest_read_count == 2
+    assert not any((workspace / "delivery").iterdir())
 
 
 def test_verification_reports_manifest_read_failure_as_stable_failure(
@@ -1552,20 +1703,16 @@ def test_physical_publication_failure_discards_reserved_commit_proof(
     source = tmp_path / "course.mp4"
     source.write_bytes(b"deterministic source")
     workspace = tmp_path / "workspace"
-    original_publish = ManagedPathCapability.publish_bytes_atomically
-    deterministic_manifest_writes = 0
+    exchange_attempts = 0
 
-    def fail_final_publication(path, contents):
-        nonlocal deterministic_manifest_writes
-        if b'"schema_version":"deterministic.v1"' in bytes(contents):
-            deterministic_manifest_writes += 1
-            if deterministic_manifest_writes == 2:
-                raise OSError("deterministic publication failure")
-        return original_publish(path, contents)
+    def fail_final_publication(*_args):
+        nonlocal exchange_attempts
+        exchange_attempts += 1
+        raise OSError("deterministic publication failure")
 
     monkeypatch.setattr(
-        ManagedPathCapability,
-        "publish_bytes_atomically",
+        workspace_effects,
+        "_exchange_publication_directories",
         fail_final_publication,
     )
 
@@ -1576,9 +1723,83 @@ def test_physical_publication_failure_discards_reserved_commit_proof(
     assert outcome.state is LiveRunState.FAILED
     assert outcome.exit_code is ExitCode.PUBLICATION_FAILED
     assert outcome.primary_error_code is ErrorCode.PUBLICATION_COMMIT_FAILED
-    assert deterministic_manifest_writes == 2
+    assert exchange_attempts == 1
     assert not any((workspace / "delivery").iterdir())
     assert not (workspace / "work" / "tmp" / str(outcome.run_id)).exists()
+
+
+def test_publication_rollback_failure_marks_recovery_incomplete(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+    original_inspection = workspace_effects._inspect_layout_descriptor
+    original_sync = workspace_effects._sync_publication_directory
+    original_exchange = workspace_effects._exchange_publication_directories
+    exchanged = False
+    sync_count = 0
+
+    def fail_commit_inspection(*args, **kwargs):
+        if exchanged and kwargs.get("expected") is None:
+            raise OSError("deterministic commit inspection failure")
+        return original_inspection(*args, **kwargs)
+
+    def observe_exchange(*args):
+        nonlocal exchanged
+        original_exchange(*args)
+        exchanged = True
+
+    def fail_rollback_sync(descriptor):
+        nonlocal sync_count
+        sync_count += 1
+        if sync_count == 3:
+            raise OSError("deterministic rollback sync failure")
+        original_sync(descriptor)
+
+    monkeypatch.setattr(
+        workspace_effects,
+        "_inspect_layout_descriptor",
+        fail_commit_inspection,
+    )
+    monkeypatch.setattr(
+        workspace_effects,
+        "_sync_publication_directory",
+        fail_rollback_sync,
+    )
+    monkeypatch.setattr(
+        workspace_effects,
+        "_exchange_publication_directories",
+        observe_exchange,
+    )
+
+    outcome = compose_deterministic_live_application().execute(
+        LiveRunRequest(source, workspace_dir=workspace)
+    )
+
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.primary_error_code is ErrorCode.PUBLICATION_ROLLBACK_FAILED
+    assert outcome.recovery_incomplete is True
+    assert not any((workspace / "delivery").iterdir())
+    assert not any((workspace / "delivery.previous").iterdir())
+    assert len(outcome.associated_errors) == 1
+    assert (
+        outcome.associated_errors[0].error_code
+        is ErrorCode.WORKSPACE_CLEANUP_FAILED
+    )
+    interrupted_temporary = (
+        workspace / "work" / "tmp" / str(outcome.run_id)
+    )
+    assert (
+        interrupted_temporary / ".publication-transaction.json"
+    ).is_file()
+
+    monkeypatch.undo()
+    recovered = Workspace.open(source, workspace)
+    with recovered.acquire_run(RunId.new()):
+        pass
+    assert not interrupted_temporary.exists()
 
 
 def test_signal_precedes_failure_inside_publication_critical_section(
@@ -1588,21 +1809,17 @@ def test_signal_precedes_failure_inside_publication_critical_section(
     source = tmp_path / "course.mp4"
     source.write_bytes(b"deterministic source")
     workspace = tmp_path / "workspace"
-    original_publish = ManagedPathCapability.publish_bytes_atomically
-    deterministic_manifest_writes = 0
+    exchange_attempts = 0
 
-    def interrupt_then_fail_final_publication(path, contents):
-        nonlocal deterministic_manifest_writes
-        if b'"schema_version":"deterministic.v1"' in bytes(contents):
-            deterministic_manifest_writes += 1
-            if deterministic_manifest_writes == 2:
-                os.kill(os.getpid(), signal.SIGTERM)
-                raise OSError("failure after pending interruption")
-        return original_publish(path, contents)
+    def interrupt_then_fail_final_publication(*_args):
+        nonlocal exchange_attempts
+        exchange_attempts += 1
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise OSError("failure after pending interruption")
 
     monkeypatch.setattr(
-        ManagedPathCapability,
-        "publish_bytes_atomically",
+        workspace_effects,
+        "_exchange_publication_directories",
         interrupt_then_fail_final_publication,
     )
 
@@ -1614,7 +1831,7 @@ def test_signal_precedes_failure_inside_publication_critical_section(
     assert outcome.exit_code is ExitCode.SIGTERM
     assert outcome.interruption_signal is InterruptionSignal.SIGTERM
     assert outcome.primary_error is None
-    assert deterministic_manifest_writes == 2
+    assert exchange_attempts == 1
     assert not any((workspace / "delivery").iterdir())
     assert not (workspace / "work" / "tmp" / str(outcome.run_id)).exists()
 

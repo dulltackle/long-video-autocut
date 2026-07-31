@@ -40,6 +40,17 @@ _QuarantineFile = Callable[
     [tuple[str, ...], tuple[str, ...]],
     None,
 ]
+_PublishDelivery = Callable[
+    [
+        "ManagedDirectoryCapability",
+        "ManagedDirectoryCapability",
+        "ManagedDirectoryCapability",
+        bool,
+        tuple["ManagedTreeEntry", ...],
+        CancellationToken,
+    ],
+    None,
+]
 _CAPABILITY_SEAL = object()
 
 
@@ -118,6 +129,7 @@ class _ManagedAuthority:
     inspect_tree: _InspectTree
     use_exclusive_lock: _UseExclusiveLock
     quarantine_file: _QuarantineFile
+    publish_delivery: _PublishDelivery
     workspace_identity: object
     run_id: RunId | None
     role: ManagedDirectoryRole
@@ -132,6 +144,7 @@ class _ManagedOperations:
     _inspect_tree: _InspectTree = field(repr=False)
     _use_exclusive_lock: _UseExclusiveLock = field(repr=False)
     _quarantine_file: _QuarantineFile = field(repr=False)
+    _publish_delivery: _PublishDelivery = field(repr=False)
     _seal: object = field(repr=False)
 
     def __new__(cls) -> "_ManagedOperations":
@@ -212,6 +225,34 @@ class _ManagedOperations:
             )
         )
 
+    def publish_delivery(
+        self,
+        staging: "ManagedDirectoryCapability",
+        current: "ManagedDirectoryCapability",
+        previous: "ManagedDirectoryCapability",
+        overwrite: bool,
+        verification_tree: tuple[ManagedTreeEntry, ...],
+        cancellation: CancellationToken,
+    ) -> None:
+        self._assert_authentic()
+        if not isinstance(staging, ManagedDirectoryCapability):
+            raise TypeError(
+                "目录发布必须使用 Workspace 签发的受管目录 capability"
+            )
+        staging._assert_authentic()
+        if staging._operations is not self:
+            raise ValueError("发布暂存目录 capability 与受管效果不匹配")
+        _without_sensitive_exception_context(
+            lambda: self._publish_delivery(
+                staging,
+                current,
+                previous,
+                overwrite,
+                verification_tree,
+                cancellation,
+            )
+        )
+
     def _assert_authentic(self) -> None:
         authority = _OPERATION_AUTHORITIES.get(self)
         if authority is None or (
@@ -223,6 +264,7 @@ class _ManagedOperations:
             or self._inspect_tree is not authority.inspect_tree
             or self._use_exclusive_lock is not authority.use_exclusive_lock
             or self._quarantine_file is not authority.quarantine_file
+            or self._publish_delivery is not authority.publish_delivery
         ):
             raise TypeError("受管效果只能由 Workspace 绑定")
 
@@ -430,6 +472,30 @@ class ManagedDirectoryCapability:
         self._assert_authentic()
         self._operations.validate_directory(())
 
+    def _publish_as_current_delivery(
+        self,
+        current: "ManagedDirectoryCapability",
+        previous: "ManagedDirectoryCapability",
+        *,
+        overwrite: bool,
+        verification_tree: tuple[ManagedTreeEntry, ...],
+        cancellation: CancellationToken,
+    ) -> None:
+        """只供 Publication 触发 Workspace 封装的目录交换事务。"""
+        self._assert_authentic()
+        if not isinstance(overwrite, bool):
+            raise TypeError("覆盖发布选项必须是布尔值")
+        if not isinstance(cancellation, CancellationToken):
+            raise TypeError("目录发布必须绑定根取消令牌")
+        self._operations.publish_delivery(
+            self,
+            current,
+            previous,
+            overwrite,
+            verification_tree,
+            cancellation,
+        )
+
     def _assert_authentic(self) -> None:
         try:
             seal = self._seal
@@ -462,6 +528,7 @@ class _WorkspaceCapabilityIssuer:
         inspect_tree: _InspectTree,
         use_exclusive_lock: _UseExclusiveLock,
         quarantine_file: _QuarantineFile,
+        publish_delivery: _PublishDelivery,
         workspace_identity: object,
         run_id: RunId | None,
         role: ManagedDirectoryRole,
@@ -489,6 +556,11 @@ class _WorkspaceCapabilityIssuer:
             "_quarantine_file",
             quarantine_file,
         )
+        object.__setattr__(
+            operations,
+            "_publish_delivery",
+            publish_delivery,
+        )
         object.__setattr__(operations, "_seal", _CAPABILITY_SEAL)
         _OPERATION_AUTHORITIES[operations] = _ManagedAuthority(
             use_file=use_file,
@@ -498,6 +570,7 @@ class _WorkspaceCapabilityIssuer:
             inspect_tree=inspect_tree,
             use_exclusive_lock=use_exclusive_lock,
             quarantine_file=quarantine_file,
+            publish_delivery=publish_delivery,
             workspace_identity=workspace_identity,
             run_id=run_id,
             role=role,

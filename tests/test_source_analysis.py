@@ -806,7 +806,11 @@ def test_invalid_source_fails_audibly_before_every_remote_request(
     )
 
     outcome = application.execute(
-        LiveRunRequest(source_path, workspace_dir=workspace)
+        LiveRunRequest(
+            source_path,
+            workspace_dir=workspace,
+            overwrite=True,
+        )
     )
 
     assert outcome.state is LiveRunState.FAILED

@@ -2,6 +2,7 @@
 
 from ._build import DeliveryBuild
 from ._model import DeliveryBuildFailure, DeliveryBuildRequest
+from ._publication import Publication, PublicationFailure
 from ._verification import (
     DeliveryVerification,
     DeliveryVerificationFailure,
@@ -18,6 +19,8 @@ __all__ = [
     "DeliveryBuildRequest",
     "DeliveryVerification",
     "DeliveryVerificationFailure",
+    "Publication",
+    "PublicationFailure",
     "PublishedDelivery",
     "UnverifiedDelivery",
     "VerifiedDelivery",

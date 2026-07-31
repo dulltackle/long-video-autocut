@@ -12,10 +12,12 @@ from types import MappingProxyType
 from typing import NoReturn, Protocol, runtime_checkable
 
 from video_auto_editor.configuration import LoadedConfiguration
+from video_auto_editor.delivery import Publication
 from video_auto_editor.delivery.capability import (
     PublishedDelivery,
     UnverifiedDelivery,
     VerifiedDelivery,
+    _pending_publication_evidence,
 )
 from video_auto_editor.diagnostics import (
     DeliveryBuildState,
@@ -353,9 +355,10 @@ class _CommitState:
     def validate(self, delivery: PublishedDelivery) -> None:
         if not isinstance(delivery, PublishedDelivery):
             raise TypeError("发布提交必须包含 PublishedDelivery")
-        if delivery.run_id != self.run_id:
+        run_id, managed_directory = _pending_publication_evidence(delivery)
+        if run_id != self.run_id:
             raise ValueError("发布提交证明必须属于当前运行")
-        if delivery.managed_directory is not self.published_directory:
+        if managed_directory is not self.published_directory:
             raise ValueError("发布提交证明必须绑定当前最终交付目录")
         if self.result_kind is None:
             raise RuntimeError("发布提交前必须准备结果种类")
@@ -438,8 +441,8 @@ class _RunAssembly(Protocol):
         stage: StageDiagnostics,
         cancellation: CancellationToken,
         commit: Callable[
-            [_StageWork, Callable[[], None]],
-            _StageWork,
+            [PublishedDelivery, Callable[[], None]],
+            None,
         ],
     ) -> _StageWork: ...
 
@@ -963,10 +966,10 @@ class LiveApplication:
                     verified.value,
                     stage,
                     token,
-                    lambda work, effect: self._capture_publication(
+                    lambda delivery, effect: self._capture_publication(
                         cancellation,
                         commit_state,
-                        work,
+                        delivery,
                         effect,
                     ),
                 ),
@@ -1075,31 +1078,28 @@ class LiveApplication:
     def _capture_publication(
         cancellation: CancellationSource,
         commit_state: _CommitState,
-        work: _StageWork,
+        delivery: PublishedDelivery,
         effect: Callable[[], None],
-    ) -> _StageWork:
-        if not isinstance(work, _StageWork):
-            raise TypeError("发布提交回调只接受类型化发布阶段结果")
-        if not isinstance(work.value, PublishedDelivery):
-            raise TypeError("发布提交回调必须包含 PublishedDelivery")
+    ) -> None:
+        if not isinstance(delivery, PublishedDelivery):
+            raise TypeError("发布提交回调只接受 PublishedDelivery")
         if not callable(effect):
             raise TypeError("发布提交回调必须包含受管原子效果")
-        commit_state.validate(work.value)
+        commit_state.validate(delivery)
         previous_mask = signal.pthread_sigmask(
             signal.SIG_BLOCK,
             {signal.SIGINT, signal.SIGTERM},
         )
         try:
             cancellation.token.raise_if_cancelled()
-            commit_state.capture(work.value)
+            commit_state.capture(delivery)
             try:
                 effect()
-            except Exception:
+            except BaseException:
                 commit_state.discard_capture()
                 raise
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-        return work
 
     def _run_stage(
         self,
@@ -1210,6 +1210,10 @@ class LiveApplication:
                     stage_diagnostics,
                     run_workspace,
                 )
+            )
+            recovery_incomplete = recovery_incomplete or (
+                getattr(recordable_failure, "error_code", None)
+                is ErrorCode.PUBLICATION_ROLLBACK_FAILED
             )
             stage_diagnostics.complete(
                 StageOutcome.FAILED,
@@ -1407,6 +1411,11 @@ class LiveApplication:
         stage: StageDiagnostics,
         cancellation: CancellationToken,
     ) -> _StageWork:
+        Publication.check_destination(
+            run_workspace.published_delivery,
+            overwrite=request.overwrite,
+            cancellation=cancellation,
+        )
         configuration = self._load_configuration(source.path)
         stage.scope(ErrorModule.CONFIGURATION).record(
             Facts.configuration(
