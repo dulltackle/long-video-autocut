@@ -558,6 +558,62 @@ def test_filesystem_repository_persists_only_a_redacted_envelope_at_fixed_layout
     assert b"run-never-persist" not in persisted
 
 
+def test_filesystem_repository_does_not_migrate_or_read_retired_live_caches(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    entry = _text_entry()
+    computations = []
+    legacy_payload = b'{"chunks":[{"text":"legacy"}],"version":1}'
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        repository = CacheRepository.initialize(
+            run_workspace.cache,
+            application_version="4.7.0",
+        )
+        envelope_path = (
+            workspace.root
+            / "work"
+            / "cache"
+            / "transcript"
+            / entry.identity.digest[:2]
+            / f"{entry.identity.digest}.json"
+        )
+        envelope_path.parent.mkdir()
+        envelope_path.write_bytes(legacy_payload)
+
+        resolution = repository.resolve(
+            entry,
+            cancellation=CancellationSource().token,
+            compute=lambda: computations.append("computed") or "当前完整转写",
+        )
+
+    quarantined = list(
+        (
+            workspace.root
+            / "work"
+            / "cache"
+            / ".quarantine"
+            / "transcript"
+            / entry.identity.digest[:2]
+        ).glob(f"{entry.identity.digest}.cache.envelope_schema_invalid.*.json")
+    )
+
+    assert resolution.value == "当前完整转写"
+    assert resolution.from_cache is False
+    assert computations == ["computed"]
+    assert [item.outcome for item in resolution.observations] == [
+        CacheOutcome.CORRUPT_QUARANTINED,
+        CacheOutcome.MISS,
+        CacheOutcome.WRITE_PUBLISHED,
+    ]
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == legacy_payload
+    assert envelope_path.read_bytes() != legacy_payload
+
+
 def test_filesystem_valid_entry_is_private_durable_and_never_replaced(
     tmp_path,
 ):

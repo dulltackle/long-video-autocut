@@ -185,6 +185,34 @@ def test_load_rejects_an_invalid_configuration_root_or_schema_version(
             {"field": "crf", "reason_code": "schema.unknown_field"},
         ),
         (
+            {"asr_provider": "whisper"},
+            {
+                "field": "asr_provider",
+                "reason_code": "schema.unknown_field",
+            },
+        ),
+        (
+            {"allow_unreviewed_export": True},
+            {
+                "field": "allow_unreviewed_export",
+                "reason_code": "schema.unknown_field",
+            },
+        ),
+        (
+            {"topic_review_enabled": False},
+            {
+                "field": "topic_review_enabled",
+                "reason_code": "schema.unknown_field",
+            },
+        ),
+        (
+            {"subtitle_optimization_enabled": False},
+            {
+                "field": "subtitle_optimization_enabled",
+                "reason_code": "schema.unknown_field",
+            },
+        ),
+        (
             {"clip_policy": {"buffer_start": 1}},
             {
                 "field": "clip_policy.buffer_start",
@@ -248,6 +276,20 @@ def test_load_recursively_rejects_unknown_fields_and_null(
         ),
         (
             {"transcription_provider": "deterministic"},
+            "transcription_provider",
+            "value.invalid_enum",
+        ),
+        (
+            {
+                "transcription_provider": "whisper",
+                "transcription_provider_config": {
+                    "model": "whisper-large-v3",
+                    "endpoint": "https://whisper.example/v1",
+                    "key_environment_variable": "WHISPER_API_KEY",
+                    "timeout_seconds": 120,
+                    "max_concurrency": 1,
+                },
+            },
             "transcription_provider",
             "value.invalid_enum",
         ),
