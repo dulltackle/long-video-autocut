@@ -34,6 +34,21 @@ def test_root_help_only_exposes_live_and_cache_commands(capsys):
         assert retired_surface not in help_text
 
 
+@pytest.mark.parametrize("retired_command", ["single", "batch"])
+def test_retired_business_command_is_rejected_without_creating_a_run(
+    retired_command,
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+
+    with pytest.raises(SystemExit) as captured:
+        cli.main([retired_command, str(source)])
+
+    assert captured.value.code == 2
+    assert not source.with_suffix(".autocut").exists()
+    assert not any(tmp_path.rglob("work/runs"))
+
+
 def test_version_query_returns_installed_application_version(capsys):
     with pytest.raises(SystemExit) as captured:
         cli.main(["--version"])

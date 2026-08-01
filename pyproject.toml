@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "video-auto-editor"
 version = "4.7.0"
-description = "Long video auto cut CLI for single videos, batches, and live clip planning."
+description = "Live video clip generation CLI."
 requires-python = ">=3.10"
 dependencies = [
     "openai-whisper",

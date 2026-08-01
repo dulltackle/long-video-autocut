@@ -1,9 +1,7 @@
 """FFmpeg / ffprobe 媒体操作封装。"""
 
 import json
-import os
 import subprocess
-import tempfile
 
 from video_auto_editor.config import CONFIG
 
@@ -71,36 +69,3 @@ def _build_subtitles_filter(subtitle_path, config):
 def _escape_subtitles_path(path):
     """转义 subtitles 滤镜文件名中的特殊字符（libass filter 语法）。"""
     return str(path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-
-
-def concat_videos(clip_paths, output_path, config=None):
-    """使用 FFmpeg concat demuxer 拼接视频，完成后清理列表文件。"""
-    config = config or CONFIG
-    output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
-    list_file = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            suffix=".list.txt",
-            prefix="concat_",
-            dir=output_dir,
-            delete=False,
-        ) as file:
-            list_file = file.name
-            for path in clip_paths:
-                file.write(f"file '{os.path.abspath(path)}'\n")
-
-        cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
-            "-c:v", "libx264", "-crf", str(config["crf"]), "-preset", config["preset"],
-            "-c:a", "aac", "-b:a", config["audio_bitrate"],
-            output_path,
-        ]
-        return subprocess.run(cmd, capture_output=True, text=True).returncode == 0
-    finally:
-        if list_file:
-            try:
-                os.remove(list_file)
-            except OSError:
-                pass

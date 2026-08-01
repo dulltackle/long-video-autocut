@@ -13,8 +13,6 @@ metadata.json
 transcript.json
 transcript.srt
 拆条报告.md
-batch_report.md
-*_report.md
 
 # Python
 __pycache__/

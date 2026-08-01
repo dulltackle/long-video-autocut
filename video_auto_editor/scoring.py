@@ -1,70 +1,6 @@
-"""片段评分与转写文本流畅度分析。"""
+"""转写文本流畅度分析。"""
 
 import re
-
-from video_auto_editor.config import CONFIG
-
-
-def _score_boundary(silences, time_point, total_duration, is_start):
-    """为片段起止边界清晰度打分，返回 0-25。"""
-    if is_start:
-        nearby = [s for s in silences if abs(s[1] - time_point) < 0.1]
-    else:
-        nearby = [s for s in silences if abs(s[0] - time_point) < 0.1]
-
-    if nearby:
-        dur = nearby[0][1] - nearby[0][0]
-        if dur >= 1.0:
-            return 25
-        if dur >= 0.5:
-            return 20
-        return 10
-
-    if is_start and time_point < 0.5:
-        return 15
-    if not is_start and abs(time_point - total_duration) < 0.5:
-        return 15
-    return 5
-
-
-def score_segment(seg, silences, total_duration):
-    """四维基础评分：清晰开头、清晰结尾、中段流畅、自然节奏。"""
-    seg.score_start = _score_boundary(silences, seg.start_time, total_duration, is_start=True)
-    seg.score_end = _score_boundary(silences, seg.end_time, total_duration, is_start=False)
-
-    internal = [
-        s for s in silences
-        if s[0] > seg.start_time + 0.1 and s[1] < seg.end_time - 0.1
-    ]
-    seg.internal_silences = internal
-    seg.interruption_count = len(internal)
-    seg.interruption_duration = sum(e - s for s, e in internal)
-
-    if seg.interruption_count == 0:
-        seg.score_fluency = 25
-    elif seg.interruption_count <= 2:
-        seg.score_fluency = 20
-    elif seg.interruption_count <= 4:
-        seg.score_fluency = 15
-    else:
-        seg.score_fluency = max(5, 25 - seg.interruption_count * 3)
-
-    score_rhythm = 0
-    if seg.duration > 0:
-        ratio = seg.interruption_duration / seg.duration
-        score_rhythm += 15 if ratio < 0.05 else 12 if ratio < 0.10 else 8 if ratio < 0.20 else 4
-
-        max_pause = max((e - s for s, e in internal), default=0)
-        score_rhythm += 10 if max_pause < 0.8 else 7 if max_pause < 1.5 else 4 if max_pause < 2.5 else 0
-
-        if seg.duration < 8:
-            score_rhythm = min(score_rhythm, 15)
-        elif seg.duration < 15:
-            score_rhythm = min(score_rhythm, 20)
-
-    seg.score_rhythm = score_rhythm
-    seg.total_score = seg.score_start + seg.score_end + seg.score_fluency + seg.score_rhythm
-    return seg
 
 
 def analyze_fluency(transcript):
@@ -117,19 +53,3 @@ def analyze_fluency(transcript):
         is_natural_end = False
 
     return repeat_count, stutter_count, is_natural_end, is_interrupted
-
-
-def calculate_adjusted_score(seg, config=None):
-    """基于转写分析结果计算调整分，并限制在 0-100。"""
-    config = config or CONFIG
-    adjusted = seg.total_score
-    duration_factor = max(1.0, seg.duration / 30.0)
-    adjusted -= (seg.repeat_count / duration_factor) * config["penalty_repeat"]
-    adjusted -= (seg.stutter_count / duration_factor) * config["penalty_stutter"]
-    if seg.is_interrupted:
-        adjusted -= config["penalty_interrupt"]
-    if seg.is_natural_end:
-        adjusted += config["bonus_natural_end"]
-    if seg.is_natural_end and not seg.is_interrupted:
-        adjusted += max(0, config["bonus_completeness_max"] * (1 - abs(seg.duration - 60) / 60))
-    return max(0, min(100, adjusted))

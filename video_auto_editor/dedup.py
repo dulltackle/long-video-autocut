@@ -1,4 +1,4 @@
-"""片段和跨视频内容去重。"""
+"""直播候选内容去重。"""
 
 import difflib
 
@@ -24,50 +24,6 @@ def _find_duplicate_groups(items, get_text, config=None):
                 if not merged:
                     groups.append({i, j})
     return groups
-
-
-def check_duplicate_content(candidates, config=None):
-    """片内去重：每组保留自然结尾、调整分、较晚 index 更优的片段。"""
-    groups = _find_duplicate_groups(candidates, lambda s: s.transcript, config)
-    for group in groups:
-        for i, j in [(i, j) for i in group for j in group if i < j]:
-            print(f"    ⚠️  segment_{candidates[i].index} and segment_{candidates[j].index} content similar")
-        best = max(
-            group,
-            key=lambda idx: (
-                candidates[idx].is_natural_end,
-                candidates[idx].adjusted_score,
-                candidates[idx].index,
-            ),
-        )
-        for idx in group:
-            if idx != best:
-                candidates[idx].is_duplicate = True
-                candidates[idx].duplicate_with.append(candidates[best].index)
-    return candidates
-
-
-def cross_video_dedup(clips, config=None):
-    """跨视频去重：每组保留自然结尾、调整分、较晚文件名更优的片段。"""
-    if len(clips) < 2:
-        return clips
-    groups = _find_duplicate_groups(clips, lambda c: c.transcript, config)
-    for group in groups:
-        for i, j in [(i, j) for i in group for j in group if i < j]:
-            print(f"    ⚠️  {clips[i].video_name} and {clips[j].video_name} content similar")
-        best = max(
-            group,
-            key=lambda idx: (
-                clips[idx].is_natural_end,
-                clips[idx].adjusted_score,
-                clips[idx].video_name,
-            ),
-        )
-        for idx in group:
-            if idx != best:
-                clips[idx].is_cross_duplicate = True
-                clips[idx].duplicate_of = clips[best].video_name
-    return clips
 
 
 def check_duplicate_live_candidates(candidates, config=None):
