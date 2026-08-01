@@ -1,9 +1,9 @@
 import shutil
+import tomllib
 from pathlib import Path
 from zipfile import ZipFile
 
 import pytest
-import tomllib
 
 from scripts.validate_architecture import (
     APPROVED_PACKAGE_FILES,
@@ -22,6 +22,7 @@ def _write_approved_wheel(
     source_overrides=None,
     include_entry_points=True,
     entry_point_name="video-auto-editor",
+    requires_python="<3.13,>=3.12.3",
 ):
     wheel = tmp_path / "video_auto_editor-4.7.0-py3-none-any.whl"
     dist_info = "video_auto_editor-4.7.0.dist-info"
@@ -36,7 +37,8 @@ def _write_approved_wheel(
             f"{dist_info}/METADATA",
             "Metadata-Version: 2.4\n"
             "Name: video-auto-editor\n"
-            "Version: 4.7.0\n",
+            "Version: 4.7.0\n"
+            f"Requires-Python: {requires_python}\n",
         )
         archive.writestr(
             f"{dist_info}/WHEEL",
@@ -164,6 +166,19 @@ def test_wheel_gate_accepts_the_approved_release_artifact(tmp_path):
     wheel = _write_approved_wheel(tmp_path)
 
     validate_wheel(wheel)
+
+
+def test_wheel_gate_rejects_an_uncertified_python_range(tmp_path):
+    wheel = _write_approved_wheel(
+        tmp_path,
+        requires_python=">=3.10",
+    )
+
+    with pytest.raises(
+        ArchitectureViolation,
+        match="CPython.*>=3.12.3,<3.13",
+    ):
+        validate_wheel(wheel)
 
 
 def test_wheel_gate_preserves_console_script_name_case(tmp_path):

@@ -358,6 +358,15 @@ def validate_wheel(
         metadata_details.append("wheel 项目名称必须为 video-auto-editor")
     if metadata.get("Version") != "4.7.0":
         metadata_details.append("wheel 项目版本必须为 4.7.0")
+    python_specifiers = {
+        specifier.strip()
+        for specifier in metadata.get("Requires-Python", "").split(",")
+        if specifier.strip()
+    }
+    if python_specifiers != {">=3.12.3", "<3.13"}:
+        metadata_details.append(
+            "wheel 必须锁定认证 CPython 范围 >=3.12.3,<3.13"
+        )
     if metadata.get_all("Requires-Dist", []):
         metadata_details.append("wheel 不得声明运行时依赖")
     if wheel_metadata.get("Root-Is-Purelib", "").casefold() != "true":

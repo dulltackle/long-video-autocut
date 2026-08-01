@@ -217,6 +217,27 @@ def test_release_metadata_has_no_runtime_dependencies():
     assert not (PROJECT_ROOT / "requirements.txt").exists()
 
 
+def test_release_metadata_locks_the_certified_python_and_runtime_inputs():
+    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    project_section = pyproject.split("[project]", 1)[1].split("\n[", 1)[0]
+    requirement = re.search(
+        r'^requires-python\s*=\s*"([^"]+)"$',
+        project_section,
+        re.MULTILINE,
+    )
+
+    assert requirement is not None
+    assert requirement.group(1) == ">=3.12.3,<3.13"
+    runtime_lock = PROJECT_ROOT / "requirements-runtime.lock"
+    assert runtime_lock.is_file()
+    assert all(
+        not line.strip() or line.lstrip().startswith("#")
+        for line in runtime_lock.read_text(encoding="utf-8").splitlines()
+    )
+
+
 @pytest.mark.parametrize(
     "retired_path",
     [
