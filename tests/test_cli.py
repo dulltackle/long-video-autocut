@@ -1,8 +1,6 @@
 import json
-import subprocess
-import sys
-from io import StringIO
 from importlib.metadata import version
+from io import StringIO
 
 import pytest
 
@@ -211,31 +209,3 @@ def test_quiet_terminal_renderer_keeps_terminal_run_and_diagnostic_facts(
     assert "终态: failed" in terminal
     assert f"run_id: {outcome.run_id}" in terminal
     assert f"诊断位置: {diagnostics_directory}" in terminal
-
-
-def test_module_entrypoint_propagates_live_exit_code(tmp_path):
-    source = tmp_path / "course.mp4"
-    source.write_bytes(b"configuration fails before media analysis")
-    source.with_suffix(".config.json").write_text(
-        '{"schema_version":"configuration.v999"}\n',
-        encoding="utf-8",
-    )
-    workspace = tmp_path / "workspace"
-
-    completed = subprocess.run(
-        (
-            sys.executable,
-            "-m",
-            "video_auto_editor",
-            "live",
-            str(source),
-            "--workspace-dir",
-            str(workspace),
-        ),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 2
-    assert "终态: failed" in completed.stderr

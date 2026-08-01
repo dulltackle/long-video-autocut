@@ -11,8 +11,12 @@ from video_auto_editor.application import (
     LiveRunRequest,
     LiveRunState,
 )
-from video_auto_editor.diagnostics import ResultKind
-from video_auto_editor.readiness import CommandResult, Readiness, TLSObservation
+from video_auto_editor.application.readiness import (
+    CommandResult,
+    Readiness,
+    TLSObservation,
+)
+from video_auto_editor.clip_planning import ResultKind
 from video_auto_editor.runtime.errors import ERROR_REGISTRY, ErrorCode, ExitCode
 from video_auto_editor.transcription._stepaudio_https import (
     StdlibStepAudioTransport,
@@ -112,7 +116,7 @@ def _install_readiness_probe(monkeypatch, probe):
     original_readiness = Readiness.check
 
     def check(request):
-        return original_readiness(request, system_probe=probe)
+        return original_readiness(request, _system_probe=probe)
 
     monkeypatch.setattr(
         composition.Readiness,
@@ -159,7 +163,7 @@ def _install_success_boundaries(
     original_readiness = Readiness.check
 
     def check(request):
-        return original_readiness(request, system_probe=_CertifiedProbe())
+        return original_readiness(request, _system_probe=_CertifiedProbe())
 
     monkeypatch.setattr(
         composition.Readiness,

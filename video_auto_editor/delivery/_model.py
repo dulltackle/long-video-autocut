@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from video_auto_editor.clip_planning import DeliveryPlan
-from video_auto_editor.configuration._model import SubtitleStyle
+from video_auto_editor.configuration import SubtitleStyle
 from video_auto_editor.runtime.cancellation import CancellationToken
 from video_auto_editor.runtime.errors import (
     ErrorCategory,
@@ -23,7 +23,6 @@ from video_auto_editor.workspace import (
     ManagedDirectoryCapability,
     ManagedDirectoryRole,
 )
-
 
 _APPLICATION_VERSION = re.compile(
     r"[0-9]+(?:\.[0-9]+){1,3}"

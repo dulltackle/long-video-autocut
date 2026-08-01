@@ -20,7 +20,7 @@ from video_auto_editor.transcription import (
     TranscriptionFailure,
     TranscriptionRequest,
 )
-from video_auto_editor.transcription._reconciliation import (
+from video_auto_editor.transcription.reconciliation import (
     RecognitionBatch,
     RecognitionKind,
     RecognitionObservation,

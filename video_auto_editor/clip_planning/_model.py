@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal, Protocol, TypeVar
 
-from video_auto_editor.configuration._model import ClipPolicy, CourseContext
+from video_auto_editor.configuration import ClipPolicy, CourseContext
 from video_auto_editor.runtime.identity import (
     CandidateId,
     PlanId,
@@ -14,10 +14,16 @@ from video_auto_editor.runtime.identity import (
     TranscriptChunkId,
     TranscriptId,
 )
-from video_auto_editor.runtime.result import ResultKind
 
 _CandidatePlanT = TypeVar("_CandidatePlanT", bound="CandidatePlan")
 _DeliveryPlanT = TypeVar("_DeliveryPlanT", bound="DeliveryPlan")
+
+
+class ResultKind(str, Enum):
+    """短视频规划形成的两类合法交付结果。"""
+
+    CLIPS = "clips"
+    EMPTY = "empty"
 
 
 @dataclass(frozen=True, slots=True)

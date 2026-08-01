@@ -2,31 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
-import hashlib
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from enum import Enum
 from threading import RLock
 from typing import Final
 
+from video_auto_editor.configuration import (
+    ConfigurationDiagnosticProjection,
+)
 from video_auto_editor.runtime.errors import (
     ErrorCode,
     ErrorModule,
     RunError,
     RunStage,
 )
-from video_auto_editor.configuration._model import (
-    ConfigurationDiagnosticProjection,
-)
 from video_auto_editor.runtime.identity import OperationId, RunId
-from video_auto_editor.workspace import (
-    ManagedDirectoryCapability,
-    ManagedDirectoryRole,
-    WorkspaceFailure,
-)
+from video_auto_editor.workspace import WorkspaceFailure
 
 from ._facts import (
     DiagnosticFact,
@@ -51,10 +47,11 @@ from ._model import (
     ArtifactRole,
     CacheNamespace,
     CacheOutcome,
-    DiagnosticFinalization,
-    DiagnosticPackageSnapshot,
     DeliveryBuildState,
     DeliveryVerificationState,
+    DiagnosticCompletion,
+    DiagnosticFinalization,
+    DiagnosticPackageSnapshot,
     ExternalRequestOutcome,
     InterruptionSignal,
     OperationKind,
@@ -63,18 +60,12 @@ from ._model import (
     ProviderTransport,
     PublicationState,
     RecoveredNoticeKind,
-    RetryKind,
     ResultKind,
-    RunOutcome,
-    RunTerminalState,
+    RetryKind,
     StageOutcome,
+    _DiagnosticTerminalState,
 )
-from ._store import (
-    _DiagnosticStore,
-    _MemoryDiagnosticStore,
-    _PersistentDiagnosticStore,
-)
-
+from ._store import _DiagnosticStore
 
 _EVENT_SCHEMA_VERSION: Final = "run_event.v1"
 _APPLICATION_VERSION = re.compile(
@@ -120,60 +111,7 @@ class RunDiagnostics:
     )
 
     def __init__(self) -> None:
-        raise TypeError("RunDiagnostics 只能通过 initialize 创建")
-
-    @classmethod
-    def initialize(
-        cls,
-        directory: ManagedDirectoryCapability,
-        *,
-        application_version: str,
-        wall_clock: Callable[[], datetime],
-        monotonic_clock: Callable[[], float],
-    ) -> "RunDiagnostics":
-        """初始化绑定既有运行标识的诊断包并写入首事件。"""
-        if not isinstance(directory, ManagedDirectoryCapability):
-            raise TypeError("运行诊断必须使用 Workspace 签发的诊断目录")
-        directory_unavailable = False
-        try:
-            directory._assert_current_directory()
-        except (OSError, WorkspaceFailure):
-            directory_unavailable = True
-        if directory_unavailable:
-            raise _startup_failure(
-                operation="diagnostics.initialize",
-                reason_code="diagnostics.open_failed",
-            )
-        if directory.role is not ManagedDirectoryRole.RUN_DIAGNOSTICS:
-            raise ValueError("运行诊断目录角色不合法")
-        run_id = directory.bound_run_id
-        if not isinstance(run_id, RunId):
-            raise ValueError("运行诊断目录必须绑定一次直播拆条运行")
-        return cls._start(
-            _PersistentDiagnosticStore(directory, run_id),
-            application_version=application_version,
-            wall_clock=wall_clock,
-            monotonic_clock=monotonic_clock,
-        )
-
-    @classmethod
-    def in_memory(
-        cls,
-        run_id: RunId,
-        *,
-        application_version: str,
-        wall_clock: Callable[[], datetime],
-        monotonic_clock: Callable[[], float],
-    ) -> "RunDiagnostics":
-        """使用收集 Adapter 初始化同一诊断契约。"""
-        if not isinstance(run_id, RunId):
-            raise TypeError("内存诊断 Adapter 必须绑定 RunId")
-        return cls._start(
-            _MemoryDiagnosticStore(run_id),
-            application_version=application_version,
-            wall_clock=wall_clock,
-            monotonic_clock=monotonic_clock,
-        )
+        raise TypeError("RunDiagnostics 只能通过诊断 Adapter 工厂创建")
 
     @classmethod
     def _start(
@@ -292,17 +230,17 @@ class RunDiagnostics:
                 )
             return snapshot
 
-    def finish(self, outcome: RunOutcome) -> DiagnosticFinalization:
+    def finish(self, outcome: DiagnosticCompletion) -> DiagnosticFinalization:
         """形成唯一运行终态并发布 ``run.json``。"""
-        if not isinstance(outcome, RunOutcome):
-            raise TypeError("运行终态必须使用 RunOutcome")
+        if not isinstance(outcome, DiagnosticCompletion):
+            raise TypeError("诊断收尾必须使用 DiagnosticCompletion")
         with self._lock:
             if self._finished:
                 raise RuntimeError("直播拆条运行诊断已经完成")
             if self._active_stage is not None:
                 raise RuntimeError("活动阶段必须先完成")
             self._validate_outcome(outcome)
-            if outcome.state is RunTerminalState.SUCCEEDED:
+            if outcome.state is _DiagnosticTerminalState.SUCCEEDED:
                 if outcome.published_delivery is None:
                     raise TypeError("成功终态必须包含发布提交证明")
                 # PublishedDelivery 是 authority-bearing capability；
@@ -372,7 +310,7 @@ class RunDiagnostics:
                     ) from None
                 self._publish_manifest(encoded_manifest)
             except DiagnosticsFailure:
-                if outcome.state is RunTerminalState.SUCCEEDED:
+                if outcome.state is _DiagnosticTerminalState.SUCCEEDED:
                     return DiagnosticFinalization._incomplete(
                         terminal_sequence
                     )
@@ -1140,7 +1078,7 @@ class RunDiagnostics:
         artifacts[fact.relative_path] = fact.role
         return sequence
 
-    def _validate_outcome(self, outcome: RunOutcome) -> None:
+    def _validate_outcome(self, outcome: DiagnosticCompletion) -> None:
         _validate_delivery_terminal(self._delivery, outcome)
         errors = (outcome.primary_error, *outcome.associated_errors)
         if any(
@@ -1160,7 +1098,7 @@ class RunDiagnostics:
             )
         ) != outcome.associated_errors:
             raise ValueError("关联错误必须按事件序号排列")
-        if outcome.state is RunTerminalState.FAILED:
+        if outcome.state is _DiagnosticTerminalState.FAILED:
             if outcome.primary_error is None:
                 raise TypeError("失败终态必须包含主错误")
             if any(
@@ -1174,7 +1112,7 @@ class RunDiagnostics:
             return
         if outcome.primary_error is not None:
             raise ValueError("成功或中断终态不能包含主错误")
-        if outcome.state is RunTerminalState.SUCCEEDED:
+        if outcome.state is _DiagnosticTerminalState.SUCCEEDED:
             delivery = outcome.published_delivery
             if delivery is None:
                 raise TypeError("成功终态必须包含 PublishedDelivery")
@@ -1185,7 +1123,7 @@ class RunDiagnostics:
             if outcome.associated_errors or outcome.recovery_incomplete:
                 raise ValueError("成功终态不能包含终态错误")
             return
-        if outcome.state is RunTerminalState.INTERRUPTED:
+        if outcome.state is _DiagnosticTerminalState.INTERRUPTED:
             if outcome.published_delivery is not None:
                 raise ValueError("中断终态不能包含发布提交证明")
             interruption = self._interruption
@@ -1202,7 +1140,7 @@ class RunDiagnostics:
             return
         raise TypeError("未知运行终态")
 
-    def _terminal_stage(self, outcome: RunOutcome) -> RunStage:
+    def _terminal_stage(self, outcome: DiagnosticCompletion) -> RunStage:
         if outcome.primary_error is not None:
             return outcome.primary_error.stage
         if self._stages:
@@ -1212,7 +1150,7 @@ class RunDiagnostics:
     def _build_manifest(
         self,
         *,
-        outcome: RunOutcome,
+        outcome: DiagnosticCompletion,
         ended_timestamp: str,
         duration_ms: int,
         events: bytes,
@@ -1303,9 +1241,9 @@ class RunDiagnostics:
 
     def _interruption_manifest(
         self,
-        outcome: RunOutcome,
+        outcome: DiagnosticCompletion,
     ) -> dict[str, object]:
-        if outcome.state is not RunTerminalState.INTERRUPTED:
+        if outcome.state is not _DiagnosticTerminalState.INTERRUPTED:
             return {"status": "not_applicable"}
         if (
             self._interruption is None
@@ -1912,10 +1850,10 @@ def _error_manifest(error: RunError) -> dict[str, object]:
     }
 
 
-def _outcome_exit_code(outcome: RunOutcome) -> int:
-    if outcome.state is RunTerminalState.SUCCEEDED:
+def _outcome_exit_code(outcome: DiagnosticCompletion) -> int:
+    if outcome.state is _DiagnosticTerminalState.SUCCEEDED:
         return 0
-    if outcome.state is RunTerminalState.INTERRUPTED:
+    if outcome.state is _DiagnosticTerminalState.INTERRUPTED:
         if outcome.interruption_signal is None:
             raise TypeError("中断终态必须包含信号")
         return outcome.interruption_signal.exit_code
@@ -1924,8 +1862,8 @@ def _outcome_exit_code(outcome: RunOutcome) -> int:
     return int(outcome.primary_error.exit_code)
 
 
-def _result_kind_status(outcome: RunOutcome) -> dict[str, object]:
-    if outcome.state is not RunTerminalState.SUCCEEDED:
+def _result_kind_status(outcome: DiagnosticCompletion) -> dict[str, object]:
+    if outcome.state is not _DiagnosticTerminalState.SUCCEEDED:
         return {"status": "not_applicable"}
     if outcome.result_kind is None:
         raise TypeError("成功终态必须包含结果种类")
@@ -2154,7 +2092,7 @@ def _advance_delivery_state(
 
 def _validate_delivery_terminal(
     delivery: dict[str, object],
-    outcome: RunOutcome,
+    outcome: DiagnosticCompletion,
 ) -> None:
     states = (
         delivery["build_state"],
@@ -2163,7 +2101,7 @@ def _validate_delivery_terminal(
     )
     if "in_progress" in states:
         raise RuntimeError("终态清单不能包含进行中的交付生命周期")
-    if outcome.state is RunTerminalState.SUCCEEDED:
+    if outcome.state is _DiagnosticTerminalState.SUCCEEDED:
         observed = states != (
             "not_started",
             "not_started",
@@ -2183,10 +2121,10 @@ def _validate_delivery_terminal(
 
 
 def _delivery_manifest(
-    outcome: RunOutcome,
+    outcome: DiagnosticCompletion,
     delivery: dict[str, object],
 ) -> dict[str, object]:
-    if outcome.state is RunTerminalState.SUCCEEDED:
+    if outcome.state is _DiagnosticTerminalState.SUCCEEDED:
         manifest: dict[str, object] = {
             "build_state": "completed",
             "verification_state": "passed",

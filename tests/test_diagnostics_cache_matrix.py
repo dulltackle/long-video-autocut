@@ -4,16 +4,17 @@ from datetime import datetime, timezone
 
 import pytest
 
+from video_auto_editor.cache import CacheNamespace, CacheOutcome
 from video_auto_editor.diagnostics import (
-    CacheNamespace,
-    CacheOutcome,
+    DiagnosticCompletion,
     Facts,
     InterruptionSignal,
     OperationKind,
     OperationOutcome,
-    RunDiagnostics,
-    RunOutcome,
     StageOutcome,
+)
+from video_auto_editor.diagnostics.collecting import (
+    initialize as initialize_collecting_diagnostics,
 )
 from video_auto_editor.runtime.errors import (
     ErrorCode,
@@ -156,7 +157,7 @@ def test_cache_diagnostics_cover_the_full_matrix_and_redact_sensitive_data():
             quarantine_digest_prefix=rejected_full_digest,
         )
 
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -228,7 +229,7 @@ def test_cache_diagnostics_cover_the_full_matrix_and_redact_sensitive_data():
     )
     stage.complete(StageOutcome.INTERRUPTED, work_item_count=24)
     finalization = diagnostics.finish(
-        RunOutcome.interrupted(
+        DiagnosticCompletion.interrupted(
             InterruptionSignal.SIGTERM,
             cleanup_duration_ms=0,
         )

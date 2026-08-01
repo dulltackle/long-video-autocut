@@ -15,14 +15,14 @@ from types import MappingProxyType
 from typing import Any, Protocol, TypeGuard
 from urllib.parse import urlsplit
 
-from video_auto_editor.runtime._classified_failure import (
-    PreservedApplicationFailure,
-)
 from video_auto_editor.runtime.cancellation import (
     CancellationRequested,
     CancellationToken,
 )
-from video_auto_editor.runtime.errors import RemoteRequestId
+from video_auto_editor.runtime.errors import (
+    PreservedApplicationFailure,
+    RemoteRequestId,
+)
 
 from .interface import (
     ReadinessIssue,
@@ -245,8 +245,8 @@ class StepFunTextModel:
         settings: StepFunSettings,
         *,
         credential: str,
+        transport: StepFunTransport,
         headers: Mapping[str, str] | None = None,
-        transport: StepFunTransport | None = None,
         event_sink: TextModelEventSink | None = None,
         clock: Callable[[], float] = monotonic,
     ) -> None:
@@ -260,10 +260,6 @@ class StepFunTextModel:
             raise TypeError("StepFun 文本模型必须使用事件接收端")
         frozen_headers = _freeze_headers(headers)
         endpoint = _chat_completions_endpoint(settings.endpoint)
-        if transport is None:
-            from ._stepfun_https import StdlibStepFunTransport
-
-            transport = StdlibStepFunTransport(endpoint)
         if not callable(getattr(transport, "check_readiness", None)) or not callable(
             getattr(transport, "send", None)
         ):

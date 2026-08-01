@@ -13,20 +13,22 @@ from video_auto_editor.runtime.identity import RunId
 from video_auto_editor.source_analysis import SourceDescription
 from video_auto_editor.transcription import (
     CacheUse,
-    DeterministicSpeechRecognition,
-    DeterministicTranscriptionScript,
     ExecutionFacts,
     ReadinessIssue,
     SpeechPresence,
     SpeechRecognition,
-    StepAudioSettings,
-    StepAudioSpeechRecognition,
     TranscriptionChunk,
     TranscriptionRequest,
     TranscriptionResult,
 )
+from video_auto_editor.transcription.deterministic import (
+    DeterministicSpeechRecognition,
+    DeterministicTranscriptionScript,
+)
 from video_auto_editor.transcription.stepaudio import (
     NormalizedPcmAudio,
+    StepAudioSettings,
+    StepAudioSpeechRecognition,
     StepAudioTransportRequest,
     StepAudioTransportResponse,
 )

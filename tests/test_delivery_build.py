@@ -19,18 +19,18 @@ from video_auto_editor.clip_planning import (
     PublishedSelection,
     RejectedSelection,
     RejectionReason,
+    ResultKind,
     ReviewRecommendation,
     ShortVideo,
     TopicReviewSnapshot,
 )
 from video_auto_editor.configuration import Configuration
-from video_auto_editor.delivery import (
+from video_auto_editor.delivery.build import (
     DeliveryBuild,
     DeliveryBuildFailure,
     DeliveryBuildRequest,
 )
 from video_auto_editor.delivery.capability import UnverifiedDelivery
-from video_auto_editor.runtime import ResultKind
 from video_auto_editor.runtime.cancellation import (
     CancellationRequested,
     CancellationSource,

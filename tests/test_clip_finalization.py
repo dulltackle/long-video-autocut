@@ -11,9 +11,9 @@ from video_auto_editor.clip_planning import (
     PublishedSelection,
     RejectedSelection,
     RejectionReason,
+    ResultKind,
 )
 from video_auto_editor.configuration import Configuration
-from video_auto_editor.runtime import ResultKind
 from video_auto_editor.runtime.identity import (
     CandidateId,
     SeriesId,

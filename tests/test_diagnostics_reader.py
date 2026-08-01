@@ -5,13 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from video_auto_editor.cache import CacheNamespace, CacheOutcome
 from video_auto_editor.configuration import Configuration
 from video_auto_editor.diagnostics import (
-    CacheNamespace,
-    CacheOutcome,
     CertifiedPlatform,
-    DiagnosticPackageReadReason,
+    DiagnosticCompletion,
     DiagnosticPackageReader,
+    DiagnosticPackageReadReason,
     DiagnosticPackageReadState,
     DiagnosticPackageSnapshot,
     ExternalDataCategory,
@@ -25,9 +25,10 @@ from video_auto_editor.diagnostics import (
     ProviderTransport,
     RecoveredNoticeKind,
     RetryKind,
-    RunDiagnostics,
-    RunOutcome,
     StageOutcome,
+)
+from video_auto_editor.diagnostics.collecting import (
+    initialize as initialize_collecting_diagnostics,
 )
 from video_auto_editor.runtime.errors import (
     DetectedVersion,
@@ -38,13 +39,12 @@ from video_auto_editor.runtime.errors import (
 )
 from video_auto_editor.runtime.identity import OperationId, RunId
 
-
 _RUN_ID = "run_11111111-1111-4111-8111-111111111111"
 _OTHER_RUN_ID = "run_22222222-2222-4222-8222-222222222222"
 
 
 def _in_memory_diagnostics():
-    return RunDiagnostics.in_memory(
+    return initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=lambda: datetime(
@@ -299,7 +299,7 @@ def test_reader_rejects_a_forged_release_projection():
 
 def test_reader_accepts_serialized_remote_request_id_diagnostics():
     monotonic_values = iter((0.0, 0.1, 0.2, 0.3))
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=lambda: datetime(
@@ -323,7 +323,7 @@ def test_reader_accepts_serialized_remote_request_id_diagnostics():
         )
     )
     stage.complete(StageOutcome.FAILED, work_item_count=1)
-    diagnostics.finish(RunOutcome.failed(primary_error))
+    diagnostics.finish(DiagnosticCompletion.failed(primary_error))
 
     result = DiagnosticPackageReader.read(diagnostics.snapshot())
 
@@ -339,7 +339,7 @@ def test_reader_accepts_producer_aggregates_rebuilt_from_events():
         monotonic_value += 0.1
         return monotonic_value
 
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=lambda: datetime(
@@ -421,7 +421,7 @@ def test_reader_accepts_producer_aggregates_rebuilt_from_events():
     )
     stage.complete(StageOutcome.INTERRUPTED, work_item_count=0)
     diagnostics.finish(
-        RunOutcome.interrupted(
+        DiagnosticCompletion.interrupted(
             InterruptionSignal.SIGINT,
             cleanup_duration_ms=10,
         )
@@ -441,7 +441,7 @@ def test_reader_rebuilds_neutral_transcription_execution_aggregates():
         monotonic_value += 0.1
         return monotonic_value
 
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=lambda: datetime(
@@ -467,7 +467,7 @@ def test_reader_rebuilds_neutral_transcription_execution_aggregates():
         )
     )
     stage.complete(StageOutcome.FAILED, work_item_count=0)
-    diagnostics.finish(RunOutcome.failed(primary_error))
+    diagnostics.finish(DiagnosticCompletion.failed(primary_error))
 
     snapshot = diagnostics.snapshot()
     manifest = json.loads(snapshot.manifest)
@@ -529,7 +529,7 @@ def test_rejected_transcription_aggregate_does_not_pollute_retry_counts():
         )
     )
     stage.complete(StageOutcome.FAILED, work_item_count=0)
-    diagnostics.finish(RunOutcome.failed(primary_error))
+    diagnostics.finish(DiagnosticCompletion.failed(primary_error))
     snapshot = diagnostics.snapshot()
     manifest = json.loads(snapshot.manifest)
 
@@ -648,7 +648,7 @@ def test_reader_rejects_internal_work_forged_after_whole_cache_hit():
         )
     )
     stage.complete(StageOutcome.FAILED, work_item_count=0)
-    diagnostics.finish(RunOutcome.failed(primary_error))
+    diagnostics.finish(DiagnosticCompletion.failed(primary_error))
     snapshot = diagnostics.snapshot()
     events = [
         json.loads(line)
@@ -735,7 +735,7 @@ def test_reader_scopes_whole_transcript_hit_conflict_to_transcription_stage():
     )
     stage.complete(StageOutcome.INTERRUPTED, work_item_count=0)
     diagnostics.finish(
-        RunOutcome.interrupted(
+        DiagnosticCompletion.interrupted(
             InterruptionSignal.SIGINT,
             cleanup_duration_ms=0,
         )
@@ -790,7 +790,7 @@ def test_producer_scopes_whole_transcript_hit_conflict_to_transcription_stage():
     )
     stage.complete(StageOutcome.INTERRUPTED, work_item_count=0)
     diagnostics.finish(
-        RunOutcome.interrupted(
+        DiagnosticCompletion.interrupted(
             InterruptionSignal.SIGINT,
             cleanup_duration_ms=0,
         )
@@ -811,7 +811,7 @@ def test_reader_rejects_forged_environment_projection(field):
         monotonic_value += 0.1
         return monotonic_value
 
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=lambda: datetime(
@@ -842,7 +842,7 @@ def test_reader_rejects_forged_environment_projection(field):
     )
     stage.complete(StageOutcome.INTERRUPTED, work_item_count=0)
     diagnostics.finish(
-        RunOutcome.interrupted(
+        DiagnosticCompletion.interrupted(
             InterruptionSignal.SIGTERM,
             cleanup_duration_ms=10,
         )
@@ -922,7 +922,7 @@ def test_reader_rejects_forged_configuration_provider_or_model(
         monotonic_value += 0.1
         return monotonic_value
 
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=lambda: datetime(
@@ -944,7 +944,7 @@ def test_reader_rejects_forged_configuration_provider_or_model(
     )
     stage.complete(StageOutcome.INTERRUPTED, work_item_count=0)
     diagnostics.finish(
-        RunOutcome.interrupted(
+        DiagnosticCompletion.interrupted(
             InterruptionSignal.SIGTERM,
             cleanup_duration_ms=10,
         )
@@ -1022,7 +1022,7 @@ def test_reader_rejects_a_forged_operation_attempt_chain():
         monotonic_value += 0.1
         return monotonic_value
 
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=lambda: datetime(
@@ -1053,7 +1053,7 @@ def test_reader_rejects_a_forged_operation_attempt_chain():
     )
     stage.complete(StageOutcome.INTERRUPTED, work_item_count=0)
     diagnostics.finish(
-        RunOutcome.interrupted(
+        DiagnosticCompletion.interrupted(
             InterruptionSignal.SIGTERM,
             cleanup_duration_ms=10,
         )
@@ -1115,7 +1115,7 @@ def test_reader_rejects_forged_operation_topology(nested, mutation):
         monotonic_value += 0.1
         return monotonic_value
 
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=lambda: datetime(
@@ -1159,7 +1159,7 @@ def test_reader_rejects_forged_operation_topology(nested, mutation):
     )
     stage.complete(StageOutcome.INTERRUPTED, work_item_count=0)
     diagnostics.finish(
-        RunOutcome.interrupted(
+        DiagnosticCompletion.interrupted(
             InterruptionSignal.SIGTERM,
             cleanup_duration_ms=10,
         )

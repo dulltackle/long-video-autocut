@@ -4,6 +4,8 @@ import json
 import multiprocessing
 import signal
 import stat
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event, Lock, Thread
@@ -21,10 +23,7 @@ from video_auto_editor.cache import (
     CacheOutcome,
     CacheRepository,
 )
-from video_auto_editor.diagnostics import (
-    CacheNamespace as DiagnosticCacheNamespace,
-)
-from video_auto_editor.diagnostics import CacheOutcome as DiagnosticCacheOutcome
+from video_auto_editor.cache.filesystem import initialize_cache_repository
 from video_auto_editor.runtime.cancellation import (
     CancellationRequested,
     CancellationSource,
@@ -33,6 +32,26 @@ from video_auto_editor.runtime.errors import ErrorCode
 from video_auto_editor.runtime.identity import RunId
 from video_auto_editor.workspace import ManagedPathCapability, Workspace
 from video_auto_editor.workspace import _workspace as workspace_module
+
+
+def test_importing_cache_does_not_load_the_filesystem_adapter():
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            (
+                "import sys\n"
+                "import video_auto_editor.cache\n"
+                "print('video_auto_editor.cache._filesystem' "
+                "in sys.modules)\n"
+            ),
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout == "False\n"
 
 
 def test_cache_identity_canonicalizes_business_owned_result_inputs():
@@ -71,11 +90,6 @@ def test_cache_identity_canonicalizes_business_owned_result_inputs():
     assert not hasattr(first, "_document")
 
 
-def test_diagnostics_reuses_cache_owned_namespace_and_outcome_types():
-    assert DiagnosticCacheNamespace is CacheNamespace
-    assert DiagnosticCacheOutcome is CacheOutcome
-
-
 @pytest.mark.parametrize(
     "application_version",
     [
@@ -96,6 +110,7 @@ def test_repository_and_claim_cannot_be_constructed_outside_factories():
     repository = CacheRepository.in_memory(application_version="4.7.0")
 
     assert not hasattr(CacheRepository, "_create")
+    assert not hasattr(CacheRepository, "initialize")
     assert not hasattr(CacheClaim, "_create")
     with pytest.raises(TypeError, match="只能由"):
         CacheRepository(
@@ -111,7 +126,7 @@ def test_filesystem_repository_requires_an_authentic_cache_capability(
     tmp_path,
 ):
     with pytest.raises(TypeError, match="受管目录 capability"):
-        CacheRepository.initialize(
+        initialize_cache_repository(
             tmp_path,
             application_version="4.7.0",
         )
@@ -121,7 +136,7 @@ def test_filesystem_repository_requires_an_authentic_cache_capability(
     workspace = Workspace.open(source, tmp_path / "workspace")
     with workspace.acquire_run(RunId.new()) as run_workspace:
         with pytest.raises(ValueError, match="缓存目录 capability"):
-            CacheRepository.initialize(
+            initialize_cache_repository(
                 run_workspace.diagnostics,
                 application_version="4.7.0",
             )
@@ -380,7 +395,7 @@ def test_filesystem_repository_preserves_business_computation_failures(
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
         _assert_business_computation_failure_is_not_reclassified(
-            CacheRepository.initialize(
+            initialize_cache_repository(
                 run_workspace.cache,
                 application_version="4.7.0",
             )
@@ -528,7 +543,7 @@ def test_filesystem_repository_persists_only_a_redacted_envelope_at_fixed_layout
     )
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
-        repository = CacheRepository.initialize(
+        repository = initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
         )
@@ -569,7 +584,7 @@ def test_filesystem_repository_does_not_migrate_or_read_retired_live_caches(
     legacy_payload = b'{"chunks":[{"text":"legacy"}],"version":1}'
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
-        repository = CacheRepository.initialize(
+        repository = initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
         )
@@ -624,7 +639,7 @@ def test_filesystem_valid_entry_is_private_durable_and_never_replaced(
     token = CancellationSource().token
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
-        repository = CacheRepository.initialize(
+        repository = initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
         )
@@ -677,7 +692,7 @@ def test_producer_application_version_is_provenance_not_cache_identity(
     token = CancellationSource().token
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
-        CacheRepository.initialize(
+        initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
         ).resolve(
@@ -685,7 +700,7 @@ def test_producer_application_version_is_provenance_not_cache_identity(
             cancellation=token,
             compute=lambda: "跨程序版本复用的完整转写",
         )
-        resolution = CacheRepository.initialize(
+        resolution = initialize_cache_repository(
             run_workspace.cache,
             application_version="5.0.0",
         ).resolve(
@@ -709,7 +724,7 @@ def test_corrupt_filesystem_entry_is_quarantined_under_claim_and_recomputed(
     computations = []
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
-        repository = CacheRepository.initialize(
+        repository = initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
         )
@@ -770,7 +785,7 @@ def test_deeply_nested_json_is_quarantined_as_corrupt_and_recomputed(
     token = CancellationSource().token
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
-        repository = CacheRepository.initialize(
+        repository = initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
         )
@@ -836,7 +851,7 @@ def test_filesystem_permission_failure_is_not_a_cache_miss(
     workspace = Workspace.open(source, tmp_path / "workspace")
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
-        repository = CacheRepository.initialize(
+        repository = initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
         )
@@ -868,7 +883,7 @@ def test_filesystem_missing_managed_parent_is_not_a_cache_miss(
     workspace = Workspace.open(source, tmp_path / "workspace")
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
-        repository = CacheRepository.initialize(
+        repository = initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
         )
@@ -902,7 +917,7 @@ def test_filesystem_disk_full_failure_is_not_a_cache_miss(
     token = CancellationSource().token
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
-        repository = CacheRepository.initialize(
+        repository = initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
         )
@@ -949,7 +964,7 @@ def test_filesystem_data_sync_failure_is_a_formal_cache_failure(
     token = CancellationSource().token
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
-        repository = CacheRepository.initialize(
+        repository = initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
         )
@@ -991,7 +1006,7 @@ def test_filesystem_lock_failure_is_not_a_cache_miss(
     workspace = Workspace.open(source, tmp_path / "workspace")
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
-        repository = CacheRepository.initialize(
+        repository = initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
         )
@@ -1031,7 +1046,7 @@ def test_filesystem_quarantine_failure_is_not_recomputed_as_a_miss(
     computations = []
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
-        repository = CacheRepository.initialize(
+        repository = initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
         )
@@ -1100,7 +1115,7 @@ def test_envelope_strictly_rejects_identity_algorithm_and_payload_corruption(
     token = CancellationSource().token
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
-        repository = CacheRepository.initialize(
+        repository = initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
         )
@@ -1219,7 +1234,7 @@ def test_filesystem_repository_singleflights_same_identity_across_threads(
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
         _assert_thread_singleflight(
-            CacheRepository.initialize(
+            initialize_cache_repository(
                 run_workspace.cache,
                 application_version="4.7.0",
             ),
@@ -1241,7 +1256,7 @@ def test_filesystem_repository_singleflights_same_identity_across_processes(
     results = context.Queue()
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
-        repository = CacheRepository.initialize(
+        repository = initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
         )
@@ -1333,7 +1348,7 @@ def test_filesystem_repository_does_not_serialize_different_identities(
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
         _assert_different_identities_compute_concurrently(
-            CacheRepository.initialize(
+            initialize_cache_repository(
                 run_workspace.cache,
                 application_version="4.7.0",
             )
@@ -1395,7 +1410,7 @@ def test_filesystem_claim_wait_is_cancellable(tmp_path):
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
         _assert_waiting_claim_is_cancellable(
-            CacheRepository.initialize(
+            initialize_cache_repository(
                 run_workspace.cache,
                 application_version="4.7.0",
             )
@@ -1435,7 +1450,7 @@ def test_cancellation_after_atomic_publication_is_reported_but_entry_survives(
     cancellation = CancellationSource()
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
-        repository = CacheRepository.initialize(
+        repository = initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
         )

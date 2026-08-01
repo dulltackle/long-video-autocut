@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from video_auto_editor.clip_planning import ResultKind
 from video_auto_editor.configuration import ConfigurationFailure
 from video_auto_editor.delivery.capability import (
     PublishedDelivery,
@@ -12,16 +13,22 @@ from video_auto_editor.delivery.capability import (
 from video_auto_editor.diagnostics import (
     DeliveryBuildState,
     DeliveryVerificationState,
+    DiagnosticCompletion,
     DiagnosticsFailure,
     Facts,
     InterruptionSignal,
     PublicationState,
-    ResultKind,
-    RunDiagnostics,
-    RunOutcome,
     StageOutcome,
 )
-from video_auto_editor.diagnostics._store import _MemoryDiagnosticStore
+from video_auto_editor.diagnostics.collecting import (
+    _CollectingDiagnosticStore,
+)
+from video_auto_editor.diagnostics.collecting import (
+    initialize as initialize_collecting_diagnostics,
+)
+from video_auto_editor.diagnostics.persistent import (
+    initialize as initialize_persistent_diagnostics,
+)
 from video_auto_editor.runtime.errors import (
     ErrorCode,
     ErrorModule,
@@ -66,13 +73,13 @@ def _raise_disk_error(*_args, **_kwargs):
 
 def test_initial_event_failure_becomes_safe_environment_failure(monkeypatch):
     monkeypatch.setattr(
-        _MemoryDiagnosticStore,
+        _CollectingDiagnosticStore,
         "append",
         _raise_disk_error,
     )
 
     with pytest.raises(DiagnosticsFailure) as captured:
-        RunDiagnostics.in_memory(
+        initialize_collecting_diagnostics(
             RunId.new(),
             application_version="4.7.0",
             wall_clock=_wall_clock,
@@ -101,7 +108,7 @@ def test_existing_event_log_is_not_overwritten_and_fails_initialization(
     run_id = RunId.new()
 
     with workspace.acquire_run(run_id) as run_workspace:
-        first = RunDiagnostics.initialize(
+        first = initialize_persistent_diagnostics(
             run_workspace.diagnostics,
             application_version="4.7.0",
             wall_clock=_wall_clock,
@@ -110,7 +117,7 @@ def test_existing_event_log_is_not_overwritten_and_fails_initialization(
         first_bytes = first.snapshot().events
 
         with pytest.raises(DiagnosticsFailure) as captured:
-            RunDiagnostics.initialize(
+            initialize_persistent_diagnostics(
                 run_workspace.diagnostics,
                 application_version="4.7.0",
                 wall_clock=_wall_clock,
@@ -131,7 +138,7 @@ def test_missing_persistent_event_log_is_never_recreated_mid_run(tmp_path):
     run_id = RunId.new()
 
     with workspace.acquire_run(run_id) as run_workspace:
-        diagnostics = RunDiagnostics.initialize(
+        diagnostics = initialize_persistent_diagnostics(
             run_workspace.diagnostics,
             application_version="4.7.0",
             wall_clock=_wall_clock,
@@ -157,7 +164,7 @@ def test_missing_persistent_event_log_is_never_recreated_mid_run(tmp_path):
 def test_runtime_append_failure_poison_session_without_recursive_event(
     monkeypatch,
 ):
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=_wall_clock,
@@ -165,7 +172,7 @@ def test_runtime_append_failure_poison_session_without_recursive_event(
     )
     before = diagnostics.snapshot().events
     monkeypatch.setattr(
-        _MemoryDiagnosticStore,
+        _CollectingDiagnosticStore,
         "append",
         _raise_disk_error,
     )
@@ -186,7 +193,7 @@ def test_runtime_append_failure_poison_session_without_recursive_event(
 def test_precommit_manifest_failure_seals_terminal_without_duplicate_event(
     monkeypatch,
 ):
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=_wall_clock,
@@ -204,13 +211,13 @@ def test_precommit_manifest_failure_seals_terminal_without_duplicate_event(
     )
     stage.complete(StageOutcome.FAILED, work_item_count=0)
     monkeypatch.setattr(
-        _MemoryDiagnosticStore,
+        _CollectingDiagnosticStore,
         "publish_manifest",
         _raise_disk_error,
     )
 
     with pytest.raises(DiagnosticsFailure) as captured:
-        diagnostics.finish(RunOutcome.failed(error))
+        diagnostics.finish(DiagnosticCompletion.failed(error))
 
     assert captured.value.error_code is ErrorCode.DIAGNOSTICS_WRITE_FAILED
     assert dict(captured.value.diagnostics) == {
@@ -225,7 +232,7 @@ def test_precommit_manifest_failure_seals_terminal_without_duplicate_event(
     ].count("run.completed") == 1
 
     with pytest.raises(RuntimeError, match="诊断已经完成"):
-        diagnostics.finish(RunOutcome.failed(error))
+        diagnostics.finish(DiagnosticCompletion.failed(error))
     assert diagnostics.snapshot().events == first_snapshot.events
 
 
@@ -242,7 +249,7 @@ def test_persistent_finish_never_reports_complete_after_manifest_parent_replacem
     )
 
     with workspace.acquire_run(run_id) as run_workspace:
-        diagnostics = RunDiagnostics.initialize(
+        diagnostics = initialize_persistent_diagnostics(
             run_workspace.diagnostics,
             application_version="4.7.0",
             wall_clock=_wall_clock,
@@ -286,7 +293,7 @@ def test_persistent_finish_never_reports_complete_after_manifest_parent_replacem
 
         with pytest.raises(DiagnosticsFailure) as captured:
             diagnostics.finish(
-                RunOutcome.interrupted(
+                DiagnosticCompletion.interrupted(
                     InterruptionSignal.SIGINT,
                     cleanup_duration_ms=0,
                 )
@@ -314,7 +321,7 @@ def test_postcommit_manifest_failure_reports_incomplete_without_undoing_success(
 
     with workspace.acquire_run(run_id) as run_workspace:
         published = _published(run_workspace)
-        diagnostics = RunDiagnostics.in_memory(
+        diagnostics = initialize_collecting_diagnostics(
             run_id,
             application_version="4.7.0",
             wall_clock=_wall_clock,
@@ -326,13 +333,13 @@ def test_postcommit_manifest_failure_reports_incomplete_without_undoing_success(
         )
         stage.complete(StageOutcome.SUCCEEDED, work_item_count=1)
         monkeypatch.setattr(
-            _MemoryDiagnosticStore,
+            _CollectingDiagnosticStore,
             "publish_manifest",
             _raise_disk_error,
         )
 
         finalization = diagnostics.finish(
-            RunOutcome.succeeded(
+            DiagnosticCompletion.succeeded(
                 published,
                 result_kind=ResultKind.CLIPS,
             )
@@ -357,7 +364,7 @@ def test_postcommit_event_failure_is_best_effort_through_stage_completion(
 
     with workspace.acquire_run(run_id) as run_workspace:
         published = _published(run_workspace)
-        diagnostics = RunDiagnostics.in_memory(
+        diagnostics = initialize_collecting_diagnostics(
             run_id,
             application_version="4.7.0",
             wall_clock=_wall_clock,
@@ -399,7 +406,7 @@ def test_postcommit_event_failure_is_best_effort_through_stage_completion(
             Facts.publication(PublicationState.IN_PROGRESS)
         )
         monkeypatch.setattr(
-            _MemoryDiagnosticStore,
+            _CollectingDiagnosticStore,
             "append",
             _raise_disk_error,
         )
@@ -415,7 +422,7 @@ def test_postcommit_event_failure_is_best_effort_through_stage_completion(
             work_item_count=1,
         )
         finalization = diagnostics.finish(
-            RunOutcome.succeeded(
+            DiagnosticCompletion.succeeded(
                 published,
                 result_kind=ResultKind.CLIPS,
             )

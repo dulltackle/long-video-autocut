@@ -7,19 +7,36 @@ from weakref import ref
 import pytest
 
 import video_auto_editor.configuration as configuration_module
-from video_auto_editor.configuration import Configuration, ConfigurationFailure
-from video_auto_editor.configuration._model import (
+from video_auto_editor.configuration import (
+    ClipPolicy,
+    Configuration,
     ConfigurationDiagnosticProjection,
+    ConfigurationFailure,
+    CourseContext,
+    SubtitleStyle,
 )
 from video_auto_editor.runtime.errors import ErrorCode, RunError
 
 
 def test_configuration_package_exposes_only_its_deep_public_seam():
     assert configuration_module.__all__ == [
+        "ClipPolicy",
         "Configuration",
+        "ConfigurationDiagnosticProjection",
         "ConfigurationFailure",
+        "CourseContext",
         "LoadedConfiguration",
+        "SubtitleStyle",
+        "TextGenerationSettings",
+        "assert_diagnostic_projection_authentic",
     ]
+    assert configuration_module.ClipPolicy is ClipPolicy
+    assert configuration_module.CourseContext is CourseContext
+    assert configuration_module.SubtitleStyle is SubtitleStyle
+    assert (
+        configuration_module.ConfigurationDiagnosticProjection
+        is ConfigurationDiagnosticProjection
+    )
     assert not hasattr(configuration_module, "EffectiveConfiguration")
     assert not hasattr(configuration_module, "ProviderConfiguration")
 

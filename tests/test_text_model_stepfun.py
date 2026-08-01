@@ -165,6 +165,14 @@ class _FailOnEventSink(_RecordingEventSink):
             )
 
 
+def test_stepfun_requires_an_explicit_transport():
+    with pytest.raises(TypeError):
+        StepFunTextModel(
+            _settings(),
+            credential=_CREDENTIAL,
+        )
+
+
 def test_stepfun_generate_sends_only_chat_protocol_fields_and_preserves_raw_text():
     transport = _ScriptedTransport([_chat_response()])
     model = _model(transport)

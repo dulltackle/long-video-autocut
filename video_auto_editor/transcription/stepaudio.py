@@ -31,9 +31,6 @@ from video_auto_editor.cache import (
     CacheRepository,
     CacheResolution,
 )
-from video_auto_editor.runtime._classified_failure import (
-    PreservedApplicationFailure,
-)
 from video_auto_editor.runtime.cancellation import (
     CancellationRequested,
     CancellationSource,
@@ -42,6 +39,7 @@ from video_auto_editor.runtime.cancellation import (
 from video_auto_editor.runtime.errors import (
     ErrorCode,
     InternalLocation,
+    PreservedApplicationFailure,
     RemoteRequestId,
 )
 from video_auto_editor.runtime.identity import OperationId
@@ -58,13 +56,6 @@ from ._normalized_audio import (
     NormalizedPcmReadFailure,
     confirmed_speech_intervals,
 )
-from ._reconciliation import (
-    RecognitionBatch,
-    RecognitionObservation,
-    RecognitionWork,
-    TimeInterval,
-    complete_transcription,
-)
 from .interface import (
     CacheUse,
     CharacterSpan,
@@ -80,6 +71,13 @@ from .interface import (
     TranscriptionRequest,
     TranscriptionResult,
     validate_result_for_source,
+)
+from .reconciliation import (
+    RecognitionBatch,
+    RecognitionObservation,
+    RecognitionWork,
+    TimeInterval,
+    complete_transcription,
 )
 
 _ADAPTER_ID = "stepaudio"
@@ -370,8 +368,8 @@ class StepAudioSpeechRecognition:
         *,
         credential: str,
         cache_repository: CacheRepository,
-        audio_preparer: StepAudioAudioPreparer | None = None,
-        transport: StepAudioTransport | None = None,
+        audio_preparer: StepAudioAudioPreparer,
+        transport: StepAudioTransport,
         event_sink: TranscriptionRemoteRequestEventSink | None = None,
     ) -> None:
         if not isinstance(settings, StepAudioSettings):
@@ -380,14 +378,6 @@ class StepAudioSpeechRecognition:
             raise TypeError("StepAudio 凭据必须是字符串")
         if not isinstance(cache_repository, CacheRepository):
             raise TypeError("StepAudio 语音识别必须使用处理缓存仓库")
-        if audio_preparer is None:
-            from ._stepaudio_audio import FFmpegNormalizedPcmPreparer
-
-            audio_preparer = FFmpegNormalizedPcmPreparer()
-        if transport is None:
-            from ._stepaudio_https import StdlibStepAudioTransport
-
-            transport = StdlibStepAudioTransport(settings.endpoint)
         if not callable(getattr(audio_preparer, "check_readiness", None)) or not callable(
             getattr(audio_preparer, "prepare", None)
         ):

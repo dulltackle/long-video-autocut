@@ -3,13 +3,10 @@
 from dataclasses import dataclass
 from enum import Enum
 
-from video_auto_editor.cache import (
-    CacheNamespace as CacheNamespace,
-)
-from video_auto_editor.cache import CacheOutcome as CacheOutcome
+from video_auto_editor.cache import CacheNamespace, CacheOutcome
+from video_auto_editor.clip_planning import ResultKind
 from video_auto_editor.delivery.capability import PublishedDelivery
 from video_auto_editor.runtime.errors import RunError
-from video_auto_editor.runtime.result import ResultKind
 
 
 class StageOutcome(str, Enum):
@@ -170,8 +167,8 @@ class RecoveredNoticeKind(str, Enum):
     CACHE_CORRUPTION_RECOVERED = "cache_corruption_recovered"
 
 
-class RunTerminalState(str, Enum):
-    """直播拆条运行的三个合法终态。"""
+class _DiagnosticTerminalState(str, Enum):
+    """运行终态写入诊断 schema 时使用的内部投影。"""
 
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -179,10 +176,10 @@ class RunTerminalState(str, Enum):
 
 
 @dataclass(frozen=True, slots=True, init=False)
-class RunOutcome:
-    """只能由合法终态工厂创建的运行完成事实。"""
+class DiagnosticCompletion:
+    """RunDiagnostics 收尾所需的类型化诊断投影。"""
 
-    state: RunTerminalState
+    state: _DiagnosticTerminalState
     primary_error: RunError | None
     associated_errors: tuple[RunError, ...]
     recovery_incomplete: bool
@@ -191,8 +188,8 @@ class RunOutcome:
     interruption_signal: InterruptionSignal | None
     cleanup_duration_ms: int | None
 
-    def __new__(cls) -> "RunOutcome":
-        raise TypeError("RunOutcome 只能通过终态工厂创建")
+    def __new__(cls) -> "DiagnosticCompletion":
+        raise TypeError("DiagnosticCompletion 只能通过诊断收尾工厂创建")
 
     @classmethod
     def failed(
@@ -201,7 +198,7 @@ class RunOutcome:
         *,
         associated_errors: tuple[RunError, ...] = (),
         recovery_incomplete: bool = False,
-    ) -> "RunOutcome":
+    ) -> "DiagnosticCompletion":
         """形成带一个主错误的失败终态。"""
         if not isinstance(primary_error, RunError):
             raise TypeError("失败终态必须包含 RunError 主错误")
@@ -212,7 +209,7 @@ class RunOutcome:
         if not isinstance(recovery_incomplete, bool):
             raise TypeError("恢复完整性必须是布尔值")
         instance = object.__new__(cls)
-        object.__setattr__(instance, "state", RunTerminalState.FAILED)
+        object.__setattr__(instance, "state", _DiagnosticTerminalState.FAILED)
         object.__setattr__(instance, "primary_error", primary_error)
         object.__setattr__(
             instance,
@@ -236,7 +233,7 @@ class RunOutcome:
         published_delivery: PublishedDelivery,
         *,
         result_kind: ResultKind,
-    ) -> "RunOutcome":
+    ) -> "DiagnosticCompletion":
         """形成只能由真实发布提交证明支撑的成功终态。"""
         if not isinstance(published_delivery, PublishedDelivery):
             raise TypeError("成功终态必须包含 PublishedDelivery 提交证明")
@@ -245,7 +242,7 @@ class RunOutcome:
         if not isinstance(result_kind, ResultKind):
             raise TypeError("成功结果必须使用 ResultKind")
         instance = object.__new__(cls)
-        object.__setattr__(instance, "state", RunTerminalState.SUCCEEDED)
+        object.__setattr__(instance, "state", _DiagnosticTerminalState.SUCCEEDED)
         object.__setattr__(instance, "primary_error", None)
         object.__setattr__(instance, "associated_errors", ())
         object.__setattr__(instance, "recovery_incomplete", False)
@@ -267,7 +264,7 @@ class RunOutcome:
         cleanup_duration_ms: int,
         associated_errors: tuple[RunError, ...] = (),
         recovery_incomplete: bool = False,
-    ) -> "RunOutcome":
+    ) -> "DiagnosticCompletion":
         """形成无主错误、可包含清理错误的受控中断终态。"""
         if not isinstance(signal, InterruptionSignal):
             raise TypeError("中断终态必须使用 InterruptionSignal")
@@ -287,7 +284,7 @@ class RunOutcome:
         if bool(associated_errors) != recovery_incomplete:
             raise ValueError("中断清理错误与恢复完整性必须一致")
         instance = object.__new__(cls)
-        object.__setattr__(instance, "state", RunTerminalState.INTERRUPTED)
+        object.__setattr__(instance, "state", _DiagnosticTerminalState.INTERRUPTED)
         object.__setattr__(instance, "primary_error", None)
         object.__setattr__(
             instance,

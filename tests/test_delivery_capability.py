@@ -8,6 +8,7 @@ from video_auto_editor.delivery.capability import (
     PublishedDelivery,
     UnverifiedDelivery,
     VerifiedDelivery,
+    validate_publication_commit_proof,
 )
 from video_auto_editor.runtime.identity import RunId
 from video_auto_editor.workspace import Workspace
@@ -47,6 +48,57 @@ def test_delivery_capability_advances_in_order_and_preserves_its_binding(tmp_pat
 
         with pytest.raises(FrozenInstanceError):
             verified.verification_snapshot = "changed"
+
+
+def test_publication_commit_proof_validates_its_pending_binding(tmp_path):
+    run_id = RunId.new()
+    with open_workspace(tmp_path).acquire_run(run_id) as run_workspace:
+        verified = VerifiedDelivery._from_verification(
+            UnverifiedDelivery._from_build(
+                run_id,
+                run_workspace.delivery_staging,
+            ),
+            verification_snapshot="snapshot-001",
+        )
+        pending = PublishedDelivery._prepare_publication(
+            verified,
+            published_directory=run_workspace.published_delivery,
+        )
+
+        validate_publication_commit_proof(
+            pending,
+            expected_run_id=run_id,
+            expected_directory=run_workspace.published_delivery,
+        )
+
+
+def test_publication_commit_proof_rejects_an_unexpected_binding(tmp_path):
+    run_id = RunId.new()
+    with open_workspace(tmp_path).acquire_run(run_id) as run_workspace:
+        verified = VerifiedDelivery._from_verification(
+            UnverifiedDelivery._from_build(
+                run_id,
+                run_workspace.delivery_staging,
+            ),
+            verification_snapshot="snapshot-001",
+        )
+        pending = PublishedDelivery._prepare_publication(
+            verified,
+            published_directory=run_workspace.published_delivery,
+        )
+
+        with pytest.raises(ValueError, match="必须属于当前运行"):
+            validate_publication_commit_proof(
+                pending,
+                expected_run_id=RunId.new(),
+                expected_directory=run_workspace.published_delivery,
+            )
+        with pytest.raises(ValueError, match="必须绑定当前最终交付目录"):
+            validate_publication_commit_proof(
+                pending,
+                expected_run_id=run_id,
+                expected_directory=run_workspace.cache,
+            )
 
 
 def test_verification_snapshot_rejects_non_string_values_clearly(tmp_path):

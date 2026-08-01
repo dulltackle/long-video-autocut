@@ -11,6 +11,10 @@ from typing import Any, Callable, FrozenSet, Mapping
 from .identity import ErrorId, OperationId
 
 
+class PreservedApplicationFailure(RuntimeError):
+    """已稳定分类且穿越内部 Adapter 时不得改写的失败。"""
+
+
 class ExitCode(IntEnum):
     """直播拆条运行的稳定进程退出码。"""
 

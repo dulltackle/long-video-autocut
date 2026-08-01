@@ -1,14 +1,13 @@
 """持久化脱敏运行诊断包。"""
 
-from ._facts import Facts
+from ._facts import DiagnosticFact, Facts
 from ._failure import DiagnosticsFailure
 from ._model import (
     ArtifactRole,
-    CacheNamespace,
-    CacheOutcome,
     CertifiedPlatform,
     DeliveryBuildState,
     DeliveryVerificationState,
+    DiagnosticCompletion,
     DiagnosticFinalization,
     DiagnosticPackageSnapshot,
     ExternalDataCategory,
@@ -22,8 +21,6 @@ from ._model import (
     PublicationState,
     RecoveredNoticeKind,
     RetryKind,
-    ResultKind,
-    RunOutcome,
     StageOutcome,
     ZeroRequestReason,
 )
@@ -33,22 +30,28 @@ from ._reader import (
     DiagnosticPackageReadResult,
     DiagnosticPackageReadState,
 )
-from ._session import RunDiagnostics
+from ._session import (
+    DiagnosticOperation,
+    DiagnosticScope,
+    RunDiagnostics,
+    StageDiagnostics,
+)
 
 __all__ = [
     "ArtifactRole",
-    "CacheNamespace",
-    "CacheOutcome",
     "CertifiedPlatform",
     "DeliveryBuildState",
     "DeliveryVerificationState",
     "DiagnosticFinalization",
+    "DiagnosticFact",
+    "DiagnosticOperation",
     "DiagnosticsFailure",
     "DiagnosticPackageReader",
     "DiagnosticPackageReadReason",
     "DiagnosticPackageReadResult",
     "DiagnosticPackageReadState",
     "DiagnosticPackageSnapshot",
+    "DiagnosticScope",
     "ExternalDataCategory",
     "ExternalRequestOutcome",
     "Facts",
@@ -61,9 +64,9 @@ __all__ = [
     "PublicationState",
     "RecoveredNoticeKind",
     "RetryKind",
-    "ResultKind",
     "RunDiagnostics",
-    "RunOutcome",
+    "DiagnosticCompletion",
+    "StageDiagnostics",
     "StageOutcome",
     "ZeroRequestReason",
 ]

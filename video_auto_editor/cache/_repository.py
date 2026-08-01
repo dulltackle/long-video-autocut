@@ -7,7 +7,6 @@ from time import monotonic
 from typing import Any, Protocol, TypeVar, cast
 
 from video_auto_editor.runtime.cancellation import CancellationToken
-from video_auto_editor.workspace import ManagedDirectoryCapability
 
 from ._envelope import (
     _CorruptEnvelope,
@@ -16,7 +15,6 @@ from ._envelope import (
     _prepare_payload,
     _PreparedPayload,
 )
-from ._filesystem import _FileSystemStore
 from ._model import (
     CacheEntrySpec,
     CacheIdentity,
@@ -224,45 +222,12 @@ class CacheRepository:
         application_version: str,
         clock: _Clock | None = None,
     ) -> "CacheRepository":
-        version = _require_version(
-            application_version,
-            field="生产程序版本",
+        del cls
+        return _create_repository(
+            _MemoryStore,
+            application_version=application_version,
+            clock=clock,
         )
-        instance = object.__new__(cls)
-        object.__setattr__(instance, "_store", _MemoryStore())
-        object.__setattr__(instance, "_application_version", version)
-        object.__setattr__(
-            instance,
-            "_clock",
-            clock or (lambda: datetime.now(timezone.utc)),
-        )
-        return instance
-
-    @classmethod
-    def initialize(
-        cls,
-        cache_directory: ManagedDirectoryCapability,
-        *,
-        application_version: str,
-        clock: _Clock | None = None,
-    ) -> "CacheRepository":
-        version = _require_version(
-            application_version,
-            field="生产程序版本",
-        )
-        instance = object.__new__(cls)
-        object.__setattr__(
-            instance,
-            "_store",
-            _FileSystemStore(cache_directory),
-        )
-        object.__setattr__(instance, "_application_version", version)
-        object.__setattr__(
-            instance,
-            "_clock",
-            clock or (lambda: datetime.now(timezone.utc)),
-        )
-        return instance
 
     def lookup(
         self,
@@ -434,6 +399,27 @@ class CacheRepository:
                 singleflight_wait_ms=wait_ms,
             )
         )
+
+
+def _create_repository(
+    store_factory: Callable[[], _Store],
+    *,
+    application_version: str,
+    clock: _Clock | None = None,
+) -> CacheRepository:
+    version = _require_version(
+        application_version,
+        field="生产程序版本",
+    )
+    instance = object.__new__(CacheRepository)
+    object.__setattr__(instance, "_store", store_factory())
+    object.__setattr__(instance, "_application_version", version)
+    object.__setattr__(
+        instance,
+        "_clock",
+        clock or (lambda: datetime.now(timezone.utc)),
+    )
+    return instance
 
 
 def _lookup_result(

@@ -1,6 +1,8 @@
 import json
 from datetime import datetime, timezone
 
+from video_auto_editor.cache import CacheNamespace, CacheOutcome
+from video_auto_editor.clip_planning import ResultKind
 from video_auto_editor.configuration import ConfigurationFailure
 from video_auto_editor.delivery.capability import (
     PublishedDelivery,
@@ -9,20 +11,19 @@ from video_auto_editor.delivery.capability import (
 )
 from video_auto_editor.diagnostics import (
     ArtifactRole,
-    CacheNamespace,
-    CacheOutcome,
     DeliveryBuildState,
     DeliveryVerificationState,
+    DiagnosticCompletion,
     Facts,
     OperationKind,
     OperationOutcome,
     PublicationState,
     RecoveredNoticeKind,
-    ResultKind,
     RetryKind,
-    RunDiagnostics,
-    RunOutcome,
     StageOutcome,
+)
+from video_auto_editor.diagnostics.collecting import (
+    initialize as initialize_collecting_diagnostics,
 )
 from video_auto_editor.runtime.errors import (
     ErrorCode,
@@ -66,7 +67,7 @@ def test_delivery_lifecycle_and_artifacts_are_owned_by_their_modules(tmp_path):
     source.write_bytes(b"source")
     run_id = RunId.new()
     workspace = Workspace.open(source, tmp_path / "workspace")
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         run_id,
         application_version="4.7.0",
         wall_clock=_wall_clock,
@@ -141,7 +142,7 @@ def test_delivery_lifecycle_and_artifacts_are_owned_by_their_modules(tmp_path):
             work_item_count=1,
         )
         diagnostics.finish(
-            RunOutcome.succeeded(
+            DiagnosticCompletion.succeeded(
                 published,
                 result_kind=ResultKind.CLIPS,
             )
@@ -182,7 +183,7 @@ def test_delivery_lifecycle_and_artifacts_are_owned_by_their_modules(tmp_path):
 
 
 def test_recovered_work_is_a_notice_and_never_a_terminal_error():
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=_wall_clock,
@@ -238,7 +239,7 @@ def test_recovered_work_is_a_notice_and_never_a_terminal_error():
         )
     )
     stage.complete(StageOutcome.FAILED, work_item_count=1)
-    diagnostics.finish(RunOutcome.failed(primary))
+    diagnostics.finish(DiagnosticCompletion.failed(primary))
 
     manifest = json.loads(diagnostics.snapshot().manifest)
 

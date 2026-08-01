@@ -1,0 +1,26 @@
+"""标准交付 JSON 文档的规范版本事实。"""
+
+from types import MappingProxyType
+
+DELIVERY_MANIFEST_SCHEMA_VERSION = "delivery_manifest.v1"
+SHORT_VIDEO_CATALOG_SCHEMA_VERSION = "short_video_catalog.v1"
+CLIP_PLAN_SCHEMA_VERSION = "clip_plan.v1"
+TRANSCRIPT_SCHEMA_VERSION = "transcript.v1"
+
+DELIVERY_SCHEMA_VERSIONS = MappingProxyType(
+    {
+        "manifest": DELIVERY_MANIFEST_SCHEMA_VERSION,
+        "metadata": SHORT_VIDEO_CATALOG_SCHEMA_VERSION,
+        "plan": CLIP_PLAN_SCHEMA_VERSION,
+        "transcript": TRANSCRIPT_SCHEMA_VERSION,
+    }
+)
+
+
+__all__ = [
+    "CLIP_PLAN_SCHEMA_VERSION",
+    "DELIVERY_MANIFEST_SCHEMA_VERSION",
+    "DELIVERY_SCHEMA_VERSIONS",
+    "SHORT_VIDEO_CATALOG_SCHEMA_VERSION",
+    "TRANSCRIPT_SCHEMA_VERSION",
+]

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from video_auto_editor.delivery import capability as delivery_capability
+import video_auto_editor.delivery.capability as delivery_capability
 from video_auto_editor.runtime.cancellation import (
     CancellationRequested,
     CancellationSource,

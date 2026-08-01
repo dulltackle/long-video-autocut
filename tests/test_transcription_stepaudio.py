@@ -21,20 +21,26 @@ from video_auto_editor.transcription import (
     CacheUse,
     ReadinessIssue,
     SpeechPresence,
-    StepAudioSettings,
-    StepAudioSpeechRecognition,
     TranscriptionFailure,
     TranscriptionRemoteRequestEvent,
     TranscriptionRemoteRequestEventKind,
     TranscriptionRequest,
 )
-from video_auto_editor.transcription._reconciliation import (
+from video_auto_editor.transcription._stepaudio_audio import (
+    FFmpegNormalizedPcmPreparer,
+)
+from video_auto_editor.transcription._stepaudio_https import (
+    StdlibStepAudioTransport,
+)
+from video_auto_editor.transcription.reconciliation import (
     RecognitionKind,
     RecognitionWork,
     TimeInterval,
 )
 from video_auto_editor.transcription.stepaudio import (
     NormalizedPcmAudio,
+    StepAudioSettings,
+    StepAudioSpeechRecognition,
     StepAudioTransportFailure,
     StepAudioTransportFailureKind,
     StepAudioTransportRequest,
@@ -248,6 +254,15 @@ def _tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
     return tuple(entries)
 
 
+def test_stepaudio_requires_explicit_production_effects():
+    with pytest.raises(TypeError):
+        StepAudioSpeechRecognition(
+            _settings(),
+            credential="credential-canary-must-not-leak",
+            cache_repository=_cache_repository(),
+        )
+
+
 def test_stepaudio_readiness_aggregates_all_local_issues_repeatably_without_business_io(
     tmp_path,
 ):
@@ -358,7 +373,7 @@ def test_stepaudio_rejects_unsafe_credential_header_before_business_io(
         run_workspace.close()
 
 
-def test_stepaudio_default_production_readiness_is_local_and_repeatable(
+def test_stepaudio_explicit_production_effects_readiness_is_local_and_repeatable(
     tmp_path,
     monkeypatch,
 ):
@@ -384,6 +399,8 @@ def test_stepaudio_default_production_readiness_is_local_and_repeatable(
         _settings(),
         credential="",
         cache_repository=_cache_repository(),
+        audio_preparer=FFmpegNormalizedPcmPreparer(),
+        transport=StdlibStepAudioTransport(_settings().endpoint),
     )
     before = _tree_snapshot(untouched)
 

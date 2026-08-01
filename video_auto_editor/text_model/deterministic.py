@@ -7,9 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
-from video_auto_editor.runtime._classified_failure import (
-    PreservedApplicationFailure,
-)
+from video_auto_editor.runtime.errors import PreservedApplicationFailure
 from video_auto_editor.runtime.identity import OperationId
 
 from .interface import (

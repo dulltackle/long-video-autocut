@@ -15,48 +15,53 @@ from video_auto_editor.application.live import (
     _RunAssembly,
     _StageWork,
 )
-from video_auto_editor.cache import CacheNamespace, CacheOutcome, CacheRepository
-from video_auto_editor.clip_planning import CandidatePlan, ClipPlanning, DeliveryPlan
-from video_auto_editor.configuration import Configuration, LoadedConfiguration
-from video_auto_editor.configuration._model import TextGenerationSettings
-from video_auto_editor.delivery import (
-    DeliveryBuild,
-    DeliveryBuildRequest,
-    DeliveryVerification,
-    Publication,
-    PublicationFailure,
-)
-from video_auto_editor.delivery.capability import (
-    PublishedDelivery,
-    UnverifiedDelivery,
-    VerifiedDelivery,
-)
-from video_auto_editor.diagnostics import (
-    ArtifactRole,
-    ExternalRequestOutcome,
-    Facts,
-    OperationKind,
-    OperationOutcome,
-    ProviderCapability,
-    ResultKind,
-    RetryKind,
-    RunDiagnostics,
-    StageOutcome,
-    ZeroRequestReason,
-)
-from video_auto_editor.diagnostics._facts import DiagnosticFact
-from video_auto_editor.diagnostics._session import (
-    DiagnosticOperation,
-    DiagnosticScope,
-    StageDiagnostics,
-)
-from video_auto_editor.readiness import (
+from video_auto_editor.application.readiness import (
     ProviderBinding,
     ProviderDisclosure,
     Readiness,
     ReadinessIssue,
     ReadinessReport,
     ReadinessRequest,
+)
+from video_auto_editor.cache import CacheNamespace, CacheOutcome, CacheRepository
+from video_auto_editor.cache.filesystem import initialize_cache_repository
+from video_auto_editor.clip_planning import (
+    CandidatePlan,
+    ClipPlanning,
+    DeliveryPlan,
+    ResultKind,
+)
+from video_auto_editor.configuration import (
+    Configuration,
+    LoadedConfiguration,
+    TextGenerationSettings,
+)
+from video_auto_editor.delivery.build import DeliveryBuild, DeliveryBuildRequest
+from video_auto_editor.delivery.capability import (
+    PublishedDelivery,
+    UnverifiedDelivery,
+    VerifiedDelivery,
+)
+from video_auto_editor.delivery.publication import Publication, PublicationFailure
+from video_auto_editor.delivery.verification import DeliveryVerification
+from video_auto_editor.diagnostics import (
+    ArtifactRole,
+    DiagnosticFact,
+    DiagnosticOperation,
+    DiagnosticScope,
+    ExternalRequestOutcome,
+    Facts,
+    OperationKind,
+    OperationOutcome,
+    ProviderCapability,
+    RetryKind,
+    RunDiagnostics,
+    StageDiagnostics,
+    StageOutcome,
+    ZeroRequestReason,
+)
+from video_auto_editor.diagnostics.persistent import (
+    initialize as initialize_persistent_diagnostics,
 )
 from video_auto_editor.runtime.cancellation import (
     CancellationRequested,
@@ -80,11 +85,13 @@ from video_auto_editor.subtitle_optimization import (
 from video_auto_editor.text_model import (
     GenerationSettings,
     ReasoningEffort,
-    StepFunSettings,
-    StepFunTextModel,
     TextModelEvent,
     TextModelEventKind,
 )
+from video_auto_editor.text_model._stepfun_https import (
+    StdlibStepFunTransport,
+)
+from video_auto_editor.text_model.stepfun import StepFunSettings, StepFunTextModel
 from video_auto_editor.topic_review import (
     TopicReview,
     TopicReviewExecutionFacts,
@@ -98,13 +105,21 @@ from video_auto_editor.transcription import (
     CompleteTranscript,
     ExecutionFacts,
     SpeechPresence,
-    StepAudioSettings,
-    StepAudioSpeechRecognition,
     TranscriptionFailure,
     TranscriptionRemoteRequestEvent,
     TranscriptionRemoteRequestEventKind,
     TranscriptionRequest,
     TranscriptionResult,
+)
+from video_auto_editor.transcription._stepaudio_audio import (
+    FFmpegNormalizedPcmPreparer,
+)
+from video_auto_editor.transcription._stepaudio_https import (
+    StdlibStepAudioTransport,
+)
+from video_auto_editor.transcription.stepaudio import (
+    StepAudioSettings,
+    StepAudioSpeechRecognition,
 )
 from video_auto_editor.workspace import (
     DiagnosticRunWorkspace,
@@ -1082,7 +1097,7 @@ class _ProductionAssemblyFactory:
             raise _fixed_provider_failure("transcription_provider")
         if effective.text_model_provider != "stepfun":
             raise _fixed_provider_failure("text_model_provider")
-        cache = CacheRepository.initialize(
+        cache = initialize_cache_repository(
             run_workspace.cache,
             application_version=_APPLICATION_VERSION,
         )
@@ -1091,29 +1106,36 @@ class _ProductionAssemblyFactory:
         text_bridge = _TextModelDiagnosticBridge(ledger)
         transcription_configuration = effective.transcription_provider_config
         text_configuration = effective.text_model_provider_config
+        stepaudio_settings = StepAudioSettings(
+            endpoint=transcription_configuration.endpoint,
+            model=transcription_configuration.model,
+            timeout_seconds=transcription_configuration.timeout_seconds,
+            max_concurrency=transcription_configuration.max_concurrency,
+        )
         speech_recognition = StepAudioSpeechRecognition(
-            StepAudioSettings(
-                endpoint=transcription_configuration.endpoint,
-                model=transcription_configuration.model,
-                timeout_seconds=transcription_configuration.timeout_seconds,
-                max_concurrency=transcription_configuration.max_concurrency,
-            ),
+            stepaudio_settings,
             credential=os.environ.get(
                 transcription_configuration.key_environment_variable,
                 "",
             ),
             cache_repository=cache,
+            audio_preparer=FFmpegNormalizedPcmPreparer(),
+            transport=StdlibStepAudioTransport(stepaudio_settings.endpoint),
             event_sink=stepaudio_bridge,
         )
+        stepfun_settings = StepFunSettings(
+            endpoint=text_configuration.endpoint,
+            timeout_seconds=text_configuration.timeout_seconds,
+            max_concurrency=text_configuration.max_concurrency,
+        )
         text_model = StepFunTextModel(
-            StepFunSettings(
-                endpoint=text_configuration.endpoint,
-                timeout_seconds=text_configuration.timeout_seconds,
-                max_concurrency=text_configuration.max_concurrency,
-            ),
+            stepfun_settings,
             credential=os.environ.get(
                 text_configuration.key_environment_variable,
                 "",
+            ),
+            transport=StdlibStepFunTransport(
+                f"{stepfun_settings.endpoint.rstrip('/')}/chat/completions"
             ),
             event_sink=text_bridge,
         )
@@ -1166,7 +1188,7 @@ def _initialize_diagnostics(
     wall_clock: Callable[[], datetime],
     monotonic_clock: Callable[[], float],
 ) -> RunDiagnostics:
-    return RunDiagnostics.initialize(
+    return initialize_persistent_diagnostics(
         run_workspace.diagnostics,
         application_version=application_version,
         wall_clock=wall_clock,

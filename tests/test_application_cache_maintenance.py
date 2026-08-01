@@ -5,7 +5,8 @@ import pytest
 from video_auto_editor.application.cache_maintenance import (
     CacheMaintenanceApplication,
 )
-from video_auto_editor.cache import CacheNamespace, CacheRepository
+from video_auto_editor.cache import CacheNamespace
+from video_auto_editor.cache.filesystem import initialize_cache_repository
 from video_auto_editor.runtime.errors import ErrorCode
 from video_auto_editor.runtime.identity import RunId
 from video_auto_editor.workspace import Workspace, WorkspaceFailure
@@ -114,7 +115,7 @@ def test_cache_maintenance_is_idempotent_without_creating_run_facts(
 
     reopened = Workspace.open_existing(workspace)
     with reopened.acquire_maintenance() as maintenance:
-        CacheRepository.initialize(
+        initialize_cache_repository(
             maintenance.cache,
             application_version="4.7.0",
         )

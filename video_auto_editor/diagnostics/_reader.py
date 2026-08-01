@@ -50,9 +50,9 @@ from ._model import (
     RecoveredNoticeKind,
     ResultKind,
     RetryKind,
-    RunTerminalState,
     StageOutcome,
     ZeroRequestReason,
+    _DiagnosticTerminalState,
 )
 
 
@@ -660,7 +660,7 @@ def _validate_event_timeline(
                 or event["module"] != ErrorModule.APPLICATION.value
                 or (
                     event["attributes"]["outcome"]
-                    != RunTerminalState.FAILED.value
+                    != _DiagnosticTerminalState.FAILED.value
                     and event["stage"] != last_stage
                 )
             ):
@@ -966,7 +966,7 @@ def _validate_event_attributes(
             and _enum_value(attributes["exit_code"], ExitCode)
             and _enum_value(
                 attributes["outcome"],
-                RunTerminalState,
+                _DiagnosticTerminalState,
             )
             and _valid_result_kind(
                 attributes["result_kind"],
@@ -1414,7 +1414,7 @@ def _manifest_matches_events(
         or lifecycle["ended_at"] != terminal["timestamp"]
         or not _interruption_matches_events(lifecycle, events)
         or (
-            lifecycle["outcome"] == RunTerminalState.FAILED.value
+            lifecycle["outcome"] == _DiagnosticTerminalState.FAILED.value
             and terminal["stage"]
             != manifest["errors"]["primary_error"]["stage"]
         )
@@ -1482,7 +1482,7 @@ def _interruption_matches_events(
     )
     if len(interruption_events) > 1:
         return False
-    if lifecycle["outcome"] != RunTerminalState.INTERRUPTED.value:
+    if lifecycle["outcome"] != _DiagnosticTerminalState.INTERRUPTED.value:
         return True
     if len(interruption_events) != 1:
         return False
@@ -1958,7 +1958,7 @@ def _delivery_from_events(
     if "in_progress" in state_values:
         return None
     successful_states = ("completed", "passed", "committed")
-    if outcome == RunTerminalState.SUCCEEDED.value:
+    if outcome == _DiagnosticTerminalState.SUCCEEDED.value:
         if delivery_observed and state_values != successful_states:
             return None
         delivery: dict[str, Any] = {
@@ -2084,13 +2084,13 @@ def _errors_match_events(
         for error in referenced
     ):
         return False
-    if outcome == RunTerminalState.SUCCEEDED.value:
+    if outcome == _DiagnosticTerminalState.SUCCEEDED.value:
         return (
             _is_not_applicable(primary)
             and not associated
             and not manifest_errors["recovery_incomplete"]
         )
-    if outcome == RunTerminalState.INTERRUPTED.value:
+    if outcome == _DiagnosticTerminalState.INTERRUPTED.value:
         return (
             _is_not_applicable(primary)
             and bool(associated)
@@ -2920,7 +2920,7 @@ def _errors_match_lifecycle(
 ) -> bool:
     primary = errors["primary_error"]
     outcome = lifecycle["outcome"]
-    if outcome == RunTerminalState.FAILED.value:
+    if outcome == _DiagnosticTerminalState.FAILED.value:
         if _is_not_applicable(primary):
             return False
         try:
@@ -2940,11 +2940,11 @@ def _errors_match_lifecycle(
         _is_not_applicable(primary)
         and (
             (
-                outcome == RunTerminalState.SUCCEEDED.value
+                outcome == _DiagnosticTerminalState.SUCCEEDED.value
                 and lifecycle["exit_code"] == int(ExitCode.SUCCESS)
             )
             or (
-                outcome == RunTerminalState.INTERRUPTED.value
+                outcome == _DiagnosticTerminalState.INTERRUPTED.value
                 and lifecycle["exit_code"]
                 == InterruptionSignal(
                     lifecycle["interruption"]["signal"]
@@ -3024,7 +3024,7 @@ def _valid_lifecycle(
         return False
     outcome = lifecycle["outcome"]
     interruption = lifecycle["interruption"]
-    if outcome == RunTerminalState.INTERRUPTED.value:
+    if outcome == _DiagnosticTerminalState.INTERRUPTED.value:
         interruption_valid = _valid_interruption_manifest(interruption)
     else:
         interruption_valid = _is_not_applicable(interruption)
@@ -3035,7 +3035,7 @@ def _valid_lifecycle(
         and _TIMESTAMP.fullmatch(lifecycle["ended_at"]) is not None
         and _nonnegative_int(lifecycle["duration_ms"])
         and lifecycle["duration_ms"] == terminal["duration_ms"]
-        and _enum_value(outcome, RunTerminalState)
+        and _enum_value(outcome, _DiagnosticTerminalState)
         and outcome == terminal["outcome"]
         and _int_not_bool(lifecycle["exit_code"])
         and lifecycle["exit_code"] == terminal["exit_code"]
@@ -3046,7 +3046,7 @@ def _valid_lifecycle(
 
 
 def _valid_result_kind(value: Any, *, outcome: str) -> bool:
-    if outcome != RunTerminalState.SUCCEEDED.value:
+    if outcome != _DiagnosticTerminalState.SUCCEEDED.value:
         return _is_not_applicable(value)
     return (
         isinstance(value, dict)

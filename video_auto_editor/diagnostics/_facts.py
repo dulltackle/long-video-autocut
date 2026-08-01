@@ -8,11 +8,9 @@ from threading import RLock
 from urllib.parse import urlsplit
 from weakref import WeakKeyDictionary
 
-from video_auto_editor.configuration._diagnostics import (
-    assert_diagnostic_projection_authentic,
-)
-from video_auto_editor.configuration._model import (
+from video_auto_editor.configuration import (
     ConfigurationDiagnosticProjection,
+    assert_diagnostic_projection_authentic,
 )
 from video_auto_editor.delivery.capability import PublishedDelivery
 from video_auto_editor.runtime.errors import (
@@ -39,7 +37,6 @@ from ._model import (
     RecoveredNoticeKind,
     ZeroRequestReason,
 )
-
 
 _FACT_SEAL = object()
 

@@ -12,16 +12,12 @@ from video_auto_editor.runtime.cancellation import CancellationSource
 from video_auto_editor.runtime.errors import ErrorCode, RunStage
 from video_auto_editor.runtime.identity import OperationId, RunId
 from video_auto_editor.text_model import (
-    DeterministicTextModel,
-    DeterministicTextModelScript,
     GenerationSettings,
     ObservationContext,
     PromptMessage,
     PromptRole,
     ReadinessReport,
     ReasoningEffort,
-    StepFunSettings,
-    StepFunTextModel,
     TextGenerationRequest,
     TextGenerationResponse,
     TextModelEventKind,
@@ -30,7 +26,15 @@ from video_auto_editor.text_model import (
     TextModelFailureKind,
     TextModelPort,
 )
-from video_auto_editor.text_model.stepfun import StepFunTransportResponse
+from video_auto_editor.text_model.deterministic import (
+    DeterministicTextModel,
+    DeterministicTextModelScript,
+)
+from video_auto_editor.text_model.stepfun import (
+    StepFunSettings,
+    StepFunTextModel,
+    StepFunTransportResponse,
+)
 
 
 class _ContractTransport:

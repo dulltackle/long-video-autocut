@@ -1,6 +1,7 @@
 [build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
+requires = ["setuptools>=64"]
+build-backend = "build_backend"
+backend-path = ["."]
 
 [project]
 name = "video-auto-editor"
@@ -12,7 +13,8 @@ requires-python = ">=3.10"
 video-auto-editor = "video_auto_editor.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["video_auto_editor*"]
+include = ["video_auto_editor", "video_auto_editor.*"]
+namespaces = false
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

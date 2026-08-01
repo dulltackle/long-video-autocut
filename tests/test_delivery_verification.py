@@ -12,11 +12,13 @@ from time import monotonic, sleep
 
 import pytest
 
-from video_auto_editor.delivery import (
-    DeliveryVerification,
-    DeliveryVerificationFailure,
+from video_auto_editor.delivery.capability import (
     UnverifiedDelivery,
     VerifiedDelivery,
+)
+from video_auto_editor.delivery.verification import (
+    DeliveryVerification,
+    DeliveryVerificationFailure,
 )
 from video_auto_editor.runtime.cancellation import (
     CancellationRequested,

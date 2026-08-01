@@ -17,7 +17,7 @@ from video_auto_editor.workspace import (
     WorkspaceFailure,
 )
 
-from ._reconciliation import TimeInterval
+from .reconciliation import TimeInterval
 
 PCM_SAMPLE_RATE = 16_000
 PCM_CHANNELS = 1

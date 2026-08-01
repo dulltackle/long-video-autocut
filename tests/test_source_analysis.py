@@ -13,10 +13,10 @@ from time import monotonic, sleep
 
 import pytest
 
-from video_auto_editor.application import LiveRunRequest, LiveRunState
-from video_auto_editor.application._deterministic import (
+from tests.support.deterministic_composition import (
     compose_deterministic_live_application,
 )
+from video_auto_editor.application import LiveRunRequest, LiveRunState
 from video_auto_editor.runtime.cancellation import (
     CancellationRequested,
     CancellationSource,

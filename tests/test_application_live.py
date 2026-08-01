@@ -9,19 +9,19 @@ import pytest
 
 import video_auto_editor.application as application_api
 import video_auto_editor.workspace._workspace as workspace_effects
+from tests.support.deterministic_composition import (
+    compose_deterministic_live_application,
+)
 from video_auto_editor.application import (
     LiveApplication,
     LiveRunOutcome,
     LiveRunRequest,
     LiveRunState,
 )
-from video_auto_editor.application._deterministic import (
-    compose_deterministic_live_application,
-)
 from video_auto_editor.application.live import _CommitState
+from video_auto_editor.clip_planning import ResultKind
 from video_auto_editor.diagnostics import (
     InterruptionSignal,
-    ResultKind,
     StageOutcome,
 )
 from video_auto_editor.runtime.errors import (

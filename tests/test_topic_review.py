@@ -5,9 +5,8 @@ from dataclasses import dataclass
 import pytest
 
 from video_auto_editor.cache import CacheRepository
-from video_auto_editor.clip_planning import ClipPlanning
+from video_auto_editor.clip_planning import ClipPlanning, ResultKind
 from video_auto_editor.configuration import Configuration
-from video_auto_editor.runtime import ResultKind
 from video_auto_editor.runtime.cancellation import (
     CancellationRequested,
     CancellationSource,
@@ -20,8 +19,6 @@ from video_auto_editor.runtime.identity import (
 )
 from video_auto_editor.source_analysis import SourceDescription
 from video_auto_editor.text_model import (
-    DeterministicTextModel,
-    DeterministicTextModelScript,
     GenerationSettings,
     ReadinessReport,
     ReasoningEffort,
@@ -29,6 +26,10 @@ from video_auto_editor.text_model import (
     TextModelExecutionFacts,
     TextModelFailure,
     TextModelFailureKind,
+)
+from video_auto_editor.text_model.deterministic import (
+    DeterministicTextModel,
+    DeterministicTextModelScript,
 )
 from video_auto_editor.topic_review import (
     TopicReview,

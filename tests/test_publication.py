@@ -7,11 +7,11 @@ import signal
 import pytest
 
 import video_auto_editor.workspace._workspace as workspace_effects
-from video_auto_editor.delivery import Publication, PublicationFailure
 from video_auto_editor.delivery.capability import (
     UnverifiedDelivery,
     VerifiedDelivery,
 )
+from video_auto_editor.delivery.publication import Publication, PublicationFailure
 from video_auto_editor.runtime.cancellation import (
     CancellationRequested,
     CancellationSource,

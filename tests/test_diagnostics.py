@@ -3,21 +3,27 @@ from datetime import datetime, timezone
 
 import pytest
 
+from video_auto_editor.cache import CacheNamespace, CacheOutcome
+from video_auto_editor.configuration import (
+    Configuration,
+    ConfigurationDiagnosticProjection,
+    ConfigurationFailure,
+)
 from video_auto_editor.diagnostics import (
-    CacheNamespace,
-    CacheOutcome,
+    DiagnosticCompletion,
     Facts,
     InterruptionSignal,
     OperationKind,
     OperationOutcome,
     RetryKind,
-    RunDiagnostics,
-    RunOutcome,
+    StageDiagnostics,
     StageOutcome,
 )
-from video_auto_editor.configuration import Configuration, ConfigurationFailure
-from video_auto_editor.configuration._model import (
-    ConfigurationDiagnosticProjection,
+from video_auto_editor.diagnostics.collecting import (
+    initialize as initialize_collecting_diagnostics,
+)
+from video_auto_editor.diagnostics.persistent import (
+    initialize as initialize_persistent_diagnostics,
 )
 from video_auto_editor.runtime.errors import (
     ErrorCode,
@@ -48,7 +54,7 @@ def test_initialize_persists_the_run_bound_first_event(tmp_path):
     run_id = RunId.new()
 
     with workspace.acquire_run(run_id) as run_workspace:
-        diagnostics = RunDiagnostics.initialize(
+        diagnostics = initialize_persistent_diagnostics(
             run_workspace.diagnostics,
             application_version="4.7.0",
             wall_clock=_fixed_wall_clock,
@@ -91,7 +97,7 @@ def test_stage_scope_persists_one_monotonic_start_and_completion_pair(tmp_path):
     monotonic_values = iter([10.0, 10.125, 10.875])
 
     with workspace.acquire_run(run_id) as run_workspace:
-        diagnostics = RunDiagnostics.initialize(
+        diagnostics = initialize_persistent_diagnostics(
             run_workspace.diagnostics,
             application_version="4.7.0",
             wall_clock=_fixed_wall_clock,
@@ -162,7 +168,7 @@ def test_stage_scope_persists_one_monotonic_start_and_completion_pair(tmp_path):
 def test_in_memory_adapter_observes_the_same_event_contract():
     run_id = RunId.new()
     monotonic_values = iter([1.0, 1.25, 1.5])
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         run_id,
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -203,7 +209,7 @@ def test_persistent_and_memory_adapters_produce_identical_package_bytes(
         scope.record(Facts.interruption(InterruptionSignal.SIGINT))
         stage.complete(StageOutcome.INTERRUPTED, work_item_count=0)
         diagnostics.finish(
-            RunOutcome.interrupted(
+            DiagnosticCompletion.interrupted(
                 InterruptionSignal.SIGINT,
                 cleanup_duration_ms=25,
             )
@@ -212,7 +218,7 @@ def test_persistent_and_memory_adapters_produce_identical_package_bytes(
 
     with workspace.acquire_run(run_id) as run_workspace:
         persistent = exercise(
-            RunDiagnostics.initialize(
+            initialize_persistent_diagnostics(
                 run_workspace.diagnostics,
                 application_version="4.7.0",
                 wall_clock=_fixed_wall_clock,
@@ -222,7 +228,7 @@ def test_persistent_and_memory_adapters_produce_identical_package_bytes(
             )
         )
         memory = exercise(
-            RunDiagnostics.in_memory(
+            initialize_collecting_diagnostics(
                 run_id,
                 application_version="4.7.0",
                 wall_clock=_fixed_wall_clock,
@@ -238,7 +244,7 @@ def test_persistent_and_memory_adapters_produce_identical_package_bytes(
 def test_operation_scope_owns_timing_retry_relationship_and_completion():
     run_id = RunId.new()
     monotonic_values = iter([1.0, 2.0, 2.25, 3.0, 4.0])
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         run_id,
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -307,7 +313,7 @@ def test_operation_scope_owns_timing_retry_relationship_and_completion():
 def test_one_stage_can_issue_minimum_scopes_to_multiple_business_modules():
     run_id = RunId.new()
     monotonic_values = iter([1.0, 2.0, 2.25, 2.5, 3.0, 3.25, 4.0])
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         run_id,
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -315,6 +321,7 @@ def test_one_stage_can_issue_minimum_scopes_to_multiple_business_modules():
     )
 
     stage = diagnostics.start_stage(RunStage.DELIVERY_BUILD)
+    assert isinstance(stage, StageDiagnostics)
     subtitle_scope = stage.scope(ErrorModule.SUBTITLE_OPTIMIZATION)
     build_scope = stage.scope(ErrorModule.DELIVERY_BUILD)
     subtitle_operation = subtitle_scope.start_operation(
@@ -354,7 +361,7 @@ def test_one_stage_can_issue_minimum_scopes_to_multiple_business_modules():
 def test_failed_run_forms_a_complete_manifest_from_recorded_facts():
     run_id = RunId.new()
     monotonic_values = iter([1.0, 2.0, 3.0, 4.0])
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         run_id,
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -373,7 +380,7 @@ def test_failed_run_forms_a_complete_manifest_from_recorded_facts():
     )
     stage.complete(StageOutcome.FAILED, work_item_count=0)
 
-    finalization = diagnostics.finish(RunOutcome.failed(primary_error))
+    finalization = diagnostics.finish(DiagnosticCompletion.failed(primary_error))
     snapshot = diagnostics.snapshot()
     events = [
         json.loads(line)
@@ -462,7 +469,7 @@ def test_configuration_fact_persists_only_the_existing_safe_projection(tmp_path)
     )
     loaded = Configuration.load(source)
     monotonic_values = iter([1.0, 2.0, 3.0, 4.0])
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -485,7 +492,7 @@ def test_configuration_fact_persists_only_the_existing_safe_projection(tmp_path)
         )
     )
     stage.complete(StageOutcome.FAILED, work_item_count=0)
-    diagnostics.finish(RunOutcome.failed(primary_error))
+    diagnostics.finish(DiagnosticCompletion.failed(primary_error))
     snapshot = diagnostics.snapshot()
     manifest = json.loads(snapshot.manifest)
 
@@ -575,7 +582,7 @@ def test_configuration_fact_rejects_unissued_and_recursively_mutated_projections
 def test_cache_fact_records_only_closed_outcomes_and_aggregates_by_namespace():
     run_id = RunId.new()
     monotonic_values = iter([1.0, 2.0, 2.25, 2.5, 3.0, 4.0, 5.0])
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         run_id,
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -608,7 +615,7 @@ def test_cache_fact_records_only_closed_outcomes_and_aggregates_by_namespace():
         )
     )
     stage.complete(StageOutcome.FAILED, work_item_count=1)
-    diagnostics.finish(RunOutcome.failed(primary_error))
+    diagnostics.finish(DiagnosticCompletion.failed(primary_error))
     snapshot = diagnostics.snapshot()
     manifest = json.loads(snapshot.manifest)
     events = [

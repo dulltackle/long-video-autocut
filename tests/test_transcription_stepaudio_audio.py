@@ -22,7 +22,6 @@ from video_auto_editor.transcription._normalized_audio import (
     NormalizedPcmAudio,
     confirmed_speech_intervals,
 )
-from video_auto_editor.transcription._reconciliation import TimeInterval
 from video_auto_editor.transcription._stepaudio_audio import (
     FFmpegNormalizedPcmPreparer,
 )
@@ -32,6 +31,7 @@ from video_auto_editor.transcription.interface import (
     TranscriptionFailure,
     TranscriptionRequest,
 )
+from video_auto_editor.transcription.reconciliation import TimeInterval
 from video_auto_editor.workspace import ManagedPathCapability, Workspace
 
 

@@ -3,15 +3,15 @@ from inspect import signature
 
 import pytest
 
-from video_auto_editor import cli, orchestration
-from video_auto_editor.application import LiveRunRequest
-from video_auto_editor.application._deterministic import (
+from tests.support.deterministic_composition import (
     compose_deterministic_live_application,
 )
+from video_auto_editor import cli
+from video_auto_editor.application import LiveRunRequest, run_interpretation
+from video_auto_editor.application.run_interpretation import interpret_run
+from video_auto_editor.clip_planning import ResultKind
 from video_auto_editor.diagnostics import InterruptionSignal
-from video_auto_editor.orchestration import interpret_run
 from video_auto_editor.runtime.errors import RunStage
-from video_auto_editor.runtime.result import ResultKind
 
 
 def _delivery_manifest(run_id, *, result_kind, short_video_count):
@@ -422,7 +422,7 @@ def test_dispatcher_does_not_expose_retired_business_decision_helpers():
         "interpret_artifacts",
         "interpret_output_dir",
         "load_artifacts",
-    }.isdisjoint(vars(orchestration))
+    }.isdisjoint(vars(run_interpretation))
 
 
 def test_interpret_run_reports_an_unsupported_delivery_manifest(tmp_path):
@@ -538,14 +538,14 @@ def test_interpret_run_reports_unreadable_diagnostics_as_incomplete(
     assert cli.main(
         ["live", str(source), "--workspace-dir", str(workspace)]
     ) == 2
-    original_open = orchestration.os.open
+    original_open = run_interpretation.os.open
 
     def fail_selected_open(path, flags, mode=0o777, *, dir_fd=None):
         if path == unreadable_name:
             raise PermissionError("sensitive filesystem detail")
         return original_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(orchestration.os, "open", fail_selected_open)
+    monkeypatch.setattr(run_interpretation.os, "open", fail_selected_open)
 
     interpretation = interpret_run(
         workspace,
@@ -570,14 +570,14 @@ def test_interpret_run_reports_an_unreadable_delivery_as_incomplete(
     outcome = compose_deterministic_live_application().execute(
         LiveRunRequest(source, workspace_dir=workspace)
     )
-    original_open = orchestration.os.open
+    original_open = run_interpretation.os.open
 
     def fail_delivery_open(path, flags, mode=0o777, *, dir_fd=None):
         if path == "manifest.json":
             raise PermissionError("sensitive filesystem detail")
         return original_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(orchestration.os, "open", fail_delivery_open)
+    monkeypatch.setattr(run_interpretation.os, "open", fail_delivery_open)
 
     interpretation = interpret_run(workspace, outcome.run_id)
 

@@ -3,16 +3,16 @@ import signal
 
 import pytest
 
+from tests.support.deterministic_composition import (
+    compose_deterministic_live_application,
+)
 from video_auto_editor.application import (
     LiveRunRequest,
     LiveRunState,
 )
-from video_auto_editor.application._deterministic import (
-    compose_deterministic_live_application,
-)
+from video_auto_editor.clip_planning import ResultKind
 from video_auto_editor.diagnostics import (
     InterruptionSignal,
-    ResultKind,
 )
 from video_auto_editor.runtime.errors import ErrorCode, ExitCode, RunStage
 from video_auto_editor.runtime.identity import (
@@ -21,12 +21,14 @@ from video_auto_editor.runtime.identity import (
 )
 from video_auto_editor.transcription import (
     CacheUse,
-    DeterministicTranscriptionScript,
     ExecutionFacts,
     SpeechPresence,
     TranscriptionChunk,
     TranscriptionFailure,
     TranscriptionResult,
+)
+from video_auto_editor.transcription.deterministic import (
+    DeterministicTranscriptionScript,
 )
 from video_auto_editor.workspace import Workspace
 

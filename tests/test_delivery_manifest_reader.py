@@ -1,13 +1,12 @@
 import json
 
-from video_auto_editor.delivery import (
+from video_auto_editor.clip_planning import ResultKind
+from video_auto_editor.delivery.verification import (
+    DeliveryManifestReader,
     DeliveryManifestReadReason,
     DeliveryManifestReadState,
-    DeliveryManifestReader,
 )
 from video_auto_editor.runtime.identity import RunId
-from video_auto_editor.runtime.result import ResultKind
-
 
 RUN_ID = RunId("run_11111111-1111-4111-8111-111111111111")
 

@@ -4,17 +4,17 @@ from pathlib import Path
 
 import pytest
 
-from video_auto_editor.diagnostics import (
-    ExternalDataCategory,
-    ProviderCapability,
-)
-from video_auto_editor.readiness import (
+from video_auto_editor.application.readiness import (
     CommandResult,
     ProviderBinding,
     ProviderPurpose,
     Readiness,
     ReadinessRequest,
     TLSObservation,
+)
+from video_auto_editor.diagnostics import (
+    ExternalDataCategory,
+    ProviderCapability,
 )
 from video_auto_editor.runtime.errors import ERROR_REGISTRY, ErrorCode
 from video_auto_editor.runtime.identity import RunId
@@ -197,11 +197,11 @@ def test_strict_readiness_returns_safe_environment_and_fixed_provider_plan(
     with workspace.acquire_run(RunId.new()) as run_workspace:
         first = Readiness.check(
             _request(run_workspace, adapters),
-            system_probe=system,
+            _system_probe=system,
         )
         second = Readiness.check(
             _request(run_workspace, adapters),
-            system_probe=system,
+            _system_probe=system,
         )
 
     assert first == second
@@ -370,7 +370,7 @@ def test_all_local_and_adapter_failures_are_collected_ordered_and_deduplicated(
         )
         report = Readiness.check(
             _request(run_workspace, adapters),
-            system_probe=system,
+            _system_probe=system,
         )
 
     registry_order = {code: index for index, code in enumerate(ERROR_REGISTRY)}
@@ -472,7 +472,7 @@ def test_media_versions_capabilities_and_exact_font_are_all_required(tmp_path):
     with workspace.acquire_run(RunId.new()) as run_workspace:
         report = Readiness.check(
             _request(run_workspace, adapters),
-            system_probe=_MediaMismatchSystemProbe(),
+            _system_probe=_MediaMismatchSystemProbe(),
         )
 
     reasons_by_code = {
@@ -536,7 +536,7 @@ def test_one_second_chinese_subtitle_burn_is_a_hard_local_smoke_test(tmp_path):
     with workspace.acquire_run(RunId.new()) as run_workspace:
         report = Readiness.check(
             _request(run_workspace, adapters),
-            system_probe=system,
+            _system_probe=system,
         )
 
     burn_command = next(command for command in system.commands if "-vf" in command)
@@ -578,7 +578,7 @@ def test_media_smoke_temp_directory_failure_is_aggregated_before_later_checks(
         )
         report = Readiness.check(
             _request(run_workspace, adapters),
-            system_probe=_SystemProbe(),
+            _system_probe=_SystemProbe(),
         )
         temporary_entries = run_workspace.temporary.inspect_tree()
 
@@ -636,7 +636,7 @@ def test_media_smoke_cleanup_failure_is_reported_without_erasing_capability(
         )
         report = Readiness.check(
             _request(run_workspace, adapters),
-            system_probe=_SystemProbe(),
+            _system_probe=_SystemProbe(),
         )
 
     assert report.ready is False
@@ -672,7 +672,7 @@ def test_tls_verification_and_nonempty_ca_store_are_both_required(tmp_path):
     with workspace.acquire_run(RunId.new()) as run_workspace:
         report = Readiness.check(
             _request(run_workspace, adapters),
-            system_probe=_NoTLSSystemProbe(),
+            _system_probe=_NoTLSSystemProbe(),
         )
 
     tls_issues = tuple(
@@ -724,7 +724,7 @@ def test_workspace_atomic_persistence_failure_is_safe_and_does_not_stop_adapters
         )
         report = Readiness.check(
             _request(run_workspace, adapters),
-            system_probe=_SystemProbe(),
+            _system_probe=_SystemProbe(),
         )
 
     assert report.ready is False
@@ -776,7 +776,7 @@ def test_python_certification_range_has_both_hard_boundaries(
     with workspace.acquire_run(RunId.new()) as run_workspace:
         report = Readiness.check(
             _request(run_workspace, adapters),
-            system_probe=_PythonVersionSystemProbe(version),
+            _system_probe=_PythonVersionSystemProbe(version),
         )
 
     assert tuple(issue.error_code for issue in report.issues) == (
@@ -828,7 +828,7 @@ def test_ffmpeg_and_ffprobe_must_both_be_in_the_certified_major_range(
     with workspace.acquire_run(RunId.new()) as run_workspace:
         report = Readiness.check(
             _request(run_workspace, adapters),
-            system_probe=_FFmpegVersionSystemProbe(version),
+            _system_probe=_FFmpegVersionSystemProbe(version),
         )
 
     assert tuple(issue.error_code for issue in report.issues) == (
@@ -876,7 +876,7 @@ def test_ffprobe_must_read_json_container_video_audio_and_duration(tmp_path):
     with workspace.acquire_run(RunId.new()) as run_workspace:
         report = Readiness.check(
             _request(run_workspace, adapters),
-            system_probe=_InvalidProbeJsonSystemProbe(),
+            _system_probe=_InvalidProbeJsonSystemProbe(),
         )
 
     assert tuple(issue.error_code for issue in report.issues) == (

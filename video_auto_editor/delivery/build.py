@@ -11,16 +11,21 @@ from video_auto_editor.clip_planning import (
     FinalCandidate,
     PublishedSelection,
     RejectedSelection,
+    ResultKind,
 )
 from video_auto_editor.runtime.cancellation import CancellationRequested
 from video_auto_editor.runtime.errors import ErrorCode
-from video_auto_editor.runtime.result import ResultKind
 from video_auto_editor.workspace import WorkspaceFailure
 
 from ._media import BuiltMedia, export_short_videos
 from ._model import DeliveryBuildFailure, DeliveryBuildRequest
 from .capability import UnverifiedDelivery
-
+from .schema import (
+    CLIP_PLAN_SCHEMA_VERSION,
+    DELIVERY_MANIFEST_SCHEMA_VERSION,
+    SHORT_VIDEO_CATALOG_SCHEMA_VERSION,
+    TRANSCRIPT_SCHEMA_VERSION,
+)
 
 _ARTIFACTS = (
     ("metadata.json", "short_video_catalog", "application/json"),
@@ -177,7 +182,7 @@ def _transcript_document(request: DeliveryBuildRequest) -> dict[str, Any]:
             ]
         chunks.append(item)
     return {
-        "schema_version": "transcript.v1",
+        "schema_version": TRANSCRIPT_SCHEMA_VERSION,
         "run_id": str(request.run_id),
         "transcript_id": str(request.transcript.transcript_id),
         "speech_presence": request.transcript.speech_presence.value,
@@ -188,7 +193,7 @@ def _transcript_document(request: DeliveryBuildRequest) -> dict[str, Any]:
 
 def _plan_document(request: DeliveryBuildRequest) -> dict[str, Any]:
     return {
-        "schema_version": "clip_plan.v1",
+        "schema_version": CLIP_PLAN_SCHEMA_VERSION,
         "run_id": str(request.run_id),
         "plan_id": str(request.plan.plan_id),
         "transcript_id": str(request.plan.transcript_id),
@@ -274,7 +279,7 @@ def _candidate_document(candidate: FinalCandidate) -> dict[str, Any]:
 
 def _metadata_document(request: DeliveryBuildRequest) -> dict[str, Any]:
     return {
-        "schema_version": "short_video_catalog.v1",
+        "schema_version": SHORT_VIDEO_CATALOG_SCHEMA_VERSION,
         "run_id": str(request.run_id),
         "result_kind": request.plan.result_kind.value,
         "short_videos": [
@@ -328,7 +333,7 @@ def _manifest_document(
         for artifact in sorted(artifacts, key=lambda item: item.path)
     ]
     return {
-        "schema_version": "delivery_manifest.v1",
+        "schema_version": DELIVERY_MANIFEST_SCHEMA_VERSION,
         "run_id": str(request.run_id),
         "terminal_state": "succeeded",
         "result_kind": request.plan.result_kind.value,

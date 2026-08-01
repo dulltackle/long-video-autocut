@@ -140,10 +140,13 @@ def _verification_evidence(
     return snapshot, authority.verification_tree
 
 
-def _pending_publication_evidence(
+def validate_publication_commit_proof(
     delivery: "PublishedDelivery",
-) -> tuple[RunId, ManagedDirectoryCapability]:
-    """供应用在提交效果前验证尚未激活的发布证明。"""
+    *,
+    expected_run_id: RunId,
+    expected_directory: ManagedDirectoryCapability,
+) -> None:
+    """验证发布提交回调的临时证明绑定到预期运行与最终目录。"""
     if not isinstance(delivery, PublishedDelivery):
         raise TypeError("发布提交回调只接受 PublishedDelivery")
     authority = _delivery_authority(
@@ -151,7 +154,10 @@ def _pending_publication_evidence(
         expected_state="publishing",
         message="PublishedDelivery 只能由 Publication 创建",
     )
-    return authority.run_id, authority.managed_directory
+    if authority.run_id != expected_run_id:
+        raise ValueError("发布提交证明必须属于当前运行")
+    if authority.managed_directory is not expected_directory:
+        raise ValueError("发布提交证明必须绑定当前最终交付目录")
 
 
 def _activate_publication(delivery: "PublishedDelivery") -> None:

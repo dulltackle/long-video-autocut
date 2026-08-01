@@ -16,6 +16,7 @@ from enum import Enum
 from time import monotonic
 from typing import Any
 
+from video_auto_editor.clip_planning import ResultKind
 from video_auto_editor.runtime.cancellation import CancellationToken
 from video_auto_editor.runtime.errors import (
     ErrorCategory,
@@ -33,7 +34,6 @@ from video_auto_editor.runtime.identity import (
     TranscriptChunkId,
     TranscriptId,
 )
-from video_auto_editor.runtime.result import ResultKind
 from video_auto_editor.workspace import (
     ManagedBinaryFile,
     ManagedDirectoryCapability,
@@ -43,6 +43,12 @@ from video_auto_editor.workspace import (
 )
 
 from .capability import UnverifiedDelivery, VerifiedDelivery
+from .schema import (
+    CLIP_PLAN_SCHEMA_VERSION,
+    DELIVERY_MANIFEST_SCHEMA_VERSION,
+    SHORT_VIDEO_CATALOG_SCHEMA_VERSION,
+    TRANSCRIPT_SCHEMA_VERSION,
+)
 
 _MANIFEST_FIELDS = frozenset(
     {
@@ -790,7 +796,7 @@ def _file_access_failure(
 
 
 def _validate_manifest_schema(manifest: dict[str, Any]) -> None:
-    if manifest["schema_version"] != "delivery_manifest.v1":
+    if manifest["schema_version"] != DELIVERY_MANIFEST_SCHEMA_VERSION:
         raise _SchemaInvalid
     _string(manifest["run_id"])
     if manifest["terminal_state"] != "succeeded":
@@ -1037,7 +1043,7 @@ def _validate_transcript_schema(transcript: dict[str, Any]) -> None:
             }
         ),
     )
-    if transcript["schema_version"] != "transcript.v1":
+    if transcript["schema_version"] != TRANSCRIPT_SCHEMA_VERSION:
         raise _SchemaInvalid
     _string(transcript["run_id"])
     _string(transcript["transcript_id"], nonempty=True)
@@ -1106,7 +1112,7 @@ def _validate_plan_schema(plan: dict[str, Any]) -> None:
             }
         ),
     )
-    if plan["schema_version"] != "clip_plan.v1":
+    if plan["schema_version"] != CLIP_PLAN_SCHEMA_VERSION:
         raise _SchemaInvalid
     _string(plan["run_id"])
     _string(plan["plan_id"], nonempty=True)
@@ -1272,7 +1278,7 @@ def _validate_metadata_schema(metadata: dict[str, Any]) -> None:
             }
         ),
     )
-    if metadata["schema_version"] != "short_video_catalog.v1":
+    if metadata["schema_version"] != SHORT_VIDEO_CATALOG_SCHEMA_VERSION:
         raise _SchemaInvalid
     _string(metadata["run_id"])
     if metadata["result_kind"] not in {"clips", "empty"}:

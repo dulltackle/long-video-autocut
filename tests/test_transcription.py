@@ -24,8 +24,6 @@ from video_auto_editor.source_analysis import SourceDescription
 from video_auto_editor.transcription import (
     CacheUse,
     CharacterSpan,
-    DeterministicSpeechRecognition,
-    DeterministicTranscriptionScript,
     ExecutionFacts,
     ReadinessIssue,
     ReadinessReport,
@@ -37,6 +35,10 @@ from video_auto_editor.transcription import (
     TranscriptionRemoteRequestEventKind,
     TranscriptionRequest,
     TranscriptionResult,
+)
+from video_auto_editor.transcription.deterministic import (
+    DeterministicSpeechRecognition,
+    DeterministicTranscriptionScript,
 )
 from video_auto_editor.workspace import (
     ManagedDirectoryCapability,
@@ -451,11 +453,6 @@ def test_deterministic_speech_recognition_replays_success_without_external_io(
     monkeypatch.setattr(
         CacheRepository,
         "in_memory",
-        classmethod(reject_external_access),
-    )
-    monkeypatch.setattr(
-        CacheRepository,
-        "initialize",
         classmethod(reject_external_access),
     )
 

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Protocol
 
-from video_auto_editor.configuration._model import ClipPolicy, CourseContext
+from video_auto_editor.configuration import ClipPolicy, CourseContext
 from video_auto_editor.runtime.identity import (
     CandidateId,
     PlanId,
@@ -12,7 +12,6 @@ from video_auto_editor.runtime.identity import (
     TranscriptChunkId,
     TranscriptId,
 )
-from video_auto_editor.runtime.result import ResultKind
 from video_auto_editor.source_analysis import SourceDescription
 
 from ._model import (
@@ -27,6 +26,7 @@ from ._model import (
     PublishedSelection,
     RejectedSelection,
     RejectionReason,
+    ResultKind,
     ReviewRecommendation,
     SameTopicSeries,
     ShortVideo,

@@ -4,6 +4,7 @@ from threading import Barrier, Lock, Thread
 
 import pytest
 
+from video_auto_editor.clip_planning import ResultKind
 from video_auto_editor.delivery.capability import (
     PublishedDelivery,
     UnverifiedDelivery,
@@ -11,6 +12,7 @@ from video_auto_editor.delivery.capability import (
 )
 from video_auto_editor.diagnostics import (
     CertifiedPlatform,
+    DiagnosticCompletion,
     ExternalDataCategory,
     ExternalRequestOutcome,
     Facts,
@@ -20,11 +22,11 @@ from video_auto_editor.diagnostics import (
     PreflightOutcome,
     ProviderCapability,
     ProviderTransport,
-    ResultKind,
-    RunDiagnostics,
-    RunOutcome,
     StageOutcome,
     ZeroRequestReason,
+)
+from video_auto_editor.diagnostics.collecting import (
+    initialize as initialize_collecting_diagnostics,
 )
 from video_auto_editor.runtime.errors import (
     DetectedVersion,
@@ -89,7 +91,7 @@ def test_success_requires_same_run_published_delivery_and_projects_commit(
     run_id = RunId.new()
 
     with workspace.acquire_run(run_id) as run_workspace:
-        diagnostics = RunDiagnostics.in_memory(
+        diagnostics = initialize_collecting_diagnostics(
             run_id,
             application_version="4.7.0",
             wall_clock=_fixed_wall_clock,
@@ -103,7 +105,7 @@ def test_success_requires_same_run_published_delivery_and_projects_commit(
         published = _published_delivery(run_workspace)
 
         finalization = diagnostics.finish(
-            RunOutcome.succeeded(
+            DiagnosticCompletion.succeeded(
                 published,
                 result_kind=result_kind,
             )
@@ -146,7 +148,7 @@ def test_success_rejects_a_published_delivery_from_another_run(tmp_path):
     source = tmp_path / "course.mp4"
     source.write_bytes(b"source")
     workspace = Workspace.open(source, tmp_path / "workspace")
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -158,7 +160,7 @@ def test_success_rejects_a_published_delivery_from_another_run(tmp_path):
 
         with pytest.raises(ValueError, match="同一次直播拆条运行"):
             diagnostics.finish(
-                RunOutcome.succeeded(
+                DiagnosticCompletion.succeeded(
                     published,
                     result_kind=ResultKind.EMPTY,
                 )
@@ -167,7 +169,7 @@ def test_success_rejects_a_published_delivery_from_another_run(tmp_path):
 
 def test_interrupted_run_has_no_primary_error_and_records_signal_cleanup():
     run_id = RunId.new()
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         run_id,
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -179,7 +181,7 @@ def test_interrupted_run_has_no_primary_error_and_records_signal_cleanup():
     scope.record(Facts.interruption(InterruptionSignal.SIGTERM))
     stage.complete(StageOutcome.INTERRUPTED, work_item_count=2)
     diagnostics.finish(
-        RunOutcome.interrupted(
+        DiagnosticCompletion.interrupted(
             InterruptionSignal.SIGTERM,
             cleanup_duration_ms=375,
         )
@@ -214,7 +216,7 @@ def test_interrupted_run_has_no_primary_error_and_records_signal_cleanup():
 
 
 def test_interruption_cleanup_failure_is_associated_without_becoming_primary():
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -235,7 +237,7 @@ def test_interruption_cleanup_failure_is_associated_without_becoming_primary():
     )
     stage.complete(StageOutcome.INTERRUPTED, work_item_count=0)
     diagnostics.finish(
-        RunOutcome.interrupted(
+        DiagnosticCompletion.interrupted(
             InterruptionSignal.SIGINT,
             cleanup_duration_ms=20,
             associated_errors=(cleanup_error,),
@@ -256,7 +258,7 @@ def test_source_and_environment_facts_use_safe_closed_projections():
     source_sha256 = "sha256:" + "a" * 64
     context_sha256 = "sha256:" + "b" * 64
     installation_sha256 = "sha256:" + "c" * 64
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -303,7 +305,7 @@ def test_source_and_environment_facts_use_safe_closed_projections():
 
 
 def test_external_service_discloses_zero_requests_and_aggregates_requests():
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -382,7 +384,7 @@ def test_external_service_discloses_zero_requests_and_aggregates_requests():
     terminal_scope.record(Facts.interruption(InterruptionSignal.SIGINT))
     terminal_stage.complete(StageOutcome.INTERRUPTED, work_item_count=0)
     diagnostics.finish(
-        RunOutcome.interrupted(
+        DiagnosticCompletion.interrupted(
             InterruptionSignal.SIGINT,
             cleanup_duration_ms=10,
         )
@@ -440,7 +442,7 @@ def test_external_service_rejects_more_than_an_https_origin(endpoint):
 
 
 def test_external_service_preserves_a_canonical_ipv6_origin():
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -475,7 +477,7 @@ def test_external_service_preserves_a_canonical_ipv6_origin():
 
 
 def test_concurrent_operations_receive_a_single_strict_sequence():
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -530,7 +532,7 @@ def test_concurrent_operations_receive_a_single_strict_sequence():
 
 
 def test_a_forged_scope_cannot_emit_into_an_active_stage():
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -551,7 +553,7 @@ def test_a_forged_scope_cannot_emit_into_an_active_stage():
 
 
 def test_a_cloned_or_mutated_fact_cannot_bypass_the_factory_authority():
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,
@@ -579,7 +581,7 @@ def test_a_cloned_or_mutated_fact_cannot_bypass_the_factory_authority():
 
 
 def test_completed_stage_cannot_be_entered_twice():
-    diagnostics = RunDiagnostics.in_memory(
+    diagnostics = initialize_collecting_diagnostics(
         RunId.new(),
         application_version="4.7.0",
         wall_clock=_fixed_wall_clock,

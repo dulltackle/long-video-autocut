@@ -11,26 +11,26 @@ from time import monotonic
 from types import MappingProxyType
 from typing import NoReturn, Protocol, runtime_checkable
 
+from video_auto_editor.clip_planning import ResultKind
 from video_auto_editor.configuration import LoadedConfiguration
 from video_auto_editor.delivery.capability import (
     PublishedDelivery,
     UnverifiedDelivery,
     VerifiedDelivery,
-    _pending_publication_evidence,
+    validate_publication_commit_proof,
 )
 from video_auto_editor.diagnostics import (
     DeliveryBuildState,
     DeliveryVerificationState,
+    DiagnosticCompletion,
     DiagnosticsFailure,
     Facts,
     InterruptionSignal,
     PublicationState,
-    ResultKind,
     RunDiagnostics,
-    RunOutcome,
+    StageDiagnostics,
     StageOutcome,
 )
-from video_auto_editor.diagnostics._session import StageDiagnostics
 from video_auto_editor.runtime.cancellation import (
     CancellationRequested,
     CancellationSource,
@@ -120,10 +120,10 @@ class LiveRunOutcome:
         raise TypeError("LiveRunOutcome 只能由 LiveApplication 创建")
 
     @classmethod
-    def _from_run_outcome(
+    def _from_diagnostic_completion(
         cls,
         run_id: RunId,
-        outcome: RunOutcome,
+        outcome: DiagnosticCompletion,
         *,
         diagnostics_incomplete: bool,
         recovery_incomplete: bool = False,
@@ -354,11 +354,11 @@ class _CommitState:
     def validate(self, delivery: PublishedDelivery) -> None:
         if not isinstance(delivery, PublishedDelivery):
             raise TypeError("发布提交必须包含 PublishedDelivery")
-        run_id, managed_directory = _pending_publication_evidence(delivery)
-        if run_id != self.run_id:
-            raise ValueError("发布提交证明必须属于当前运行")
-        if managed_directory is not self.published_directory:
-            raise ValueError("发布提交证明必须绑定当前最终交付目录")
+        validate_publication_commit_proof(
+            delivery,
+            expected_run_id=self.run_id,
+            expected_directory=self.published_directory,
+        )
         if self.result_kind is None:
             raise RuntimeError("发布提交前必须准备结果种类")
         if self.published_delivery is not None:
@@ -368,12 +368,12 @@ class _CommitState:
     def committed(self) -> bool:
         return self.published_delivery is not None
 
-    def outcome(self) -> RunOutcome:
+    def outcome(self) -> DiagnosticCompletion:
         delivery = self.published_delivery
         result_kind = self.result_kind
         if delivery is None or result_kind is None:
             raise RuntimeError("直播拆条运行尚未越过发布提交点")
-        return RunOutcome.succeeded(
+        return DiagnosticCompletion.succeeded(
             delivery,
             result_kind=result_kind,
         )
@@ -535,7 +535,7 @@ class _StageTerminated(Exception):
 
     def __init__(
         self,
-        outcome: RunOutcome,
+        outcome: DiagnosticCompletion,
         *,
         diagnostics_incomplete: bool = False,
     ) -> None:
@@ -851,7 +851,7 @@ class LiveApplication:
                 StageOutcome.INTERRUPTED,
                 work_item_count=0,
             )
-            run_outcome = RunOutcome.interrupted(
+            diagnostic_completion = DiagnosticCompletion.interrupted(
                 interruption_signal,
                 cleanup_duration_ms=cleanup_duration_ms,
                 associated_errors=associated_errors,
@@ -865,22 +865,22 @@ class LiveApplication:
                 self._record_cleanup_failure(stage, cleanup_failure)
             )
             stage.complete(StageOutcome.FAILED, work_item_count=0)
-            run_outcome = RunOutcome.failed(
+            diagnostic_completion = DiagnosticCompletion.failed(
                 primary_error,
                 associated_errors=associated_errors,
                 recovery_incomplete=recovery_incomplete,
             )
         try:
-            finalization = diagnostics.finish(run_outcome)
+            finalization = diagnostics.finish(diagnostic_completion)
         except Exception:
-            return LiveRunOutcome._from_run_outcome(
+            return LiveRunOutcome._from_diagnostic_completion(
                 run_id,
-                run_outcome,
+                diagnostic_completion,
                 diagnostics_incomplete=True,
             )
-        return LiveRunOutcome._from_run_outcome(
+        return LiveRunOutcome._from_diagnostic_completion(
             run_id,
-            run_outcome,
+            diagnostic_completion,
             diagnostics_incomplete=finalization.diagnostics_incomplete,
         )
 
@@ -1054,41 +1054,41 @@ class LiveApplication:
                 ),
             )
             cursor.complete()
-            run_outcome = commit_state.outcome()
+            diagnostic_completion = commit_state.outcome()
             try:
                 self._cleanup_run(run_workspace)
             except Exception:
                 # 发布提交证明优先；清理失败不能撤销完整可见的交付。
                 postcommit_cleanup_incomplete = True
         except _StageTerminated as terminal:
-            run_outcome = terminal.outcome
+            diagnostic_completion = terminal.outcome
             terminal_diagnostics_incomplete = (
                 terminal.diagnostics_incomplete
             )
         if postcommit_cleanup_incomplete:
-            return LiveRunOutcome._from_run_outcome(
+            return LiveRunOutcome._from_diagnostic_completion(
                 run_id,
-                run_outcome,
+                diagnostic_completion,
                 diagnostics_incomplete=True,
                 recovery_incomplete=True,
             )
         if terminal_diagnostics_incomplete:
-            return LiveRunOutcome._from_run_outcome(
+            return LiveRunOutcome._from_diagnostic_completion(
                 run_id,
-                run_outcome,
+                diagnostic_completion,
                 diagnostics_incomplete=True,
             )
         try:
-            finalization = diagnostics.finish(run_outcome)
+            finalization = diagnostics.finish(diagnostic_completion)
         except Exception:
-            return LiveRunOutcome._from_run_outcome(
+            return LiveRunOutcome._from_diagnostic_completion(
                 run_id,
-                run_outcome,
+                diagnostic_completion,
                 diagnostics_incomplete=True,
             )
-        return LiveRunOutcome._from_run_outcome(
+        return LiveRunOutcome._from_diagnostic_completion(
             run_id,
-            run_outcome,
+            diagnostic_completion,
             diagnostics_incomplete=finalization.diagnostics_incomplete,
         )
 
@@ -1105,7 +1105,7 @@ class LiveApplication:
                 self._cleanup_run(run_workspace)
             except Exception:
                 recovery_incomplete = True
-            return LiveRunOutcome._from_run_outcome(
+            return LiveRunOutcome._from_diagnostic_completion(
                 run_id,
                 commit_state.outcome(),
                 diagnostics_incomplete=True,
@@ -1320,7 +1320,7 @@ class LiveApplication:
                 getattr(recordable_failure, "error_code", None)
                 is ErrorCode.PUBLICATION_ROLLBACK_FAILED
             )
-            run_outcome = RunOutcome.failed(
+            diagnostic_completion = DiagnosticCompletion.failed(
                 primary_error,
                 associated_errors=associated_errors,
                 recovery_incomplete=recovery_incomplete,
@@ -1332,7 +1332,7 @@ class LiveApplication:
             ):
                 cursor.terminate()
                 raise _StageTerminated(
-                    run_outcome,
+                    diagnostic_completion,
                     diagnostics_incomplete=True,
                 ) from None
             stage_diagnostics.complete(
@@ -1340,7 +1340,7 @@ class LiveApplication:
                 work_item_count=0,
             )
             cursor.terminate()
-            raise _StageTerminated(run_outcome) from None
+            raise _StageTerminated(diagnostic_completion) from None
 
     def _terminate_interrupted_stage(
         self,
@@ -1351,7 +1351,7 @@ class LiveApplication:
         signal_number: int | None,
         terminal_diagnostics: _TerminalDiagnosticsFinalizer | None,
     ) -> NoReturn:
-        run_outcome = self._complete_interrupted_stage(
+        diagnostic_completion = self._complete_interrupted_stage(
             stage_diagnostics,
             run_workspace,
             stage,
@@ -1364,7 +1364,7 @@ class LiveApplication:
         ):
             cursor.terminate()
             raise _StageTerminated(
-                run_outcome,
+                diagnostic_completion,
                 diagnostics_incomplete=True,
             ) from None
         stage_diagnostics.complete(
@@ -1372,7 +1372,7 @@ class LiveApplication:
             work_item_count=0,
         )
         cursor.terminate()
-        raise _StageTerminated(run_outcome) from None
+        raise _StageTerminated(diagnostic_completion) from None
 
     def _complete_interrupted_stage(
         self,
@@ -1380,7 +1380,7 @@ class LiveApplication:
         run_workspace: RunWorkspace,
         stage: RunStage,
         signal_number: int | None,
-    ) -> RunOutcome:
+    ) -> DiagnosticCompletion:
         interruption_signal = self._record_interruption(
             stage_diagnostics,
             stage,
@@ -1399,7 +1399,7 @@ class LiveApplication:
             0,
             int((cleanup_completed - cleanup_started) * 1000),
         )
-        return RunOutcome.interrupted(
+        return DiagnosticCompletion.interrupted(
             interruption_signal,
             cleanup_duration_ms=cleanup_duration_ms,
             associated_errors=associated_errors,

@@ -9,23 +9,29 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import MappingProxyType
 
+from video_auto_editor.application.live import (
+    LiveApplication,
+    LiveRunRequest,
+    _DeliveryBuildWork,
+    _RunAssembly,
+    _StageWork,
+)
+from video_auto_editor.cache import CacheNamespace, CacheOutcome
+from video_auto_editor.clip_planning import ResultKind
 from video_auto_editor.configuration import Configuration, LoadedConfiguration
-from video_auto_editor.delivery import Publication
 from video_auto_editor.delivery.capability import (
     PublishedDelivery,
     UnverifiedDelivery,
     VerifiedDelivery,
 )
+from video_auto_editor.delivery.publication import Publication
 from video_auto_editor.diagnostics import (
     ArtifactRole,
-    CacheNamespace,
-    CacheOutcome,
     DiagnosticsFailure,
     Facts,
     InterruptionSignal,
     OperationKind,
     OperationOutcome,
-    ResultKind,
     RunDiagnostics,
     StageOutcome,
 )
@@ -33,7 +39,10 @@ from video_auto_editor.diagnostics._session import (
     DiagnosticScope,
     StageDiagnostics,
 )
-from video_auto_editor.diagnostics._store import _MemoryDiagnosticStore
+from video_auto_editor.diagnostics.collecting import _CollectingDiagnosticStore
+from video_auto_editor.diagnostics.persistent import (
+    initialize as initialize_persistent_diagnostics,
+)
 from video_auto_editor.runtime.cancellation import (
     CancellationRequested,
     CancellationSource,
@@ -53,8 +62,6 @@ from video_auto_editor.source_analysis import SourceDescription
 from video_auto_editor.transcription import (
     CacheUse,
     CompleteTranscript,
-    DeterministicSpeechRecognition,
-    DeterministicTranscriptionScript,
     ExecutionFacts,
     SpeechPresence,
     SpeechRecognition,
@@ -63,20 +70,16 @@ from video_auto_editor.transcription import (
     TranscriptionRequest,
     TranscriptionResult,
 )
+from video_auto_editor.transcription.deterministic import (
+    DeterministicSpeechRecognition,
+    DeterministicTranscriptionScript,
+)
 from video_auto_editor.workspace import (
     DiagnosticRunWorkspace,
     RunWorkspace,
     SourceFileCapability,
     Workspace,
     WorkspaceFailure,
-)
-
-from .live import (
-    LiveApplication,
-    LiveRunRequest,
-    _DeliveryBuildWork,
-    _RunAssembly,
-    _StageWork,
 )
 
 
@@ -993,7 +996,7 @@ class _FailingDiagnosticStore:
     def __init__(self, run_id, failure: str) -> None:
         self.run_id = run_id
         self._failure = failure
-        self._memory = _MemoryDiagnosticStore(run_id)
+        self._memory = _CollectingDiagnosticStore(run_id)
 
     def append(self, payload: bytes) -> None:
         event = json.loads(payload)
@@ -1037,7 +1040,7 @@ class _DeterministicDiagnosticsInitializer:
         monotonic_clock,
     ) -> RunDiagnostics:
         if self._failure is None:
-            return RunDiagnostics.initialize(
+            return initialize_persistent_diagnostics(
                 run_workspace.diagnostics,
                 application_version=application_version,
                 wall_clock=wall_clock,

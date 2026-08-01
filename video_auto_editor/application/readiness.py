@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Protocol
+from typing import cast
 from urllib.parse import urlsplit
 
 from video_auto_editor.diagnostics import (
@@ -43,7 +43,7 @@ from video_auto_editor.transcription import (
 )
 from video_auto_editor.workspace import WorkspaceFailure
 
-from ._model import (
+from ._readiness_model import (
     CommandResult,
     EnvironmentProjection,
     ProviderBinding,
@@ -74,36 +74,6 @@ _MEDIA_PROBE_SRT = """1
 00:00:00,000 --> 00:00:00,900
 中文预检
 """
-
-
-class SystemProbe(Protocol):
-    """Readiness 内部唯一可替换的本机系统效果 seam。"""
-
-    def platform_name(self) -> str: ...
-
-    def architecture(self) -> str: ...
-
-    def os_release(self) -> Mapping[str, str]: ...
-
-    def python_implementation(self) -> str: ...
-
-    def python_version(self) -> tuple[int, int, int]: ...
-
-    def is_virtual_environment(self) -> bool: ...
-
-    def which(self, command: str) -> str | None: ...
-
-    def run(
-        self,
-        command: tuple[str, ...],
-        *,
-        cwd: Path | None = None,
-        timeout_seconds: int,
-    ) -> CommandResult: ...
-
-    def font_file_is_readable(self, path: str) -> bool: ...
-
-    def tls_observation(self) -> TLSObservation: ...
 
 
 class _LocalSystemProbe:
@@ -208,13 +178,18 @@ class Readiness:
     def check(
         request: ReadinessRequest,
         *,
-        system_probe: SystemProbe | None = None,
+        _system_probe: object | None = None,
     ) -> ReadinessReport:
         """一次收集本地阻塞项；绝不调用 Adapter 的业务方法。"""
         if not isinstance(request, ReadinessRequest):
             raise TypeError("Readiness.check() 只接受 ReadinessRequest")
-        probe: SystemProbe = system_probe or _LocalSystemProbe()
-        _validate_system_probe(probe)
+        candidate = (
+            _LocalSystemProbe()
+            if _system_probe is None
+            else _system_probe
+        )
+        _validate_system_probe(candidate)
+        probe = cast(_LocalSystemProbe, candidate)
         issues: list[ReadinessIssue] = []
 
         certified_platform, platform_observation = _check_platform(probe, issues)
@@ -282,7 +257,7 @@ def _validate_system_probe(probe: object) -> None:
 
 
 def _check_platform(
-    probe: SystemProbe,
+    probe: _LocalSystemProbe,
     issues: list[ReadinessIssue],
 ) -> tuple[CertifiedPlatform | None, tuple[object, ...]]:
     try:
@@ -347,7 +322,7 @@ def _check_platform(
 
 
 def _check_python(
-    probe: SystemProbe,
+    probe: _LocalSystemProbe,
     issues: list[ReadinessIssue],
 ) -> tuple[DetectedVersion | None, tuple[object, ...]]:
     try:
@@ -431,7 +406,7 @@ def _check_python(
 
 
 def _check_media_and_font(
-    probe: SystemProbe,
+    probe: _LocalSystemProbe,
     font_family: str,
     issues: list[ReadinessIssue],
 ) -> tuple[
@@ -579,7 +554,7 @@ def _check_media_and_font(
     )
 
 
-def _locate(probe: SystemProbe, command: str) -> str | None:
+def _locate(probe: _LocalSystemProbe, command: str) -> str | None:
     try:
         path = probe.which(command)
     except Exception:  # noqa: BLE001
@@ -588,7 +563,7 @@ def _locate(probe: SystemProbe, command: str) -> str | None:
 
 
 def _inspect_tool_version(
-    probe: SystemProbe,
+    probe: _LocalSystemProbe,
     command: str,
     executable: str | None,
     error_code: ErrorCode,
@@ -645,7 +620,7 @@ def _inspect_tool_version(
 
 
 def _ffmpeg_capability(
-    probe: SystemProbe,
+    probe: _LocalSystemProbe,
     executable: str | None,
     arguments: tuple[str, ...],
     pattern: str,
@@ -655,7 +630,7 @@ def _ffmpeg_capability(
 
 
 def _command_stdout(
-    probe: SystemProbe,
+    probe: _LocalSystemProbe,
     executable: str | None,
     arguments: tuple[str, ...],
 ) -> str | None:
@@ -666,7 +641,7 @@ def _command_stdout(
 
 
 def _check_font(
-    probe: SystemProbe,
+    probe: _LocalSystemProbe,
     font_family: str,
     fc_list_path: str | None,
     fc_match_path: str | None,
@@ -737,7 +712,7 @@ def _check_font(
 
 
 def _media_smoke_test(
-    probe: SystemProbe,
+    probe: _LocalSystemProbe,
     font_family: str,
     issues: list[ReadinessIssue],
 ) -> bool:
@@ -890,7 +865,7 @@ def _valid_smoke_probe(stdout: str) -> bool:
 
 
 def _check_tls(
-    probe: SystemProbe,
+    probe: _LocalSystemProbe,
     issues: list[ReadinessIssue],
 ) -> tuple[object, ...]:
     try:
@@ -1156,7 +1131,7 @@ def _environment_projection(
 
 
 def _safe_run(
-    probe: SystemProbe,
+    probe: _LocalSystemProbe,
     command: tuple[str, ...],
     *,
     cwd: Path | None = None,
@@ -1229,4 +1204,4 @@ def _https_origin(endpoint: str) -> str | None:
     return f"https://{host}{normalized_port}"
 
 
-__all__ = ["Readiness", "SystemProbe"]
+__all__ = ["Readiness"]

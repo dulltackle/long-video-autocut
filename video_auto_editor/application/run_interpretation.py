@@ -14,11 +14,15 @@ import stat
 from pathlib import Path
 from typing import Any
 
-from video_auto_editor.delivery import (
+from video_auto_editor.clip_planning import ResultKind
+from video_auto_editor.delivery.schema import (
+    DELIVERY_MANIFEST_SCHEMA_VERSION,
+)
+from video_auto_editor.delivery.verification import (
+    DeliveryManifestReader,
     DeliveryManifestReadReason,
     DeliveryManifestReadResult,
     DeliveryManifestReadState,
-    DeliveryManifestReader,
     DeliveryManifestSummary,
 )
 from video_auto_editor.diagnostics import (
@@ -26,8 +30,6 @@ from video_auto_editor.diagnostics import (
     DiagnosticPackageSnapshot,
 )
 from video_auto_editor.runtime.identity import RunId
-from video_auto_editor.runtime.result import ResultKind
-
 
 RunInterpretation = dict[str, Any]
 
@@ -427,7 +429,7 @@ def _project_delivery_summary(
 ) -> dict[str, Any]:
     return {
         "manifest_path": "delivery/manifest.json",
-        "schema_version": "delivery_manifest.v1",
+        "schema_version": DELIVERY_MANIFEST_SCHEMA_VERSION,
         "run_id": str(summary.run_id),
         "result_kind": summary.result_kind.value,
         "application_version": summary.application_version,
