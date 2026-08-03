@@ -47,6 +47,14 @@ _COMMIT_BOUND_PATHS = (
     "tests",
     "video_auto_editor",
 )
+_RELEASE_TOOLS = (
+    "install-production.sh",
+    "run_keyless_gate_network.sh",
+    "run_release_gate.py",
+    "systemd_credential_bridge.py",
+    "validate_installed_delivery.py",
+    "validate_release_evidence.py",
+)
 
 
 class GateConfigurationError(RuntimeError):
@@ -225,6 +233,23 @@ def _credential_free_environment() -> dict[str, str]:
     ):
         environment.pop(variable, None)
     return environment
+
+
+def _release_tool_digests(harness_root: Path) -> dict[str, str]:
+    scripts = harness_root / "scripts"
+    digests: dict[str, str] = {}
+    for name in _RELEASE_TOOLS:
+        path = scripts / name
+        try:
+            if not path.is_file() or path.is_symlink():
+                raise OSError(name)
+            with path.open("rb") as stream:
+                digests[name] = hashlib.file_digest(stream, "sha256").hexdigest()
+        except OSError:
+            raise GateConfigurationError(
+                f"发布工具缺失或身份不可信：{name}"
+            ) from None
+    return digests
 
 
 def _validate_commit(source_root: Path, expected: str) -> str:
@@ -629,10 +654,12 @@ def run_gate(
                 "python_guard",
             ),
         },
+        "release_tools": {},
         "success": False,
     }
     try:
         _validate_commit(source_root, commit_sha)
+        evidence["release_tools"] = _release_tool_digests(harness_root)
         digest = validate_wheel_source(wheel_path, source_root=source_root)
         evidence["candidate"]["wheel_sha256"] = digest
         manifest = load_gate_manifest(

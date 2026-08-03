@@ -55,6 +55,9 @@
       "tests/test_keyless_gate.py",
       "tests/test_package_structure.py",
       "tests/test_production_installation.py",
+      "tests/test_release_credential_bridge.py",
+      "tests/test_release_evidence.py",
+      "tests/test_release_gate.py",
       "tests/test_release_surface.py"
     ]
   }

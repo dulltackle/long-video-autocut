@@ -238,6 +238,65 @@ def test_release_metadata_locks_the_certified_python_and_runtime_inputs():
     )
 
 
+def test_build_and_gate_dependencies_are_fully_pinned_to_hashed_wheels():
+    expected = {
+        "build": (
+            "1.3.0",
+            "7145f0b5061ba90a1500d60bd1b13ca0a8a4cebdd0cc16ed8adf1c0e739f43b4",
+        ),
+        "iniconfig": (
+            "2.3.0",
+            "f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12",
+        ),
+        "packaging": (
+            "26.2",
+            "5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e",
+        ),
+        "pluggy": (
+            "1.6.0",
+            "e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746",
+        ),
+        "pygments": (
+            "2.20.0",
+            "81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176",
+        ),
+        "pyproject-hooks": (
+            "1.2.0",
+            "9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913",
+        ),
+        "pytest": (
+            "9.0.3",
+            "2c5efc453d45394fdd706ade797c0a81091eccd1d6e4bccfcd476e2b8e0ab5d9",
+        ),
+        "setuptools": (
+            "80.9.0",
+            "062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922",
+        ),
+        "wheel": (
+            "0.45.1",
+            "708e7481cc80179af0e556bbf0cc00b8444c7321e2700b8d8580231d13017248",
+        ),
+    }
+    build_lock = PROJECT_ROOT / "requirements-build.lock"
+
+    locked = {}
+    for line in build_lock.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        matched = re.fullmatch(
+            r"([a-z0-9-]+)==([0-9]+(?:\.[0-9]+)*) "
+            r"--hash=sha256:([0-9a-f]{64})",
+            stripped,
+        )
+        assert matched is not None
+        name, version, digest = matched.groups()
+        assert name not in locked
+        locked[name] = (version, digest)
+
+    assert locked == expected
+
+
 @pytest.mark.parametrize(
     "retired_path",
     [

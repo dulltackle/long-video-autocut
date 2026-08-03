@@ -21,22 +21,124 @@ jobs:
 
     steps:
       - name: 检出候选提交
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: 安装认证 Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12.3"
 
-      - name: 安装固定版本门禁工具
+      - name: 从哈希锁安装构建与门禁工具
         run: >-
           python -m pip install
-          "build==1.3.0"
-          "pytest==9.0.3"
-          "setuptools==80.9.0"
-          "wheel==0.45.1"
+          --disable-pip-version-check
+          --require-hashes
+          --only-binary=:all:
+          -r requirements-build.lock
+
+      - name: 从固定 snapshot 准备完整门禁媒体能力
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly APT_SNAPSHOT_ID="20260725T000000Z"
+          readonly APT_STATE="${RUNNER_TEMP}/snapshot-apt"
+          packages=(ffmpeg fontconfig fonts-noto-cjk)
+          sudo install -d -m 0755 \
+            "$APT_STATE" \
+            "$APT_STATE/parts" \
+            "$APT_STATE/lists/partial" \
+            "$APT_STATE/archives/partial"
+          sudo tee "$APT_STATE/ubuntu.sources" >/dev/null <<EOF
+          Types: deb
+          URIs: https://archive.ubuntu.com/ubuntu
+          Suites: noble noble-updates
+          Components: main universe
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          Snapshot: $APT_SNAPSHOT_ID
+
+          Types: deb
+          URIs: https://security.ubuntu.com/ubuntu
+          Suites: noble-security
+          Components: main universe
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          Snapshot: $APT_SNAPSHOT_ID
+          EOF
+          sudo tee "$APT_STATE/snapshot.preferences" >/dev/null <<'EOF'
+          Package: *
+          Pin: release o=Ubuntu,n=noble
+          Pin-Priority: 1001
+
+          Package: *
+          Pin: release o=Ubuntu,n=noble-updates
+          Pin-Priority: 1001
+
+          Package: *
+          Pin: release o=Ubuntu,n=noble-security
+          Pin-Priority: 1001
+          EOF
+          sudo chmod 0644 \
+            "$APT_STATE/ubuntu.sources" \
+            "$APT_STATE/snapshot.preferences"
+          APT_OPTIONS=(
+            -o "Dir::Etc::main=/dev/null"
+            -o "Dir::Etc::parts=$APT_STATE/parts"
+            -o "Dir::Etc::sourcelist=$APT_STATE/ubuntu.sources"
+            -o "Dir::Etc::sourceparts=$APT_STATE/parts"
+            -o "Dir::Etc::preferences=$APT_STATE/snapshot.preferences"
+            -o "Dir::Etc::preferencesparts=$APT_STATE/parts"
+            -o "Dir::State::lists=$APT_STATE/lists"
+            -o "Dir::Cache::archives=$APT_STATE/archives"
+            -o "Dir::Cache::pkgcache=$APT_STATE/pkgcache.bin"
+            -o "Dir::Cache::srcpkgcache=$APT_STATE/srcpkgcache.bin"
+            -o "APT::Get::List-Cleanup=0"
+            -o "APT::Get::Always-Include-Phased-Updates=true"
+            -o "Acquire::Languages=none"
+          )
+          sudo apt-get "${APT_OPTIONS[@]}" \
+            --snapshot "$APT_SNAPSHOT_ID" --error-on=any update
+          package_specs=()
+          for package in "${packages[@]}"; do
+            candidate_version=$(LC_ALL=C sudo apt-cache \
+              "${APT_OPTIONS[@]}" policy "$package" \
+              | awk '$1 == "Candidate:" { print $2 }')
+            if [[ -z "$candidate_version" || "$candidate_version" == "(none)" ]]; then
+              echo "snapshot 缺少媒体包候选版本：$package" >&2
+              exit 1
+            fi
+            if ! LC_ALL=C sudo apt-cache \
+              "${APT_OPTIONS[@]}" madison "$package" \
+              | awk -F '|' -v expected="$candidate_version" '
+                  {
+                    version = $2
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", version)
+                    if (version == expected) found = 1
+                  }
+                  END { exit(found ? 0 : 1) }
+                '
+            then
+              echo "snapshot 索引缺少媒体包版本：$package=$candidate_version" >&2
+              exit 1
+            fi
+            package_specs+=("$package=$candidate_version")
+          done
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get \
+            "${APT_OPTIONS[@]}" \
+            --snapshot "$APT_SNAPSHOT_ID" \
+            --assume-yes --no-remove --allow-downgrades \
+            install --no-install-recommends "${package_specs[@]}"
+          for specification in "${package_specs[@]}"; do
+            package=${specification%%=*}
+            expected_version=${specification#*=}
+            actual_version=$(dpkg-query -W -f='${Version}' "$package")
+            [[ "$actual_version" == "$expected_version" ]]
+          done
+          ffmpeg -version >/dev/null
+          ffprobe -version >/dev/null
+          matched_family=$(fc-match -f '%{family[0]}\n' "Noto Sans CJK SC" \
+            | head -n 1)
+          [[ "$matched_family" == "Noto Sans CJK SC" ]]
 
       - name: 固化本次候选声明的门禁裁判
         shell: bash
@@ -49,9 +151,12 @@ jobs:
             scripts/keyless_gate_pytest.py
             scripts/run_installed_acceptance.py
             scripts/run_keyless_gate.py
+            scripts/run_release_gate.py
             scripts/sitecustomize.py
+            scripts/systemd_credential_bridge.py
             scripts/validate_installed_delivery.py
             scripts/validate_architecture.py
+            scripts/validate_release_evidence.py
           )
           readonly_executables=(
             scripts/install-production.sh
@@ -60,6 +165,7 @@ jobs:
           for source in \
             "${readonly_scripts[@]}" \
             "${readonly_executables[@]}" \
+            requirements-build.lock \
             requirements-runtime.lock; do
             if [[ ! -f "$source" || -L "$source" ]]; then
               echo "门禁裁判必须由普通文件组成：$source" >&2
@@ -73,6 +179,9 @@ jobs:
             "${readonly_scripts[@]}" "$trusted_root/scripts/"
           sudo install -o root -g root -m 0555 \
             "${readonly_executables[@]}" "$trusted_root/scripts/"
+          sudo install -o root -g root -m 0444 \
+            requirements-build.lock \
+            "$trusted_root/candidate/requirements-build.lock"
           sudo install -o root -g root -m 0444 \
             requirements-runtime.lock \
             "$trusted_root/candidate/requirements-runtime.lock"
@@ -221,17 +330,144 @@ jobs:
             --work-root "$acceptance_work" \
             --evidence "$acceptance_evidence"
 
+      - name: 固化保留 Unix 权限的确定性发布包
+        shell: bash
+        run: |
+          set -euo pipefail
+          trusted_root="/opt/keyless-gate"
+          release_bundle="$RUNNER_TEMP/release-bundle.tar"
+
+          mapfile -t wheels < <(
+            find "$trusted_root/candidate" \
+              -maxdepth 1 -type f -name '*.whl' -print
+          )
+          if [[ ${#wheels[@]} -ne 1 ]]; then
+            echo "发布包必须且只能包含一个候选 wheel" >&2
+            exit 1
+          fi
+          wheel_filename=$(basename -- "${wheels[0]}")
+
+          sudo install -o root -g root -m 0444 \
+            "$RUNNER_TEMP/keyless-gate-evidence.json" \
+            "$trusted_root/evidence/keyless-gate-evidence.json"
+          sudo install -o root -g root -m 0444 \
+            "$RUNNER_TEMP/installed-acceptance-evidence.json" \
+            "$trusted_root/evidence/installed-acceptance-evidence.json"
+
+          bundle_members=(
+            "candidate/$wheel_filename"
+            candidate/commit-sha
+            candidate/requirements-build.lock
+            candidate/requirements-runtime.lock
+            evidence/READY
+            evidence/installation-manifest.json
+            evidence/installed-acceptance-evidence.json
+            evidence/keyless-gate-evidence.json
+            scripts/install-production.sh
+            scripts/run_keyless_gate_network.sh
+            scripts/run_release_gate.py
+            scripts/systemd_credential_bridge.py
+            scripts/validate_installed_delivery.py
+            scripts/validate_release_evidence.py
+          )
+          mapfile -d '' -t bundle_members < <(
+            printf '%s\0' "${bundle_members[@]}" | LC_ALL=C sort -z
+          )
+          for member in "${bundle_members[@]}"; do
+            if [[ ! -f "$trusted_root/$member" || -L "$trusted_root/$member" ]]; then
+              echo "发布包成员必须是普通文件：$member" >&2
+              exit 1
+            fi
+            expected_mode=444
+            case "$member" in
+              scripts/install-production.sh|scripts/run_keyless_gate_network.sh)
+                expected_mode=555
+                ;;
+            esac
+            if [[ $(stat -c '%a:%u:%g' "$trusted_root/$member") \
+              != "$expected_mode:0:0" ]]; then
+              echo "发布包成员权限或所有者不符合契约：$member" >&2
+              exit 1
+            fi
+          done
+
+          sudo sh -c \
+            'cd "$1"; shift; sha256sum -- "$@" > BUNDLE-SHA256SUMS' \
+            bundle-checksums "$trusted_root" "${bundle_members[@]}"
+          sudo chown root:root "$trusted_root/BUNDLE-SHA256SUMS"
+          sudo chmod 0444 "$trusted_root/BUNDLE-SHA256SUMS"
+          sudo tar \
+            --sort=name \
+            --mtime='@0' \
+            --clamp-mtime \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C "$trusted_root" \
+            -cf "$release_bundle" \
+            BUNDLE-SHA256SUMS \
+            "${bundle_members[@]}"
+          sudo chown "$(id -u):$(id -g)" "$release_bundle"
+          chmod 0444 "$release_bundle"
+
       - name: 保存候选与机器可读证据
-        if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: keyless-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-bundle.tar
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 记录 CI 失败现场
+        if: failure()
+        shell: bash
+        env:
+          FAILURE_CANDIDATE_COMMIT: ${{ github.sha }}
+          FAILURE_REPOSITORY: ${{ github.repository }}
+          FAILURE_RUN_ID: ${{ github.run_id }}
+          FAILURE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          FAILURE_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I - "$RUNNER_TEMP/keyless-gate-failure.json" <<'PY'
+          import json
+          import os
+          import sys
+
+          payload = {
+              "schema_version": "keyless-gate-failure.v1",
+              "candidate": {"commit": os.environ["FAILURE_CANDIDATE_COMMIT"]},
+              "automation": {
+                  "repository": os.environ["FAILURE_REPOSITORY"],
+                  "run_id": os.environ["FAILURE_RUN_ID"],
+                  "run_attempt": os.environ["FAILURE_RUN_ATTEMPT"],
+                  "run_url": os.environ["FAILURE_RUN_URL"],
+              },
+              "status": "failed",
+              "classification": "ci_gate_failure_non_retryable",
+              "release_eligible": False,
+          }
+          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+          if hasattr(os, "O_NOFOLLOW"):
+              flags |= os.O_NOFOLLOW
+          descriptor = os.open(sys.argv[1], flags, 0o444)
+          with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+              json.dump(payload, stream, ensure_ascii=False, sort_keys=True)
+              stream.write("\n")
+          PY
+
+      - name: 保存 CI 失败诊断
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: keyless-gate-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            /opt/keyless-gate/candidate/*.whl
-            /opt/keyless-gate/candidate/requirements-runtime.lock
-            /opt/keyless-gate/evidence/installation-manifest.json
-            /opt/keyless-gate/evidence/READY
+            ${{ runner.temp }}/keyless-gate-failure.json
+            ${{ runner.temp }}/keyless-candidate/*.whl
             ${{ runner.temp }}/keyless-gate-evidence.json
             ${{ runner.temp }}/installed-acceptance-evidence.json
+            /opt/keyless-gate/evidence/installation-manifest.json
+            /opt/keyless-gate/evidence/READY
           if-no-files-found: warn
           retention-days: 14

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -611,6 +612,19 @@ sys.exit(0)
         "mode": "python_guard",
     }
     assert payload["credential_mode"] == "absent"
+    assert payload["release_tools"] == {
+        name: hashlib.sha256(
+            (PROJECT_ROOT / "scripts" / name).read_bytes()
+        ).hexdigest()
+        for name in (
+            "install-production.sh",
+            "run_keyless_gate_network.sh",
+            "run_release_gate.py",
+            "systemd_credential_bridge.py",
+            "validate_installed_delivery.py",
+            "validate_release_evidence.py",
+        )
+    }
     assert payload["success"] is True
 
 
@@ -762,43 +776,126 @@ def test_network_entrypoint_never_falls_back_when_namespace_is_required(tmp_path
     assert "网络命名空间" in completed.stderr
 
 
-def test_network_entrypoint_ignores_spoofed_mode_and_seals_sudo_arguments(
+def test_network_entrypoint_scrubs_spoofed_context_in_forced_guard(tmp_path):
+    observation = tmp_path / "environment.json"
+    fake_command = tmp_path / "gate-command"
+    fake_command.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+from pathlib import Path
+
+Path({str(observation)!r}).write_text(json.dumps({{
+    "legacy_uid": os.environ.get("KEYLESS_GATE_ORIGINAL_UID"),
+    "legacy_gid": os.environ.get("KEYLESS_GATE_ORIGINAL_GID"),
+    "preset_mode": os.environ.get("KEYLESS_GATE_NETWORK_MODE"),
+    "attestation_fd": os.environ.get("RELEASE_GATE_NETWORK_ATTESTATION_FD"),
+    "host_netns": os.environ.get("RELEASE_GATE_SYSTEMD_HOST_NETNS"),
+}}), encoding="utf-8")
+raise SystemExit(90)
+""",
+        encoding="utf-8",
+    )
+    fake_command.chmod(0o755)
+    completed = subprocess.run(
+        [str(NETWORK_ENTRYPOINT), str(fake_command), "argument"],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "KEYLESS_GATE_FORCE_PYTHON_GUARD": "1",
+            "KEYLESS_GATE_NETWORK_MODE": "network_namespace",
+            "KEYLESS_GATE_ORIGINAL_UID": "0",
+            "KEYLESS_GATE_ORIGINAL_GID": "0",
+            "RELEASE_GATE_NETWORK_ATTESTATION_FD": "9",
+            "RELEASE_GATE_SYSTEMD_HOST_NETNS": "net:[123]",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 90
+    assert completed.stderr == ""
+    assert json.loads(observation.read_text(encoding="utf-8")) == {
+        "legacy_uid": None,
+        "legacy_gid": None,
+        "preset_mode": "python_guard",
+        "attestation_fd": None,
+        "host_netns": None,
+    }
+
+
+def test_network_entrypoint_refuses_attestation_outside_private_namespace(
     tmp_path,
 ):
     sudo_log = tmp_path / "sudo.json"
     fake_sudo = tmp_path / "sudo"
     fake_sudo.write_text(
-        f"""#!{sys.executable}
-import json
-import os
-import sys
-from pathlib import Path
-
-args = sys.argv[1:]
-if args == ["-n", "true"]:
-    raise SystemExit(0)
-Path({str(sudo_log)!r}).write_text(json.dumps({{
-    "args": args,
-    "legacy_uid": os.environ.get("KEYLESS_GATE_ORIGINAL_UID"),
-    "legacy_gid": os.environ.get("KEYLESS_GATE_ORIGINAL_GID"),
-    "preset_mode": os.environ.get("KEYLESS_GATE_NETWORK_MODE"),
-}}), encoding="utf-8")
-""",
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"Path({str(sudo_log)!r}).write_text("
+        "json.dumps(sys.argv[1:]), encoding='utf-8')\n",
         encoding="utf-8",
     )
     fake_sudo.chmod(0o755)
     fake_command = tmp_path / "gate-command"
     fake_command.write_text(f"#!{sys.executable}\nraise SystemExit(90)\n")
     fake_command.chmod(0o755)
+    read_descriptor, write_descriptor = os.pipe()
+    try:
+        completed = subprocess.run(
+            [
+                str(NETWORK_ENTRYPOINT),
+                str(fake_command),
+                "argument",
+            ],
+            cwd=tmp_path,
+            env={
+                **_environment_without("KEYLESS_GATE_FORCE_PYTHON_GUARD"),
+                "KEYLESS_GATE_REQUIRE_NAMESPACE": "1",
+                "RELEASE_GATE_NETWORK_ATTESTATION_FD": str(write_descriptor),
+                "RELEASE_GATE_SYSTEMD_HOST_NETNS": os.readlink(
+                    "/proc/self/ns/net"
+                ),
+                "PATH": os.pathsep.join([str(tmp_path), os.environ["PATH"]]),
+            },
+            pass_fds=(write_descriptor,),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        os.close(write_descriptor)
+        write_descriptor = -1
+        attestation_payload = os.read(read_descriptor, 4096)
+    finally:
+        if write_descriptor >= 0:
+            os.close(write_descriptor)
+        os.close(read_descriptor)
+
+    assert completed.returncode == 1
+    assert not sudo_log.exists()
+    assert attestation_payload == b""
+    assert "不在 systemd 仅回环网络命名空间" in completed.stderr
+
+
+@pytest.mark.parametrize("attestation_fd", ["01", "02"])
+def test_network_entrypoint_rejects_noncanonical_attestation_fd(
+    tmp_path,
+    attestation_fd,
+):
+    fake_command = tmp_path / "gate-command"
+    fake_command.write_text(f"#!{sys.executable}\nraise SystemExit(90)\n")
+    fake_command.chmod(0o755)
+
     completed = subprocess.run(
-        [str(NETWORK_ENTRYPOINT), fake_command.name, "argument"],
+        [str(NETWORK_ENTRYPOINT), str(fake_command)],
         cwd=tmp_path,
         env={
             **_environment_without("KEYLESS_GATE_FORCE_PYTHON_GUARD"),
-            "KEYLESS_GATE_NETWORK_MODE": "network_namespace",
-            "KEYLESS_GATE_ORIGINAL_UID": "0",
-            "KEYLESS_GATE_ORIGINAL_GID": "0",
             "KEYLESS_GATE_REQUIRE_NAMESPACE": "1",
+            "RELEASE_GATE_NETWORK_ATTESTATION_FD": attestation_fd,
             "PATH": os.pathsep.join([str(tmp_path), os.environ["PATH"]]),
         },
         check=False,
@@ -806,30 +903,28 @@ Path({str(sudo_log)!r}).write_text(json.dumps({{
         text=True,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    payload = json.loads(sudo_log.read_text(encoding="utf-8"))
-    assert payload == {
-        "args": [
-            "-n",
-            "-E",
-            str(NETWORK_ENTRYPOINT.resolve()),
-            "__keyless_gate_root__",
-            str(os.getuid()),
-            str(os.getgid()),
-            os.readlink("/proc/self/ns/net"),
-            "1",
-            str(fake_command.resolve()),
-            "argument",
-        ],
-        "legacy_uid": None,
-        "legacy_gid": None,
-        "preset_mode": None,
-    }
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert "证明文件描述符不合法" in completed.stderr
 
 
 def test_network_entrypoint_drops_reacquirable_privileges():
     entrypoint = NETWORK_ENTRYPOINT.read_text(encoding="utf-8")
 
+    assert entrypoint.count(
+        "LC_ALL=C /usr/bin/grep -qxE '[3-9]|[1-9][0-9]+'"
+    ) == 2
+    assert "*[!0-9]*|0*|1|2)" not in entrypoint
+    assert entrypoint.count("2>/dev/null || true)") == 2
+    assert '/usr/bin/grep -qxE "net:\\[[0-9]+\\]"' in entrypoint
+    assert 'sudo_command=/usr/bin/sudo' in entrypoint
+    assert "-n -E" not in entrypoint
+    assert "拒绝跨 sudo 保留调用者环境" in entrypoint
+    assert 'host_netns=${RELEASE_GATE_SYSTEMD_HOST_NETNS:-}' in entrypoint
+    assert entrypoint.index(
+        'attestation_fd=${RELEASE_GATE_NETWORK_ATTESTATION_FD:-}',
+        entrypoint.index('parent_netns=$("$readlink_command" /proc/self/ns/net)'),
+    ) < entrypoint.index('exec "$sudo_command" -n')
     assert "--nnp" in entrypoint
     assert "--inh-caps=-all" in entrypoint
     assert "--ambient-caps=-all" in entrypoint
@@ -899,7 +994,15 @@ def test_workflow_runs_every_required_event_and_builds_the_candidate_once():
     assert "paths:" not in workflow
     assert "concurrency:" in workflow
     assert "timeout-minutes: 60" in workflow
-    assert workflow.count("uses: actions/checkout@v7") == 1
+    assert workflow.count(
+        "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+    ) == 1
+    assert workflow.count(
+        "uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"
+    ) == 1
+    assert workflow.count(
+        "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+    ) == 2
     assert workflow.count("persist-credentials: false") == 1
     assert 'trusted_root="/opt/keyless-gate"' in workflow
     assert 'candidate_root="$GITHUB_WORKSPACE"' in workflow
@@ -909,17 +1012,19 @@ def test_workflow_runs_every_required_event_and_builds_the_candidate_once():
     validation_loop = workflow[
         validation_loop_start : workflow.index("done", validation_loop_start)
     ]
+    assert "requirements-build.lock" in validation_loop
     assert "requirements-runtime.lock" in validation_loop
-    assert '"setuptools==80.9.0"' in workflow
-    assert '"wheel==0.45.1"' in workflow
     assert workflow.count("-m build --wheel") == 1
     assert "--no-isolation" in workflow
     assert workflow.count('--wheel "$CANDIDATE_WHEEL"') == 3
     assert "scripts/installed_acceptance_composition.py" in workflow
     assert "scripts/run_installed_acceptance.py" in workflow
+    assert "scripts/run_release_gate.py" in workflow
+    assert "scripts/systemd_credential_bridge.py" in workflow
+    assert "scripts/validate_release_evidence.py" in workflow
     assert "scripts/validate_installed_delivery.py" in workflow
     assert "scripts/install-production.sh" in workflow
-    assert workflow.count('APT_SNAPSHOT_ID="20260725T000000Z"') == 2
+    assert workflow.count('APT_SNAPSHOT_ID="20260725T000000Z"') == 3
     assert workflow.count('sudo "$trusted_root/scripts/install-production.sh"') == 1
     assert '--runtime-lock "$runtime_lock"' in workflow
     assert '--wheelhouse "$wheelhouse"' in workflow
@@ -943,7 +1048,178 @@ def test_workflow_runs_every_required_event_and_builds_the_candidate_once():
     )
     assert build_at < gate_at < install_at < acceptance_at
     assert "installed-acceptance-evidence.json" in workflow
-    assert "/opt/keyless-gate/evidence/installation-manifest.json" in workflow
-    assert "/opt/keyless-gate/evidence/READY" in workflow
+    assert "evidence/installation-manifest.json" in workflow
+    assert "evidence/READY" in workflow
     assert "${{ runner.temp }}/production-installation-manifest.json" not in workflow
-    assert "if-no-files-found: warn" in workflow
+    assert "if-no-files-found: error" in workflow
+
+
+def test_workflow_uploads_one_deterministic_release_bundle_with_unix_modes():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    bundle_at = workflow.index("- name: 固化保留 Unix 权限的确定性发布包")
+    upload_at = workflow.index("- name: 保存候选与机器可读证据")
+    failure_record_at = workflow.index("- name: 记录 CI 失败现场")
+    bundle_step = workflow[bundle_at:upload_at]
+    upload_step = workflow[upload_at:failure_record_at]
+
+    assert bundle_at < upload_at
+    assert "mapfile -t wheels" in bundle_step
+    assert "-name '*.whl' -print" in bundle_step
+    assert "if [[ ${#wheels[@]} -ne 1 ]]" in bundle_step
+    assert 'wheel_filename=$(basename -- "${wheels[0]}")' in bundle_step
+    assert "candidate/*.whl" not in upload_step
+
+    expected_members = {
+        '"candidate/$wheel_filename"',
+        "candidate/commit-sha",
+        "candidate/requirements-build.lock",
+        "candidate/requirements-runtime.lock",
+        "evidence/READY",
+        "evidence/installation-manifest.json",
+        "evidence/installed-acceptance-evidence.json",
+        "evidence/keyless-gate-evidence.json",
+        "scripts/install-production.sh",
+        "scripts/run_keyless_gate_network.sh",
+        "scripts/run_release_gate.py",
+        "scripts/systemd_credential_bridge.py",
+        "scripts/validate_installed_delivery.py",
+        "scripts/validate_release_evidence.py",
+    }
+    members_match = re.search(
+        r"bundle_members=\(\n(?P<members>.*?)\n\s+\)",
+        bundle_step,
+        re.DOTALL,
+    )
+    assert members_match is not None
+    actual_members = {
+        line.strip()
+        for line in members_match.group("members").splitlines()
+        if line.strip()
+    }
+    assert actual_members == expected_members
+    assert "LC_ALL=C sort -z" in bundle_step
+
+    assert bundle_step.count("sudo install -o root -g root -m 0444") == 2
+    assert 'expected_mode=444' in bundle_step
+    assert (
+        "scripts/install-production.sh|scripts/run_keyless_gate_network.sh"
+        in bundle_step
+    )
+    assert "expected_mode=555" in bundle_step
+    assert "stat -c '%a:%u:%g'" in bundle_step
+    assert '!= "$expected_mode:0:0"' in bundle_step
+
+    checksum_at = bundle_step.index("sha256sum --")
+    tar_at = bundle_step.index("sudo tar")
+    assert checksum_at < tar_at
+    assert "sha256sum -- \"$@\" > BUNDLE-SHA256SUMS" in bundle_step
+    assert 'chmod 0444 "$trusted_root/BUNDLE-SHA256SUMS"' in bundle_step
+    assert "--sort=name" in bundle_step
+    assert "--mtime='@0'" in bundle_step
+    assert "--clamp-mtime" in bundle_step
+    assert "--owner=0" in bundle_step
+    assert "--group=0" in bundle_step
+    assert "--numeric-owner" in bundle_step
+    assert "BUNDLE-SHA256SUMS" in bundle_step
+    assert '"${bundle_members[@]}"' in bundle_step
+    assert 'chmod 0444 "$release_bundle"' in bundle_step
+
+    assert "path: ${{ runner.temp }}/release-bundle.tar" in upload_step
+    assert "archive: false" in upload_step
+    assert "if-no-files-found: error" in upload_step
+    assert "if: always()" not in upload_step
+    assert "path: |" not in upload_step
+
+
+def test_workflow_persists_failed_ci_evidence_as_nonrelease_diagnostics():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    record_at = workflow.index("- name: 记录 CI 失败现场")
+    upload_at = workflow.index("- name: 保存 CI 失败诊断")
+    record_step = workflow[record_at:upload_at]
+    upload_step = workflow[upload_at:]
+
+    assert record_at < upload_at
+    assert "if: failure()" in record_step
+    assert '"schema_version": "keyless-gate-failure.v1"' in record_step
+    assert '"classification": "ci_gate_failure_non_retryable"' in record_step
+    assert '"release_eligible": False' in record_step
+    assert "${{ github.sha }}" in record_step
+    assert "${{ github.run_id }}" in record_step
+    assert "${{ github.run_attempt }}" in record_step
+    assert "if: failure()" in upload_step
+    assert "keyless-gate-failure-${{ github.run_id }}-${{ github.run_attempt }}" in upload_step
+    assert "path: |" in upload_step
+    assert "${{ runner.temp }}/keyless-gate-failure.json" in upload_step
+    assert "${{ runner.temp }}/keyless-candidate/*.whl" in upload_step
+    assert "${{ runner.temp }}/keyless-gate-evidence.json" in upload_step
+    assert "${{ runner.temp }}/installed-acceptance-evidence.json" in upload_step
+    assert "if-no-files-found: warn" in upload_step
+    assert "archive: false" not in upload_step
+
+
+def test_workflow_installs_ffmpeg_from_the_fixed_snapshot_before_the_full_gate():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+
+    media_setup_at = workflow.index("- name: 从固定 snapshot 准备完整门禁媒体能力")
+    full_gate_at = workflow.index("- name: 只构建一次并在仅回环网络中执行完整门禁")
+    media_setup = workflow[media_setup_at:full_gate_at]
+
+    assert media_setup_at < full_gate_at
+    assert 'readonly APT_SNAPSHOT_ID="20260725T000000Z"' in media_setup
+    assert '--snapshot "$APT_SNAPSHOT_ID"' in media_setup
+    assert "Snapshot: $APT_SNAPSHOT_ID" in media_setup
+    assert "URIs: https://archive.ubuntu.com/ubuntu" in media_setup
+    assert "URIs: https://security.ubuntu.com/ubuntu" in media_setup
+    assert 'Dir::Etc::main=/dev/null' in media_setup
+    assert 'Dir::Etc::sourcelist=$APT_STATE/ubuntu.sources' in media_setup
+    assert 'Dir::Etc::sourceparts=$APT_STATE/parts' in media_setup
+    assert 'Dir::Etc::preferences=$APT_STATE/snapshot.preferences' in media_setup
+    assert 'Dir::Etc::preferencesparts=$APT_STATE/parts' in media_setup
+    assert 'Dir::State::lists=$APT_STATE/lists' in media_setup
+    assert '"${APT_OPTIONS[@]}" policy "$package"' in media_setup
+    assert '"${APT_OPTIONS[@]}" madison "$package"' in media_setup
+    assert "--no-install-recommends" in media_setup
+    assert "packages=(ffmpeg fontconfig fonts-noto-cjk)" in media_setup
+    assert 'package_specs+=("$package=$candidate_version")' in media_setup
+    assert "--allow-downgrades" in media_setup
+    assert "dpkg-query" in media_setup
+    assert "ffmpeg -version" in media_setup
+    assert "ffprobe -version" in media_setup
+    assert "fc-match -f '%{family[0]}\\n'" in media_setup
+    assert '[[ "$matched_family" == "Noto Sans CJK SC" ]]' in media_setup
+
+
+def test_workflow_installs_build_and_gate_tools_only_from_the_hashed_lock():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+
+    tools_at = workflow.index("- name: 从哈希锁安装构建与门禁工具")
+    media_setup_at = workflow.index("- name: 从固定 snapshot 准备完整门禁媒体能力")
+    tools_step = workflow[tools_at:media_setup_at]
+
+    assert "python -m pip install" in tools_step
+    assert "--require-hashes" in tools_step
+    assert "--only-binary=:all:" in tools_step
+    assert "--no-deps" not in tools_step
+    assert "-r requirements-build.lock" in tools_step
+    for inline_requirement in (
+        '"build==',
+        '"pytest==',
+        '"setuptools==',
+        '"wheel==',
+    ):
+        assert inline_requirement not in tools_step
+
+
+def test_workflow_preserves_both_hash_locks_with_the_candidate_evidence():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    validation_loop_start = workflow.index("for source in")
+    validation_loop = workflow[
+        validation_loop_start : workflow.index("done", validation_loop_start)
+    ]
+
+    assert "requirements-build.lock" in validation_loop
+    assert "requirements-runtime.lock" in validation_loop
+    assert "requirements-build.lock \\" in workflow
+    assert '"$trusted_root/candidate/requirements-build.lock"' in workflow
+    assert "candidate/requirements-build.lock" in workflow
+    assert "candidate/requirements-runtime.lock" in workflow
