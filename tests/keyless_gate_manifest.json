@@ -51,6 +51,7 @@
     "installation_contract": [
       "tests/test_cli.py",
       "tests/test_composition.py",
+      "tests/test_installed_acceptance.py",
       "tests/test_keyless_gate.py",
       "tests/test_package_structure.py",
       "tests/test_production_installation.py",

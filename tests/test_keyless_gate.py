@@ -898,20 +898,52 @@ def test_workflow_runs_every_required_event_and_builds_the_candidate_once():
     assert "workflow_dispatch:" in workflow
     assert "paths:" not in workflow
     assert "concurrency:" in workflow
+    assert "timeout-minutes: 60" in workflow
     assert workflow.count("uses: actions/checkout@v7") == 1
     assert workflow.count("persist-credentials: false") == 1
     assert 'trusted_root="/opt/keyless-gate"' in workflow
     assert 'candidate_root="$GITHUB_WORKSPACE"' in workflow
     assert 'sudo install -d -o root -g root -m 0755 "$trusted_root/scripts"' in workflow
     assert 'sudo chmod -R a-w "$trusted_root"' in workflow
+    validation_loop_start = workflow.index("for source in")
+    validation_loop = workflow[
+        validation_loop_start : workflow.index("done", validation_loop_start)
+    ]
+    assert "requirements-runtime.lock" in validation_loop
     assert '"setuptools==80.9.0"' in workflow
     assert '"wheel==0.45.1"' in workflow
     assert workflow.count("-m build --wheel") == 1
     assert "--no-isolation" in workflow
-    assert '--wheel "$CANDIDATE_WHEEL"' in workflow
-    assert '"$trusted_root/scripts/run_keyless_gate_network.sh"' in workflow
-    assert 'KEYLESS_GATE_REQUIRE_NAMESPACE: "1"' in workflow
+    assert workflow.count('--wheel "$CANDIDATE_WHEEL"') == 3
+    assert "scripts/installed_acceptance_composition.py" in workflow
+    assert "scripts/run_installed_acceptance.py" in workflow
+    assert "scripts/validate_installed_delivery.py" in workflow
+    assert "scripts/install-production.sh" in workflow
+    assert workflow.count('APT_SNAPSHOT_ID="20260725T000000Z"') == 2
+    assert workflow.count('sudo "$trusted_root/scripts/install-production.sh"') == 1
+    assert '--runtime-lock "$runtime_lock"' in workflow
+    assert '--wheelhouse "$wheelhouse"' in workflow
+    assert '--installation-prefix "$installation_prefix"' in workflow
+    assert "python -m video_auto_editor" not in workflow
+    assert workflow.count('"$trusted_root/scripts/run_keyless_gate_network.sh"') == 3
+    assert workflow.count('KEYLESS_GATE_REQUIRE_NAMESPACE: "1"') == 2
     assert '"$python_path" -I "$trusted_root/scripts/run_keyless_gate.py"' in workflow
     assert '--harness-root "$trusted_root"' in workflow
-    assert '--source-root "$candidate_root"' in workflow
+    assert '--harness-root "$trusted_root/scripts"' in workflow
+    assert workflow.count('--source-root "$candidate_root"') == 2
+    build_at = workflow.index("-m build --wheel")
+    gate_at = workflow.index(
+        '"$python_path" -I "$trusted_root/scripts/run_keyless_gate.py"'
+    )
+    install_at = workflow.index(
+        'sudo "$trusted_root/scripts/install-production.sh"'
+    )
+    acceptance_at = workflow.index(
+        '"$python_path" -I "$trusted_root/scripts/run_installed_acceptance.py"'
+    )
+    assert build_at < gate_at < install_at < acceptance_at
+    assert "installed-acceptance-evidence.json" in workflow
+    assert "/opt/keyless-gate/evidence/installation-manifest.json" in workflow
+    assert "/opt/keyless-gate/evidence/READY" in workflow
+    assert "${{ runner.temp }}/production-installation-manifest.json" not in workflow
     assert "if-no-files-found: warn" in workflow

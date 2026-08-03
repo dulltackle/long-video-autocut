@@ -365,6 +365,7 @@ def _observe_local_installation(
     shadow_import: bool = False,
     direct_url_sha256: str = "1" * 64,
     editable: bool = False,
+    console_record_count: int = 1,
     swap_version_parent_on_manifest_open: bool = False,
     installation_document_fault: str | None = None,
     invoke_through_current: bool = False,
@@ -458,6 +459,7 @@ def _observe_local_installation(
         external_module.parent.mkdir(parents=True)
         external_module.write_text("# external module\n", encoding="utf-8")
     direct_url_relative = Path("video_auto_editor-4.7.0.dist-info/direct_url.json")
+    console_relative = Path("../../../bin/video-auto-editor")
     direct_url_path = distribution_root / direct_url_relative
     direct_url_path.parent.mkdir(parents=True, exist_ok=True)
     direct_url = (
@@ -475,7 +477,7 @@ def _observe_local_installation(
 
     class _Distribution:
         version = "4.7.0"
-        files = (
+        files = (console_relative,) * console_record_count + (
             Path("video_auto_editor/application/readiness.py"),
             direct_url_relative,
         )
@@ -591,6 +593,23 @@ def test_local_installation_probe_binds_distribution_and_import_to_venv(
         assert observation == InstallationObservation.verified(
             manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest()
         )
+
+
+@pytest.mark.parametrize("console_record_count", [0, 2])
+def test_local_installation_probe_requires_exactly_one_console_record(
+    tmp_path,
+    monkeypatch,
+    console_record_count,
+):
+    observation, _ = _observe_local_installation(
+        tmp_path,
+        monkeypatch,
+        console_record_count=console_record_count,
+    )
+
+    assert observation == InstallationObservation.invalid(
+        "manifest.prefix_mismatch"
+    )
 
 
 def test_local_installation_probe_rejects_incomplete_manifest_schema(

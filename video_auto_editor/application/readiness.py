@@ -276,7 +276,10 @@ class _LocalSystemProbe:
                 strict=True
             )
             imported_module = Path(__file__).resolve(strict=True)
-            identity_paths = _distribution_identity_paths(distribution)
+            identity_paths = _distribution_identity_paths(
+                distribution,
+                expected_cli=expected_cli,
+            )
         except (IndexError, OSError, RuntimeError, TypeError):
             return InstallationObservation.invalid("manifest.prefix_mismatch")
         if identity_paths is None:
@@ -1691,16 +1694,30 @@ def _is_package_inventory(value: object) -> bool:
 
 def _distribution_identity_paths(
     distribution: metadata.Distribution,
+    *,
+    expected_cli: Path,
 ) -> tuple[Path, Path] | None:
     files = distribution.files
     if files is None:
         return None
     module_entry = None
     direct_url_entries = []
+    console_entries = []
     for entry in files:
         relative = Path(str(entry))
-        if relative.is_absolute() or ".." in relative.parts:
+        if relative.is_absolute():
             return None
+        if ".." in relative.parts:
+            try:
+                resolved = Path(str(distribution.locate_file(entry))).resolve(
+                    strict=True
+                )
+            except (OSError, RuntimeError, TypeError):
+                return None
+            if not os.path.samefile(resolved, expected_cli):
+                return None
+            console_entries.append(entry)
+            continue
         if relative.as_posix() == "video_auto_editor/application/readiness.py":
             if module_entry is not None:
                 return None
@@ -1709,7 +1726,11 @@ def _distribution_identity_paths(
             ".dist-info"
         ):
             direct_url_entries.append(entry)
-    if module_entry is None or len(direct_url_entries) != 1:
+    if (
+        module_entry is None
+        or len(direct_url_entries) != 1
+        or len(console_entries) != 1
+    ):
         return None
     module_path = Path(str(distribution.locate_file(module_entry))).resolve(strict=True)
     direct_url_path = Path(

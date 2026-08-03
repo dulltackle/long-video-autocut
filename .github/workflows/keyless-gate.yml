@@ -17,7 +17,7 @@ jobs:
   keyless-gate:
     name: 完整无密钥门禁
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: 检出候选提交
@@ -44,24 +44,38 @@ jobs:
           set -euo pipefail
           trusted_root="/opt/keyless-gate"
           readonly_scripts=(
+            scripts/installed_acceptance_composition.py
             scripts/keyless_gate_network_guard.py
             scripts/keyless_gate_pytest.py
+            scripts/run_installed_acceptance.py
             scripts/run_keyless_gate.py
             scripts/sitecustomize.py
+            scripts/validate_installed_delivery.py
             scripts/validate_architecture.py
           )
-          for source in "${readonly_scripts[@]}" scripts/run_keyless_gate_network.sh; do
+          readonly_executables=(
+            scripts/install-production.sh
+            scripts/run_keyless_gate_network.sh
+          )
+          for source in \
+            "${readonly_scripts[@]}" \
+            "${readonly_executables[@]}" \
+            requirements-runtime.lock; do
             if [[ ! -f "$source" || -L "$source" ]]; then
               echo "门禁裁判必须由普通文件组成：$source" >&2
               exit 1
             fi
           done
           sudo install -d -o root -g root -m 0755 "$trusted_root/scripts"
+          sudo install -d -o root -g root -m 0755 "$trusted_root/candidate"
+          sudo install -d -o root -g root -m 0755 "$trusted_root/evidence"
           sudo install -o root -g root -m 0444 \
             "${readonly_scripts[@]}" "$trusted_root/scripts/"
           sudo install -o root -g root -m 0555 \
-            scripts/run_keyless_gate_network.sh \
-            "$trusted_root/scripts/run_keyless_gate_network.sh"
+            "${readonly_executables[@]}" "$trusted_root/scripts/"
+          sudo install -o root -g root -m 0444 \
+            requirements-runtime.lock \
+            "$trusted_root/candidate/requirements-runtime.lock"
           sudo chmod -R a-w "$trusted_root"
 
       - name: 只构建一次并在仅回环网络中执行完整门禁
@@ -103,7 +117,13 @@ jobs:
             echo "候选构建必须且只能产生一个 wheel" >&2
             exit 1
           fi
-          CANDIDATE_WHEEL=${wheels[0]}
+          wheel_filename=$(basename -- "${wheels[0]}")
+          CANDIDATE_WHEEL="$trusted_root/candidate/$wheel_filename"
+          sudo install -o root -g root -m 0444 \
+            "${wheels[0]}" "$CANDIDATE_WHEEL"
+          printf '%s\n' "$candidate_sha" \
+            | sudo tee "$trusted_root/candidate/commit-sha" >/dev/null
+          sudo chmod 0444 "$trusted_root/candidate/commit-sha"
 
           run_without_ci_credentials \
             "$trusted_root/scripts/run_keyless_gate_network.sh" \
@@ -115,13 +135,103 @@ jobs:
             --source-root "$candidate_root" \
             --manifest "$candidate_root/tests/keyless_gate_manifest.json"
 
+      - name: 从固定 snapshot 安装同一候选
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly APT_SNAPSHOT_ID="20260725T000000Z"
+          trusted_root="/opt/keyless-gate"
+          wheelhouse="$RUNNER_TEMP/runtime-wheelhouse"
+          runtime_lock="$trusted_root/candidate/requirements-runtime.lock"
+          installation_prefix="/opt/video-auto-editor-keyless"
+          mapfile -t wheels < <(find "$trusted_root/candidate" -maxdepth 1 -type f -name '*.whl' -print)
+          if [[ ${#wheels[@]} -ne 1 ]]; then
+            echo "可信候选目录必须且只能包含一个 wheel" >&2
+            exit 1
+          fi
+          CANDIDATE_WHEEL=${wheels[0]}
+          install -d -m 0700 "$wheelhouse"
+          wheel_sha256=$(sha256sum -- "$CANDIDATE_WHEEL" | awk '{print $1}')
+          runtime_lock_sha256=$(sha256sum -- "$runtime_lock" | awk '{print $1}')
+
+          sudo "$trusted_root/scripts/install-production.sh" \
+            --wheel "$CANDIDATE_WHEEL" \
+            --wheel-sha256 "$wheel_sha256" \
+            --wheelhouse "$wheelhouse" \
+            --runtime-lock "$runtime_lock" \
+            --runtime-lock-sha256 "$runtime_lock_sha256" \
+            --apt-snapshot-id "$APT_SNAPSHOT_ID" \
+            --prefix "$installation_prefix"
+
+          sudo install -o root -g root -m 0444 \
+            "$installation_prefix/current/installation-manifest.json" \
+            "$trusted_root/evidence/installation-manifest.json"
+          sudo install -o root -g root -m 0444 \
+            "$installation_prefix/current/READY" \
+            "$trusted_root/evidence/READY"
+          sudo chmod -R a-w "$trusted_root/evidence"
+
+      - name: 在仅回环网络中验收已安装控制台
+        shell: bash
+        env:
+          KEYLESS_GATE_REQUIRE_NAMESPACE: "1"
+        run: |
+          set -euo pipefail
+          readonly APT_SNAPSHOT_ID="20260725T000000Z"
+          trusted_root="/opt/keyless-gate"
+          candidate_root="$GITHUB_WORKSPACE"
+          runtime_lock="$trusted_root/candidate/requirements-runtime.lock"
+          installation_prefix="/opt/video-auto-editor-keyless"
+          acceptance_work="$RUNNER_TEMP/installed-acceptance-work"
+          acceptance_evidence="$RUNNER_TEMP/installed-acceptance-evidence.json"
+          python_path=$(command -v python)
+          candidate_sha=$(<"$trusted_root/candidate/commit-sha")
+          mapfile -t wheels < <(find "$trusted_root/candidate" -maxdepth 1 -type f -name '*.whl' -print)
+          if [[ ${#wheels[@]} -ne 1 ]]; then
+            echo "可信候选目录必须且只能包含一个 wheel" >&2
+            exit 1
+          fi
+          CANDIDATE_WHEEL=${wheels[0]}
+
+          run_without_ci_credentials() {
+            env \
+              -u STEPFUN_API_KEY \
+              -u GITHUB_TOKEN \
+              -u GH_TOKEN \
+              -u ACTIONS_RUNTIME_TOKEN \
+              -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+              -u ACTIONS_ID_TOKEN_REQUEST_URL \
+              -u GITHUB_ENV \
+              -u GITHUB_OUTPUT \
+              -u GITHUB_PATH \
+              -u GITHUB_STEP_SUMMARY \
+              "$@"
+          }
+
+          run_without_ci_credentials \
+            "$trusted_root/scripts/run_keyless_gate_network.sh" \
+            "$python_path" -I "$trusted_root/scripts/run_installed_acceptance.py" \
+            --wheel "$CANDIDATE_WHEEL" \
+            --commit-sha "$candidate_sha" \
+            --runtime-lock "$runtime_lock" \
+            --apt-snapshot-id "$APT_SNAPSHOT_ID" \
+            --installation-prefix "$installation_prefix" \
+            --source-root "$candidate_root" \
+            --harness-root "$trusted_root/scripts" \
+            --work-root "$acceptance_work" \
+            --evidence "$acceptance_evidence"
+
       - name: 保存候选与机器可读证据
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: keyless-gate-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/keyless-candidate/*.whl
+            /opt/keyless-gate/candidate/*.whl
+            /opt/keyless-gate/candidate/requirements-runtime.lock
+            /opt/keyless-gate/evidence/installation-manifest.json
+            /opt/keyless-gate/evidence/READY
             ${{ runner.temp }}/keyless-gate-evidence.json
+            ${{ runner.temp }}/installed-acceptance-evidence.json
           if-no-files-found: warn
           retention-days: 14
