@@ -1479,8 +1479,14 @@ class Workspace:
                 if stream.closed:
                     raise RuntimeError("受管文件效果不能关闭文件流")
                 if mode != "rb":
-                    stream.flush()
-                    os.fsync(stream.fileno())
+                    try:
+                        stream.flush()
+                        _sync_file_data(stream.fileno())
+                    except OSError as exc:
+                        raise _workspace_filesystem_failure(
+                            operation="workspace.access",
+                            reason_code="filesystem.file_sync_failed",
+                        ) from exc
                 self._revalidate_managed_open_file(
                     root_descriptor,
                     base_parts,
@@ -1680,7 +1686,13 @@ class Workspace:
                 if written == 0:
                     raise OSError(errno.EIO, "无法完整写入受管文件")
                 remaining = remaining[written:]
-            _sync_file_data(file_descriptor)
+            try:
+                _sync_file_data(file_descriptor)
+            except OSError as exc:
+                raise _workspace_filesystem_failure(
+                    operation="workspace.access",
+                    reason_code="filesystem.file_sync_failed",
+                ) from exc
 
             self._validate_lease_root(root_descriptor)
             synced_status = os.fstat(file_descriptor)
@@ -1714,11 +1726,25 @@ class Workspace:
                     parent_descriptor,
                     target_name,
                 )
-            except OSError as exc:
+            except FileExistsError as exc:
                 raise _managed_component_failure(
                     parent_descriptor,
                     target_name,
                     exc,
+                ) from exc
+            except PermissionError as exc:
+                raise _workspace_access_failure(
+                    "workspace.permission_denied"
+                ) from exc
+            except OSError as exc:
+                reason_code = (
+                    "filesystem.cross_device"
+                    if exc.errno == errno.EXDEV
+                    else "filesystem.atomic_replace_failed"
+                )
+                raise _workspace_filesystem_failure(
+                    operation="workspace.access",
+                    reason_code=reason_code,
                 ) from exc
             published = True
             self._revalidate_managed_parent(
@@ -1734,7 +1760,13 @@ class Workspace:
                 temporary_identity,
                 access_failure=True,
             )
-            os.fsync(parent_descriptor)
+            try:
+                os.fsync(parent_descriptor)
+            except OSError as exc:
+                raise _workspace_filesystem_failure(
+                    operation="workspace.access",
+                    reason_code="filesystem.directory_sync_failed",
+                ) from exc
             self._revalidate_managed_parent(
                 root_descriptor,
                 base_parts,

@@ -89,6 +89,34 @@ class _DeterministicFact:
     payload: object | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ProductionFailureInjection:
+    """只允许真实生产 failure 类型穿过顶层应用 seam。"""
+
+    stage: RunStage
+    failure_factory: Callable[[], Exception]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stage, RunStage):
+            raise TypeError("生产故障注入必须绑定 RunStage")
+        if self.stage is RunStage.INITIALIZED:
+            raise ValueError("初始化故障必须从 workspace 或诊断入口真实产生")
+        if not callable(self.failure_factory):
+            raise TypeError("生产故障注入必须提供 failure 工厂")
+
+    def create_failure(self) -> Exception:
+        failure = self.failure_factory()
+        if not isinstance(failure, Exception):
+            raise TypeError("生产故障工厂必须返回 Exception")
+        if not type(failure).__module__.startswith("video_auto_editor."):
+            raise TypeError("生产故障工厂不得返回测试专用异常")
+        if not isinstance(getattr(failure, "error_code", None), ErrorCode):
+            raise TypeError("生产故障必须携带稳定 ErrorCode")
+        if not isinstance(getattr(failure, "diagnostics", None), Mapping):
+            raise TypeError("生产故障必须携带安全诊断映射")
+        return failure
+
+
 _SourceAnalyzer = Callable[
     [SourceFileCapability, CancellationToken],
     SourceDescription,
@@ -241,6 +269,7 @@ class _DeterministicRunAssembly:
         "_built_manifest_bytes",
         "_built_result_kind",
         "_course_context_sha256",
+        "_failure_injection",
         "_failure_stage",
         "_interrupt_after_preflight_return",
         "_interruption_signal",
@@ -268,6 +297,7 @@ class _DeterministicRunAssembly:
         result_kind: ResultKind,
         subtitle_failure: bool,
         failure_stage: RunStage | None,
+        failure_injection: ProductionFailureInjection | None,
         unexpected_stage: RunStage | None,
         invalid_result_stage: RunStage | None,
         invalid_work_count_stage: RunStage | None,
@@ -296,6 +326,7 @@ class _DeterministicRunAssembly:
         self._result_kind = result_kind
         self._subtitle_failure = subtitle_failure
         self._failure_stage = failure_stage
+        self._failure_injection = failure_injection
         self._unexpected_stage = unexpected_stage
         self._invalid_result_stage = invalid_result_stage
         self._invalid_work_count_stage = invalid_work_count_stage
@@ -338,6 +369,9 @@ class _DeterministicRunAssembly:
             )
 
     def _before_work(self, stage: RunStage) -> None:
+        injection = self._failure_injection
+        if injection is not None and stage is injection.stage:
+            raise injection.create_failure()
         if stage is self._failure_stage:
             error_code, module = _FAILURES[stage]
             raise _DeterministicFailure(error_code, module)
@@ -733,6 +767,7 @@ class _DeterministicRunAssembly:
 
 class _DeterministicAssemblyFactory:
     __slots__ = (
+        "_failure_injection",
         "_failure_stage",
         "_interrupt_after_preflight_return",
         "_interruption_signal",
@@ -756,6 +791,7 @@ class _DeterministicAssemblyFactory:
         result_kind: ResultKind,
         subtitle_failure: bool,
         failure_stage: RunStage | None,
+        failure_injection: ProductionFailureInjection | None,
         unexpected_stage: RunStage | None,
         invalid_result_stage: RunStage | None,
         invalid_work_count_stage: RunStage | None,
@@ -775,6 +811,7 @@ class _DeterministicAssemblyFactory:
         self._result_kind = result_kind
         self._subtitle_failure = subtitle_failure
         self._failure_stage = failure_stage
+        self._failure_injection = failure_injection
         self._unexpected_stage = unexpected_stage
         self._invalid_result_stage = invalid_result_stage
         self._invalid_work_count_stage = invalid_work_count_stage
@@ -808,6 +845,7 @@ class _DeterministicAssemblyFactory:
             self._result_kind,
             self._subtitle_failure,
             self._failure_stage,
+            self._failure_injection,
             self._unexpected_stage,
             self._invalid_result_stage,
             self._invalid_work_count_stage,
@@ -1039,6 +1077,15 @@ class _DeterministicDiagnosticsInitializer:
         wall_clock,
         monotonic_clock,
     ) -> RunDiagnostics:
+        if self._failure == "startup":
+            raise DiagnosticsFailure(
+                ErrorCode.ENVIRONMENT_DIAGNOSTICS_UNWRITABLE,
+                {
+                    "component": "run_diagnostics",
+                    "operation": "diagnostics.initialize",
+                    "reason_code": "diagnostics.open_failed",
+                },
+            )
         if self._failure is None:
             return initialize_persistent_diagnostics(
                 run_workspace.diagnostics,
@@ -1063,6 +1110,7 @@ def compose_deterministic_live_application(
     transcription_script: DeterministicTranscriptionScript | None = None,
     result_kind: ResultKind = ResultKind.CLIPS,
     failure_stage: RunStage | None = None,
+    failure_injection: ProductionFailureInjection | None = None,
     interruption_stage: RunStage | None = None,
     interruption_signal: InterruptionSignal = InterruptionSignal.SIGINT,
     interrupt_after_commit: bool = False,
@@ -1103,6 +1151,11 @@ def compose_deterministic_live_application(
         raise TypeError("确定性结果必须使用 ResultKind")
     if failure_stage is not None and failure_stage not in _FAILURES:
         raise ValueError("确定性故障只能注入非初始化业务阶段")
+    if failure_injection is not None and not isinstance(
+        failure_injection,
+        ProductionFailureInjection,
+    ):
+        raise TypeError("生产故障注入必须使用 ProductionFailureInjection")
     if (
         interruption_stage is not None
         and interruption_stage not in _FAILURES
@@ -1126,11 +1179,14 @@ def compose_deterministic_live_application(
         raise ValueError("清理故障位置只能选择一个")
     if diagnostics_failure not in {
         None,
+        "startup",
         "precommit",
         "postcommit",
         "finalization",
     }:
-        raise ValueError("诊断故障只能发生在提交点前、提交点后或终态收尾")
+        raise ValueError(
+            "诊断故障只能发生在初始化、提交点前、提交点后或终态收尾"
+        )
     if not isinstance(subtitle_failure, bool):
         raise TypeError("字幕优化故障选项必须是布尔值")
     resolved_transcription_script = (
@@ -1193,6 +1249,7 @@ def compose_deterministic_live_application(
         value is not None
         for value in (
             failure_stage,
+            failure_injection,
             interruption_stage,
             unexpected_stage,
             invalid_result_stage,
@@ -1223,6 +1280,7 @@ def compose_deterministic_live_application(
             result_kind,
             subtitle_failure,
             failure_stage,
+            failure_injection,
             unexpected_stage,
             invalid_result_stage,
             invalid_work_count_stage,

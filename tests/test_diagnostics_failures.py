@@ -1,5 +1,8 @@
+import errno
 import json
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -27,6 +30,9 @@ from video_auto_editor.diagnostics.collecting import (
     initialize as initialize_collecting_diagnostics,
 )
 from video_auto_editor.diagnostics.persistent import (
+    _PersistentDiagnosticStore,
+)
+from video_auto_editor.diagnostics.persistent import (
     initialize as initialize_persistent_diagnostics,
 )
 from video_auto_editor.runtime.errors import (
@@ -35,7 +41,10 @@ from video_auto_editor.runtime.errors import (
     RunStage,
 )
 from video_auto_editor.runtime.identity import RunId
-from video_auto_editor.workspace import Workspace
+from video_auto_editor.workspace import (
+    ManagedPathCapability,
+    Workspace,
+)
 from video_auto_editor.workspace import _workspace as workspace_module
 
 
@@ -95,6 +104,308 @@ def test_initial_event_failure_becomes_safe_environment_failure(monkeypatch):
         "reason_code": "diagnostics.append_failed",
     }
     assert "/secret/workspace" not in repr(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+def test_persistent_initialization_classifies_managed_open_failure(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    run_id = RunId.new()
+
+    with workspace.acquire_run(run_id) as run_workspace:
+
+        def fail_open(*_args, **_kwargs):
+            raise OSError("injected")
+
+        monkeypatch.setattr(
+            Workspace,
+            "_validate_managed_directory",
+            fail_open,
+        )
+
+        with pytest.raises(DiagnosticsFailure) as captured:
+            initialize_persistent_diagnostics(
+                run_workspace.diagnostics,
+                application_version="4.7.0",
+                wall_clock=_wall_clock,
+                monotonic_clock=_monotonic_clock(),
+            )
+
+    assert captured.value.error_code is (
+        ErrorCode.ENVIRONMENT_DIAGNOSTICS_UNWRITABLE
+    )
+    assert dict(captured.value.diagnostics) == {
+        "component": "run_diagnostics",
+        "operation": "diagnostics.initialize",
+        "reason_code": "diagnostics.open_failed",
+    }
+
+
+def test_critical_boundary_event_syncs_immediately(tmp_path, monkeypatch):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    run_id = RunId.new()
+    original_sync = workspace_module._sync_file_data
+
+    with workspace.acquire_run(run_id) as run_workspace:
+        diagnostics = initialize_persistent_diagnostics(
+            run_workspace.diagnostics,
+            application_version="4.7.0",
+            wall_clock=_wall_clock,
+            monotonic_clock=_monotonic_clock(),
+        )
+        synced_files = []
+
+        def observe_sync(descriptor):
+            synced_files.append(
+                Path(os.readlink(f"/proc/self/fd/{descriptor}")).name
+            )
+            return original_sync(descriptor)
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_sync_file_data",
+            observe_sync,
+        )
+
+        diagnostics.start_stage(RunStage.PREFLIGHT)
+
+    assert synced_files == ["events.jsonl"]
+
+
+def test_ordinary_event_syncs_immediately(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    run_id = RunId.new()
+    original_sync = workspace_module._sync_file_data
+
+    with workspace.acquire_run(run_id) as run_workspace:
+        store = _PersistentDiagnosticStore(
+            run_workspace.diagnostics,
+            run_id,
+        )
+        store.append(b'{"event_code":"run.initialized"}\n')
+        synced_files = []
+
+        def observe_sync(descriptor):
+            synced_files.append(
+                Path(os.readlink(f"/proc/self/fd/{descriptor}")).name
+            )
+            return original_sync(descriptor)
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_sync_file_data",
+            observe_sync,
+        )
+
+        store.append(b'{"event_code":"cache.observed"}\n')
+
+    assert synced_files == ["events.jsonl"]
+
+
+def test_event_log_sync_precedes_manifest_atomic_publication(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    run_id = RunId.new()
+    original_sync = workspace_module._sync_file_data
+    original_publish = ManagedPathCapability.publish_bytes_atomically
+
+    with workspace.acquire_run(run_id) as run_workspace:
+        store = _PersistentDiagnosticStore(
+            run_workspace.diagnostics,
+            run_id,
+        )
+        store.append(b'{"event_code":"run.initialized"}\n')
+        order = []
+
+        def observe_sync(descriptor):
+            if (
+                Path(os.readlink(f"/proc/self/fd/{descriptor}")).name
+                == "events.jsonl"
+            ):
+                order.append("events.sync")
+            return original_sync(descriptor)
+
+        def observe_publish(location, payload):
+            order.append("manifest.publish")
+            return original_publish(location, payload)
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_sync_file_data",
+            observe_sync,
+        )
+        monkeypatch.setattr(
+            ManagedPathCapability,
+            "publish_bytes_atomically",
+            observe_publish,
+        )
+
+        store.publish_manifest(b"manifest\n")
+
+    assert order == ["events.sync", "manifest.publish"]
+
+
+def test_critical_event_data_sync_failure_has_a_stable_reason(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    run_id = RunId.new()
+
+    with workspace.acquire_run(run_id) as run_workspace:
+        diagnostics = initialize_persistent_diagnostics(
+            run_workspace.diagnostics,
+            application_version="4.7.0",
+            wall_clock=_wall_clock,
+            monotonic_clock=_monotonic_clock(),
+        )
+
+        def fail_data_sync(_descriptor):
+            raise OSError(errno.EIO, "injected")
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_sync_file_data",
+            fail_data_sync,
+        )
+
+        with pytest.raises(DiagnosticsFailure) as captured:
+            diagnostics.start_stage(RunStage.PREFLIGHT)
+
+    assert captured.value.error_code is ErrorCode.DIAGNOSTICS_WRITE_FAILED
+    assert dict(captured.value.diagnostics) == {
+        "operation": "diagnostics.append",
+        "reason_code": "diagnostics.file_sync_failed",
+    }
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("failure_phase", "expected_reason", "manifest_visible"),
+    [
+        ("file_sync", "diagnostics.file_sync_failed", False),
+        ("rename", "diagnostics.atomic_replace_failed", False),
+        ("parent_sync", "diagnostics.directory_sync_failed", True),
+    ],
+)
+def test_manifest_durability_failure_has_a_stable_phase(
+    tmp_path,
+    monkeypatch,
+    failure_phase,
+    expected_reason,
+    manifest_visible,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    run_id = RunId.new()
+
+    with workspace.acquire_run(run_id) as run_workspace:
+        diagnostics = initialize_persistent_diagnostics(
+            run_workspace.diagnostics,
+            application_version="4.7.0",
+            wall_clock=_wall_clock,
+            monotonic_clock=_monotonic_clock(),
+        )
+        stage = diagnostics.start_stage(RunStage.PREFLIGHT)
+        scope = stage.scope(ErrorModule.APPLICATION)
+        scope.record(Facts.interruption(InterruptionSignal.SIGINT))
+        stage.complete(StageOutcome.INTERRUPTED, work_item_count=0)
+        diagnostic_directory = (
+            workspace.root / "work" / "runs" / str(run_id)
+        )
+
+        if failure_phase == "file_sync":
+            original_data_sync = workspace_module._sync_file_data
+
+            def fail_manifest_data_sync(descriptor):
+                name = Path(
+                    os.readlink(f"/proc/self/fd/{descriptor}")
+                ).name
+                if name.startswith(".workspace-create-"):
+                    raise OSError(errno.EIO, "injected")
+                return original_data_sync(descriptor)
+
+            monkeypatch.setattr(
+                workspace_module,
+                "_sync_file_data",
+                fail_manifest_data_sync,
+            )
+        elif failure_phase == "rename":
+            original_rename = workspace_module._rename_no_replace
+
+            def fail_manifest_rename(
+                source_parent,
+                source_name,
+                target_parent,
+                target_name,
+            ):
+                if target_name == "run.json":
+                    raise OSError(errno.EIO, "injected")
+                return original_rename(
+                    source_parent,
+                    source_name,
+                    target_parent,
+                    target_name,
+                )
+
+            monkeypatch.setattr(
+                workspace_module,
+                "_rename_no_replace",
+                fail_manifest_rename,
+            )
+        else:
+            original_fsync = os.fsync
+
+            def fail_manifest_parent_sync(descriptor):
+                if os.readlink(f"/proc/self/fd/{descriptor}") == str(
+                    diagnostic_directory
+                ):
+                    raise OSError(errno.EIO, "injected")
+                return original_fsync(descriptor)
+
+            monkeypatch.setattr(
+                os,
+                "fsync",
+                fail_manifest_parent_sync,
+            )
+
+        with pytest.raises(DiagnosticsFailure) as captured:
+            diagnostics.finish(
+                DiagnosticCompletion.interrupted(
+                    InterruptionSignal.SIGINT,
+                    cleanup_duration_ms=0,
+                )
+            )
+
+        assert (diagnostic_directory / "run.json").exists() is (
+            manifest_visible
+        )
+
+    assert captured.value.error_code is ErrorCode.DIAGNOSTICS_WRITE_FAILED
+    assert dict(captured.value.diagnostics) == {
+        "operation": "diagnostics.publish_manifest",
+        "reason_code": expected_reason,
+    }
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
 

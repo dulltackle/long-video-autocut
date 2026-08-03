@@ -19,6 +19,7 @@ from video_auto_editor.runtime.errors import (
     ErrorModule,
     RunError,
     RunStage,
+    freeze_error_diagnostics,
 )
 from video_auto_editor.runtime.identity import RunId
 from video_auto_editor.workspace import (
@@ -499,7 +500,7 @@ def test_atomic_publish_cleans_its_temporary_file_when_data_sync_fails(
             ).publish_bytes_atomically(b"manifest")
 
         assert captured.value.diagnostics["reason_code"] == (
-            "workspace.io_failed"
+            "filesystem.file_sync_failed"
         )
         assert not (diagnostic_directory / "run.json").exists()
         assert not list(
@@ -584,10 +585,60 @@ def test_atomic_publish_does_not_roll_back_after_parent_sync_failure(
             ).publish_bytes_atomically(b"committed")
 
         assert captured.value.diagnostics["reason_code"] == (
-            "workspace.io_failed"
+            "filesystem.directory_sync_failed"
         )
         assert target.read_bytes() == b"committed"
         assert not list(target.parent.glob(".workspace-create-*"))
+
+
+@pytest.mark.parametrize(
+    ("failure_errno", "expected_reason"),
+    [
+        (errno.EIO, "filesystem.atomic_replace_failed"),
+        (errno.EXDEV, "filesystem.cross_device"),
+    ],
+)
+def test_atomic_publish_classifies_rename_failure_before_publication(
+    tmp_path,
+    monkeypatch,
+    failure_errno,
+    expected_reason,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        diagnostic_directory = (
+            workspace.root
+            / "work"
+            / "runs"
+            / str(run_workspace.run_id)
+        )
+
+        def fail_rename(*_args):
+            raise OSError(failure_errno, "injected")
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_rename_no_replace",
+            fail_rename,
+        )
+
+        with pytest.raises(WorkspaceFailure) as captured:
+            run_workspace.diagnostics.location(
+                "run.json"
+            ).publish_bytes_atomically(b"manifest")
+
+        assert captured.value.diagnostics["reason_code"] == expected_reason
+        assert freeze_error_diagnostics(
+            captured.value.error_code,
+            captured.value.diagnostics,
+        ) == captured.value.diagnostics
+        assert not (diagnostic_directory / "run.json").exists()
+        assert not list(
+            diagnostic_directory.glob(".workspace-create-*")
+        )
 
 
 def test_atomic_publish_syncs_private_data_before_same_directory_no_replace(
@@ -2369,6 +2420,73 @@ def test_scoped_binary_effect_does_not_expose_a_duplicable_file_descriptor(
     assert retained_streams[0].closed
     with pytest.raises(ValueError, match="作用域"):
         retained_streams[0].write(b"outside")
+
+
+def test_scoped_binary_effect_syncs_file_data_on_close(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    original_sync = workspace_module._sync_file_data
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        syncs = []
+
+        def observe_sync(descriptor):
+            syncs.append(Path(os.readlink(f"/proc/self/fd/{descriptor}")))
+            return original_sync(descriptor)
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_sync_file_data",
+            observe_sync,
+        )
+        location = run_workspace.diagnostics.location("events.jsonl")
+        location.use_binary("wb", lambda stream: stream.write(b"event\n"))
+
+        assert location.read_bytes() == b"event\n"
+
+    assert len(syncs) == 1
+    assert syncs[0].name == "events.jsonl"
+
+
+def test_scoped_binary_close_sync_failure_has_a_stable_phase(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        location = run_workspace.diagnostics.location("events.jsonl")
+
+        def fail_sync(_descriptor):
+            raise OSError(errno.EIO, "injected")
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_sync_file_data",
+            fail_sync,
+        )
+
+        with pytest.raises(WorkspaceFailure) as captured:
+            location.use_binary(
+                "wb",
+                lambda stream: stream.write(b"event\n"),
+            )
+
+        assert location.read_bytes() == b"event\n"
+
+    assert captured.value.diagnostics == {
+        "component": "workspace",
+        "operation": "workspace.access",
+        "reason_code": "filesystem.file_sync_failed",
+    }
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
 
 
 def test_lease_close_waits_for_scoped_file_effect_and_closes_its_stream(

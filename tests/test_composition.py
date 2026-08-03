@@ -13,6 +13,7 @@ from video_auto_editor.application import (
 )
 from video_auto_editor.application.readiness import (
     CommandResult,
+    InstallationObservation,
     Readiness,
     TLSObservation,
 )
@@ -44,6 +45,11 @@ class _CertifiedProbe:
 
     def is_virtual_environment(self) -> bool:
         return True
+
+    def installation_observation(self) -> InstallationObservation:
+        return InstallationObservation.verified(
+            manifest_sha256="a" * 64,
+        )
 
     def which(self, command: str) -> str | None:
         return f"/usr/bin/{command}"

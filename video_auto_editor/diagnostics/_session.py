@@ -158,15 +158,19 @@ class RunDiagnostics:
             ).encode("utf-8")
             + b"\n"
         )
-        append_failed = False
+        append_failure_reason: str | None = None
         try:
             store.append(encoded)
-        except (OSError, WorkspaceFailure):
-            append_failed = True
-        if append_failed:
+        except (OSError, WorkspaceFailure) as failure:
+            append_failure_reason = _diagnostics_failure_reason(
+                failure,
+                default="diagnostics.append_failed",
+                startup=True,
+            )
+        if append_failure_reason is not None:
             raise _startup_failure(
                 operation="diagnostics.append",
-                reason_code="diagnostics.append_failed",
+                reason_code=append_failure_reason,
             )
 
         instance = object.__new__(cls)
@@ -335,15 +339,19 @@ class RunDiagnostics:
         return snapshot.events
 
     def _publish_manifest(self, payload: bytes) -> None:
-        publish_failed = False
+        publish_failure_reason: str | None = None
         try:
             self._store.publish_manifest(payload)
-        except (OSError, WorkspaceFailure):
-            publish_failed = True
-        if publish_failed:
+        except (OSError, WorkspaceFailure) as failure:
+            publish_failure_reason = _diagnostics_failure_reason(
+                failure,
+                default="diagnostics.atomic_replace_failed",
+                startup=False,
+            )
+        if publish_failure_reason is not None:
             raise _runtime_failure(
                 operation="diagnostics.publish_manifest",
-                reason_code="diagnostics.atomic_replace_failed",
+                reason_code=publish_failure_reason,
             )
 
     def enter_stage(
@@ -1496,22 +1504,47 @@ class RunDiagnostics:
             + b"\n"
         )
 
-        append_failed = False
+        append_failure_reason: str | None = None
         try:
             self._store.append(encoded)
-        except (OSError, WorkspaceFailure):
-            append_failed = True
-        if append_failed:
+        except (OSError, WorkspaceFailure) as failure:
+            append_failure_reason = _diagnostics_failure_reason(
+                failure,
+                default="diagnostics.append_failed",
+                startup=False,
+            )
+        if append_failure_reason is not None:
             if self._postcommit_proof is not None:
                 self._postcommit_incomplete = True
                 return None
             self._finished = True
             raise _runtime_failure(
                 operation="diagnostics.append",
-                reason_code="diagnostics.append_failed",
+                reason_code=append_failure_reason,
             )
         self._sequence = sequence
         return sequence
+
+
+def _diagnostics_failure_reason(
+    failure: OSError | WorkspaceFailure,
+    *,
+    default: str,
+    startup: bool,
+) -> str:
+    if not isinstance(failure, WorkspaceFailure):
+        return default
+    workspace_reason = failure.diagnostics.get("reason_code")
+    if workspace_reason == "filesystem.file_sync_failed":
+        return "diagnostics.file_sync_failed"
+    if workspace_reason == "filesystem.directory_sync_failed":
+        return "diagnostics.directory_sync_failed"
+    if not startup and workspace_reason in {
+        "filesystem.atomic_replace_failed",
+        "filesystem.cross_device",
+    }:
+        return "diagnostics.atomic_replace_failed"
+    return default
 
 
 class StageDiagnostics:

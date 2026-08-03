@@ -11,15 +11,17 @@ import re
 import secrets
 import shutil
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
+from importlib import metadata
 from pathlib import Path
 from types import MappingProxyType
 from typing import cast
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from video_auto_editor.diagnostics import (
     CertifiedPlatform,
@@ -74,6 +76,82 @@ _MEDIA_PROBE_SRT = """1
 00:00:00,000 --> 00:00:00,900
 中文预检
 """
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_APPLICATION_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)*")
+_APT_SNAPSHOT_ID = re.compile(r"[0-9]{8}T[0-9]{6}Z")
+_PACKAGE_NAME = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9][a-z0-9-]*)?")
+_SAFE_FILENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,254}")
+_PYTHON_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+_INSTALLATION_FAILURE_REASONS = frozenset(
+    {
+        "manifest.digest_mismatch",
+        "manifest.missing",
+        "manifest.prefix_mismatch",
+        "manifest.schema_invalid",
+        "manifest.unreadable",
+        "manifest.version_mismatch",
+    }
+)
+_MAX_INSTALLATION_DOCUMENT_BYTES = 2 * 1024 * 1024
+_INSTALLATION_MANIFEST_FIELDS = frozenset(
+    {
+        "application",
+        "apt_snapshot_id",
+        "environment",
+        "installation_prefix",
+        "platform",
+        "python",
+        "runtime_lock",
+        "schema_version",
+        "snapshot_packages",
+        "system_packages",
+        "wheelhouse",
+    }
+)
+_SNAPSHOT_PACKAGE_NAMES = frozenset(
+    {
+        "ca-certificates",
+        "ffmpeg",
+        "fontconfig",
+        "fonts-noto-cjk",
+        "python3.12",
+        "python3.12-venv",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class InstallationObservation:
+    """安装清单与就绪标记的最小脱敏校验结果。"""
+
+    manifest_sha256: str | None
+    reason_code: str | None
+
+    def __post_init__(self) -> None:
+        if self.manifest_sha256 is not None and (
+            not isinstance(self.manifest_sha256, str)
+            or _SHA256.fullmatch(self.manifest_sha256) is None
+        ):
+            raise ValueError("安装清单摘要必须是规范 SHA-256")
+        if self.reason_code is not None and (
+            not isinstance(self.reason_code, str)
+            or self.reason_code not in _INSTALLATION_FAILURE_REASONS
+        ):
+            raise ValueError("安装清单失败原因必须来自稳定闭集")
+        if (self.manifest_sha256 is None) == (self.reason_code is None):
+            raise ValueError("安装清单观察必须且只能表达成功或失败")
+
+    @property
+    def valid(self) -> bool:
+        return self.manifest_sha256 is not None
+
+    @classmethod
+    def verified(cls, *, manifest_sha256: str) -> InstallationObservation:
+        return cls(manifest_sha256=manifest_sha256, reason_code=None)
+
+    @classmethod
+    def invalid(cls, reason_code: str) -> InstallationObservation:
+        return cls(manifest_sha256=None, reason_code=reason_code)
 
 
 class _LocalSystemProbe:
@@ -102,6 +180,135 @@ class _LocalSystemProbe:
 
     def is_virtual_environment(self) -> bool:
         return sys.prefix != sys.base_prefix
+
+    def installation_observation(self) -> InstallationObservation:
+        """校验当前版本目录中的安装清单与 READY 摘要绑定。"""
+        try:
+            environment_prefix = Path(sys.prefix).resolve(strict=True)
+            version_directory = environment_prefix.parent
+            installation_prefix = version_directory.parent.parent.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return InstallationObservation.invalid("manifest.unreadable")
+        if (
+            environment_prefix.name != "venv"
+            or version_directory.parent.name != "versions"
+        ):
+            return InstallationObservation.invalid("manifest.prefix_mismatch")
+
+        manifest_path = version_directory / "installation-manifest.json"
+        ready_path = version_directory / "READY"
+        if not manifest_path.exists() or not ready_path.exists():
+            return InstallationObservation.invalid("manifest.missing")
+        try:
+            version_descriptor = _open_anchored_directory(version_directory)
+            try:
+                manifest_bytes = _read_regular_installation_file_at(
+                    version_descriptor,
+                    "installation-manifest.json",
+                )
+                ready_bytes = _read_regular_installation_file_at(
+                    version_descriptor,
+                    "READY",
+                )
+                if not _directory_descriptor_matches_path(
+                    version_descriptor,
+                    version_directory,
+                ):
+                    raise OSError("版本目录读取期间发生替换")
+            finally:
+                os.close(version_descriptor)
+        except FileNotFoundError:
+            return InstallationObservation.invalid("manifest.missing")
+        except OSError:
+            return InstallationObservation.invalid("manifest.unreadable")
+
+        try:
+            manifest = _load_strict_json(manifest_bytes)
+            ready = _load_strict_json(ready_bytes)
+        except (UnicodeError, ValueError):
+            return InstallationObservation.invalid("manifest.schema_invalid")
+        if not isinstance(manifest, dict) or not isinstance(ready, dict):
+            return InstallationObservation.invalid("manifest.schema_invalid")
+        if (
+            not _installation_manifest_has_complete_shape(manifest)
+            or manifest.get("schema_version") != ("production-installation-manifest.v1")
+            or set(ready)
+            != {
+                "installation_manifest_sha256",
+                "schema_version",
+            }
+        ):
+            return InstallationObservation.invalid("manifest.schema_invalid")
+        if ready.get("schema_version") != "production-installation-ready.v1":
+            return InstallationObservation.invalid("manifest.schema_invalid")
+
+        digest = hashlib.sha256(manifest_bytes).hexdigest()
+        ready_digest = ready.get("installation_manifest_sha256")
+        if (
+            not isinstance(ready_digest, str)
+            or _SHA256.fullmatch(ready_digest) is None
+            or not secrets.compare_digest(digest, ready_digest)
+        ):
+            return InstallationObservation.invalid("manifest.digest_mismatch")
+
+        application = manifest.get("application")
+        try:
+            distribution = metadata.distribution("video-auto-editor")
+        except metadata.PackageNotFoundError:
+            distribution = None
+        if (
+            not isinstance(application, dict)
+            or application.get("name") != "video-auto-editor"
+            or distribution is None
+            or application.get("version") != distribution.version
+        ):
+            return InstallationObservation.invalid("manifest.version_mismatch")
+        if manifest.get("installation_prefix") != str(installation_prefix):
+            return InstallationObservation.invalid("manifest.prefix_mismatch")
+        if application.get("version") != version_directory.name:
+            return InstallationObservation.invalid("manifest.prefix_mismatch")
+        try:
+            python_executable = Path(os.path.abspath(sys.executable))
+            cli_executable = Path(sys.argv[0]).resolve(strict=True)
+            expected_python = environment_prefix / "bin" / "python"
+            expected_cli = environment_prefix / "bin" / "video-auto-editor"
+            distribution_root = Path(str(distribution.locate_file(""))).resolve(
+                strict=True
+            )
+            imported_module = Path(__file__).resolve(strict=True)
+            identity_paths = _distribution_identity_paths(distribution)
+        except (IndexError, OSError, RuntimeError, TypeError):
+            return InstallationObservation.invalid("manifest.prefix_mismatch")
+        if identity_paths is None:
+            return InstallationObservation.invalid("manifest.prefix_mismatch")
+        distribution_module, direct_url_path = identity_paths
+        if (
+            not python_executable.is_relative_to(environment_prefix)
+            or not cli_executable.is_relative_to(environment_prefix)
+            or not os.path.samefile(python_executable, expected_python)
+            or not os.path.samefile(cli_executable, expected_cli)
+            or not distribution_root.is_relative_to(environment_prefix)
+            or not imported_module.is_relative_to(environment_prefix)
+            or not distribution_module.is_relative_to(environment_prefix)
+            or not direct_url_path.is_relative_to(environment_prefix)
+            or not stat.S_ISREG(Path(__file__).lstat().st_mode)
+            or not stat.S_ISREG(distribution_module.lstat().st_mode)
+            or not os.path.samefile(imported_module, distribution_module)
+        ):
+            return InstallationObservation.invalid("manifest.prefix_mismatch")
+        try:
+            direct_url_bytes = _read_regular_installation_file(direct_url_path)
+            direct_url = _load_strict_json(direct_url_bytes)
+        except (OSError, UnicodeError, ValueError):
+            return InstallationObservation.invalid("manifest.digest_mismatch")
+        wheel = application["wheel"]
+        if not isinstance(wheel, dict) or not _direct_url_matches_wheel(
+            direct_url,
+            filename=wheel.get("filename"),
+            sha256=wheel.get("sha256"),
+        ):
+            return InstallationObservation.invalid("manifest.digest_mismatch")
+        return InstallationObservation.verified(manifest_sha256=digest)
 
     def which(self, command: str) -> str | None:
         return shutil.which(command)
@@ -158,6 +365,7 @@ class _LocalSystemProbe:
 @dataclass(frozen=True, slots=True)
 class _EnvironmentState:
     certified_platform: CertifiedPlatform | None
+    installation_fingerprint: str | None
     python_version: DetectedVersion | None
     ffmpeg_version: DetectedVersion | None
     ffprobe_version: DetectedVersion | None
@@ -183,17 +391,14 @@ class Readiness:
         """一次收集本地阻塞项；绝不调用 Adapter 的业务方法。"""
         if not isinstance(request, ReadinessRequest):
             raise TypeError("Readiness.check() 只接受 ReadinessRequest")
-        candidate = (
-            _LocalSystemProbe()
-            if _system_probe is None
-            else _system_probe
-        )
+        candidate = _LocalSystemProbe() if _system_probe is None else _system_probe
         _validate_system_probe(candidate)
         probe = cast(_LocalSystemProbe, candidate)
         issues: list[ReadinessIssue] = []
 
         certified_platform, platform_observation = _check_platform(probe, issues)
         python_version, python_observation = _check_python(probe, issues)
+        installation_fingerprint = _check_installation(probe, issues)
         (
             ffmpeg_version,
             ffprobe_version,
@@ -208,6 +413,7 @@ class Readiness:
         ready = not unique_issues
         state = _EnvironmentState(
             certified_platform=certified_platform,
+            installation_fingerprint=installation_fingerprint,
             python_version=python_version,
             ffmpeg_version=ffmpeg_version,
             ffprobe_version=ffprobe_version,
@@ -247,6 +453,7 @@ def _validate_system_probe(probe: object) -> None:
         "python_implementation",
         "python_version",
         "is_virtual_environment",
+        "installation_observation",
         "which",
         "run",
         "font_file_is_readable",
@@ -403,6 +610,29 @@ def _check_python(
             )
         )
     return detected, (implementation, version_text, in_virtual_environment)
+
+
+def _check_installation(
+    probe: _LocalSystemProbe,
+    issues: list[ReadinessIssue],
+) -> str | None:
+    try:
+        observation = probe.installation_observation()
+        if not isinstance(observation, InstallationObservation):
+            raise TypeError
+    except Exception:  # noqa: BLE001 - 探针异常必须收敛为稳定失败
+        observation = InstallationObservation.invalid("manifest.unreadable")
+    if not observation.valid:
+        issues.append(
+            _issue(
+                ErrorCode.ENVIRONMENT_INSTALLATION_MANIFEST_INVALID,
+                component="installation_manifest",
+                operation="manifest.verify",
+                reason_code=observation.reason_code,
+            )
+        )
+        return None
+    return f"sha256:{observation.manifest_sha256}"
 
 
 def _check_media_and_font(
@@ -778,9 +1008,7 @@ def _media_smoke_test(
             cwd=smoke_directory,
             timeout_seconds=15,
         )
-        if probe_result.return_code != 0 or not _valid_smoke_probe(
-            probe_result.stdout
-        ):
+        if probe_result.return_code != 0 or not _valid_smoke_probe(probe_result.stdout):
             issues.extend(
                 (
                     _issue(
@@ -1104,10 +1332,11 @@ def _environment_projection(
     *,
     ready: bool,
 ) -> EnvironmentProjection:
-    fingerprint = _fingerprint(
+    fingerprint = state.installation_fingerprint or _fingerprint(
         {
             "font_available": state.font_available,
             "font_family": request.subtitle_font,
+            "installation_manifest": "invalid",
             "media": state.media_observation,
             "platform": state.platform_observation,
             "python": state.python_observation,
@@ -1202,6 +1431,357 @@ def _https_origin(endpoint: str) -> str | None:
             return None
     normalized_port = "" if port in {None, 443} else f":{port}"
     return f"https://{host}{normalized_port}"
+
+
+def _read_regular_installation_file(path: Path) -> bytes:
+    parent_descriptor = _open_anchored_directory(path.parent)
+    try:
+        return _read_regular_installation_file_at(parent_descriptor, path.name)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _open_anchored_directory(path: Path) -> int:
+    if not path.is_absolute():
+        raise OSError("安装记录父目录不是绝对路径")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    try:
+        for component in path.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _read_regular_installation_file_at(
+    parent_descriptor: int,
+    filename: str,
+) -> bytes:
+    parent_status = os.fstat(parent_descriptor)
+    metadata_result = os.stat(
+        filename,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
+    _validate_installation_file_status(metadata_result, parent_status)
+    descriptor = os.open(
+        filename,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=parent_descriptor,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        _validate_installation_file_status(opened, parent_status)
+        if _file_identity(opened) != _file_identity(metadata_result):
+            raise OSError("安装记录读取期间发生替换")
+        chunks: list[bytes] = []
+        remaining = _MAX_INSTALLATION_DOCUMENT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        contents = b"".join(chunks)
+        if len(contents) > _MAX_INSTALLATION_DOCUMENT_BYTES:
+            raise OSError("安装记录超过允许大小")
+        after_read = os.fstat(descriptor)
+        current = os.stat(
+            filename,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if _file_snapshot(after_read) != _file_snapshot(opened) or _file_snapshot(
+            current
+        ) != _file_snapshot(opened):
+            raise OSError("安装记录读取期间发生变化")
+        return contents
+    finally:
+        os.close(descriptor)
+
+
+def _validate_installation_file_status(
+    file_status: os.stat_result,
+    parent_status: os.stat_result,
+) -> None:
+    if (
+        not stat.S_ISREG(file_status.st_mode)
+        or file_status.st_nlink != 1
+        or file_status.st_dev != parent_status.st_dev
+        or file_status.st_uid != parent_status.st_uid
+        or stat.S_IMODE(file_status.st_mode) & 0o022
+    ):
+        raise OSError("安装记录不是受信常规文件")
+    if file_status.st_size > _MAX_INSTALLATION_DOCUMENT_BYTES:
+        raise OSError("安装记录超过允许大小")
+
+
+def _file_identity(status: os.stat_result) -> tuple[int, int]:
+    return status.st_dev, status.st_ino
+
+
+def _file_snapshot(status: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        status.st_nlink,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
+def _directory_descriptor_matches_path(descriptor: int, path: Path) -> bool:
+    try:
+        path_status = path.lstat()
+        opened_status = os.fstat(descriptor)
+    except OSError:
+        return False
+    return stat.S_ISDIR(path_status.st_mode) and _file_identity(
+        path_status
+    ) == _file_identity(opened_status)
+
+
+def _installation_manifest_has_complete_shape(manifest: dict[object, object]) -> bool:
+    application = manifest.get("application")
+    environment = manifest.get("environment")
+    platform_document = manifest.get("platform")
+    python_document = manifest.get("python")
+    runtime_lock = manifest.get("runtime_lock")
+    snapshot_packages = manifest.get("snapshot_packages")
+    system_packages = manifest.get("system_packages")
+    wheelhouse = manifest.get("wheelhouse")
+    if (
+        set(manifest) != _INSTALLATION_MANIFEST_FIELDS
+        or not isinstance(application, dict)
+        or set(application) != {"name", "version", "wheel"}
+        or not isinstance(application.get("wheel"), dict)
+        or set(application["wheel"]) != {"filename", "sha256"}
+        or not isinstance(environment, dict)
+        or set(environment)
+        != {"ffmpeg_version", "ffprobe_version", "font_family", "font_file"}
+        or not isinstance(platform_document, dict)
+        or set(platform_document)
+        != {"architecture", "operating_system", "operating_system_version"}
+        or not isinstance(python_document, dict)
+        or set(python_document) != {"implementation", "version"}
+        or not isinstance(runtime_lock, dict)
+        or set(runtime_lock) != {"filename", "sha256"}
+        or not isinstance(snapshot_packages, dict)
+        or not isinstance(system_packages, dict)
+        or not isinstance(wheelhouse, list)
+    ):
+        return False
+    artifacts_are_shaped = all(
+        isinstance(artifact, dict) and set(artifact) == {"filename", "sha256"}
+        for artifact in wheelhouse
+    )
+    if not artifacts_are_shaped:
+        return False
+    wheel = application["wheel"]
+    if not isinstance(wheel, dict):
+        return False
+    digests = [
+        wheel["sha256"],
+        runtime_lock["sha256"],
+        *(artifact["sha256"] for artifact in wheelhouse),
+    ]
+    if not all(
+        isinstance(digest, str) and _SHA256.fullmatch(digest) is not None
+        for digest in digests
+    ):
+        return False
+    scalar_texts = (
+        manifest.get("installation_prefix"),
+        environment["ffmpeg_version"],
+        environment["ffprobe_version"],
+        environment["font_family"],
+        environment["font_file"],
+    )
+    if not all(_is_safe_manifest_text(value) for value in scalar_texts):
+        return False
+    apt_snapshot_id = manifest.get("apt_snapshot_id")
+    if (
+        manifest.get("schema_version") != "production-installation-manifest.v1"
+        or application["name"] != "video-auto-editor"
+        or not isinstance(application["version"], str)
+        or _APPLICATION_VERSION.fullmatch(application["version"]) is None
+        or not _is_safe_filename(wheel["filename"], suffix=".whl")
+        or not _is_safe_filename(runtime_lock["filename"])
+        or not isinstance(apt_snapshot_id, str)
+        or _APT_SNAPSHOT_ID.fullmatch(apt_snapshot_id) is None
+        or platform_document
+        != {
+            "architecture": "amd64",
+            "operating_system": "ubuntu",
+            "operating_system_version": "24.04",
+        }
+        or python_document.get("implementation") != "CPython"
+        or not _is_certified_python_version(python_document.get("version"))
+        or not _is_absolute_manifest_path(manifest.get("installation_prefix"))
+        or not _is_absolute_manifest_path(environment["font_file"])
+        or not _is_package_inventory(snapshot_packages)
+        or set(snapshot_packages) != _SNAPSHOT_PACKAGE_NAMES
+        or not _is_package_inventory(system_packages)
+        or any(
+            system_packages.get(name) != version
+            for name, version in snapshot_packages.items()
+        )
+    ):
+        return False
+    wheelhouse_filenames = [artifact["filename"] for artifact in wheelhouse]
+    return (
+        all(
+            _is_safe_filename(filename, suffix=".whl")
+            for filename in wheelhouse_filenames
+        )
+        and len(set(wheelhouse_filenames)) == len(wheelhouse_filenames)
+        and wheelhouse_filenames == sorted(wheelhouse_filenames)
+    )
+
+
+def _is_safe_manifest_text(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 4096
+        and all(ord(character) >= 32 and ord(character) != 127 for character in value)
+    )
+
+
+def _is_safe_filename(value: object, *, suffix: str | None = None) -> bool:
+    return (
+        isinstance(value, str)
+        and _SAFE_FILENAME.fullmatch(value) is not None
+        and (suffix is None or value.endswith(suffix))
+    )
+
+
+def _is_absolute_manifest_path(value: object) -> bool:
+    if not _is_safe_manifest_text(value):
+        return False
+    try:
+        return Path(cast(str, value)).is_absolute()
+    except (OSError, ValueError):
+        return False
+
+
+def _is_certified_python_version(value: object) -> bool:
+    if not isinstance(value, str) or _PYTHON_VERSION.fullmatch(value) is None:
+        return False
+    version = tuple(int(part) for part in value.split("."))
+    return _PYTHON_MINIMUM <= version < _PYTHON_MAXIMUM
+
+
+def _is_package_inventory(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and bool(value)
+        and all(
+            isinstance(name, str)
+            and _PACKAGE_NAME.fullmatch(name) is not None
+            and _is_safe_manifest_text(version)
+            for name, version in value.items()
+        )
+    )
+
+
+def _distribution_identity_paths(
+    distribution: metadata.Distribution,
+) -> tuple[Path, Path] | None:
+    files = distribution.files
+    if files is None:
+        return None
+    module_entry = None
+    direct_url_entries = []
+    for entry in files:
+        relative = Path(str(entry))
+        if relative.is_absolute() or ".." in relative.parts:
+            return None
+        if relative.as_posix() == "video_auto_editor/application/readiness.py":
+            if module_entry is not None:
+                return None
+            module_entry = entry
+        if relative.name == "direct_url.json" and relative.parent.name.endswith(
+            ".dist-info"
+        ):
+            direct_url_entries.append(entry)
+    if module_entry is None or len(direct_url_entries) != 1:
+        return None
+    module_path = Path(str(distribution.locate_file(module_entry))).resolve(strict=True)
+    direct_url_path = Path(
+        str(distribution.locate_file(direct_url_entries[0]))
+    ).resolve(strict=True)
+    return module_path, direct_url_path
+
+
+def _direct_url_matches_wheel(
+    document: object,
+    *,
+    filename: object,
+    sha256: object,
+) -> bool:
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"archive_info", "url"}
+        or not isinstance(document.get("archive_info"), dict)
+        or not isinstance(document.get("url"), str)
+        or not _is_safe_filename(filename, suffix=".whl")
+        or not isinstance(sha256, str)
+        or _SHA256.fullmatch(sha256) is None
+    ):
+        return False
+    archive_info = document["archive_info"]
+    if not isinstance(archive_info, dict) or not set(archive_info).issubset(
+        {"hash", "hashes"}
+    ):
+        return False
+    hashes = archive_info.get("hashes")
+    if not isinstance(hashes, dict) or set(hashes) != {"sha256"}:
+        return False
+    recorded_sha256 = hashes.get("sha256")
+    if (
+        not isinstance(recorded_sha256, str)
+        or _SHA256.fullmatch(recorded_sha256) is None
+        or not secrets.compare_digest(recorded_sha256, sha256)
+    ):
+        return False
+    legacy_hash = archive_info.get("hash")
+    if legacy_hash is not None and legacy_hash != f"sha256={sha256}":
+        return False
+    try:
+        origin = urlsplit(document["url"])
+    except (TypeError, ValueError):
+        return False
+    return (
+        origin.scheme == "file"
+        and origin.netloc in {"", "localhost"}
+        and Path(unquote(origin.path)).name == filename
+    )
+
+
+def _load_strict_json(payload: bytes) -> object:
+    return json.loads(
+        payload,
+        object_pairs_hook=_unique_json_object,
+        parse_constant=_reject_non_finite_json_number,
+    )
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    document: dict[str, object] = {}
+    for key, value in pairs:
+        if key in document:
+            raise ValueError("JSON 文档包含重复字段")
+        document[key] = value
+    return document
+
+
+def _reject_non_finite_json_number(value: str) -> object:
+    raise ValueError(f"JSON 文档包含非有限数字：{value}")
 
 
 __all__ = ["Readiness"]

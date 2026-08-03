@@ -10,6 +10,7 @@ import pytest
 import video_auto_editor.application as application_api
 import video_auto_editor.workspace._workspace as workspace_effects
 from tests.support.deterministic_composition import (
+    ProductionFailureInjection,
     compose_deterministic_live_application,
 )
 from video_auto_editor.application import (
@@ -35,6 +36,7 @@ from video_auto_editor.runtime.identity import (
     TranscriptChunkId,
     TranscriptId,
 )
+from video_auto_editor.source_analysis import SourceAnalysisFailure
 from video_auto_editor.workspace import (
     ManagedPathCapability,
     RunWorkspace,
@@ -52,6 +54,29 @@ EXPECTED_STAGES = [
     "delivery_verification",
     "publishing",
 ]
+
+
+def test_production_failure_injection_derives_public_error_from_failure_type(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+
+    outcome = compose_deterministic_live_application(
+        failure_injection=ProductionFailureInjection(
+            stage=RunStage.SOURCE_ANALYSIS,
+            failure_factory=lambda: SourceAnalysisFailure(
+                ErrorCode.INPUT_UNSUPPORTED,
+                {},
+            ),
+        )
+    ).execute(LiveRunRequest(source, workspace_dir=tmp_path / "workspace"))
+
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.primary_error_code is ErrorCode.INPUT_UNSUPPORTED
+    assert outcome.primary_error is not None
+    assert outcome.primary_error.stage is RunStage.SOURCE_ANALYSIS
+    assert outcome.primary_error.module is ErrorModule.SOURCE_ANALYSIS
 
 
 def test_application_package_exposes_one_business_entry_and_terminal_contract():
@@ -1250,6 +1275,46 @@ def test_cleanup_failure_is_associated_after_primary_stage_failure(
     assert not (workspace / "work" / "tmp" / str(outcome.run_id)).exists()
 
 
+@pytest.mark.parametrize(
+    ("failure_stage", "primary_error_code", "exit_code"),
+    [
+        (
+            RunStage.DELIVERY_VERIFICATION,
+            ErrorCode.DELIVERY_VERIFICATION_FAILED,
+            ExitCode.DELIVERY_FAILED,
+        ),
+        (
+            RunStage.PUBLISHING,
+            ErrorCode.PUBLICATION_COMMIT_FAILED,
+            ExitCode.PUBLICATION_FAILED,
+        ),
+    ],
+)
+def test_unpublished_delivery_cleanup_failure_keeps_its_stable_delivery_code(
+    tmp_path,
+    failure_stage,
+    primary_error_code,
+    exit_code,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"deterministic source")
+    workspace = tmp_path / "workspace"
+
+    outcome = compose_deterministic_live_application(
+        failure_stage=failure_stage,
+        cleanup_failure_before_delete=True,
+    ).execute(LiveRunRequest(source, workspace_dir=workspace))
+
+    assert outcome.state is LiveRunState.FAILED
+    assert outcome.exit_code is exit_code
+    assert outcome.primary_error_code is primary_error_code
+    assert tuple(error.error_code for error in outcome.associated_errors) == (
+        ErrorCode.DELIVERY_CLEANUP_FAILED,
+    )
+    assert outcome.associated_errors[0].module is ErrorModule.DELIVERY_BUILD
+    assert outcome.recovery_incomplete is True
+
+
 def test_aggregate_stage_failure_records_ordered_associated_errors(
     tmp_path,
 ):
@@ -1363,14 +1428,37 @@ def test_malformed_associated_failures_do_not_mask_primary_failure(
     assert not (workspace / "work" / "tmp" / str(outcome.run_id)).exists()
 
 
-def test_cleanup_failure_does_not_replace_interruption_exit_code(
+@pytest.mark.parametrize(
+    ("interruption_stage", "cleanup_error_code", "cleanup_module"),
+    [
+        (
+            RunStage.DELIVERY_BUILD,
+            ErrorCode.WORKSPACE_CLEANUP_FAILED,
+            ErrorModule.WORKSPACE,
+        ),
+        (
+            RunStage.DELIVERY_VERIFICATION,
+            ErrorCode.DELIVERY_CLEANUP_FAILED,
+            ErrorModule.DELIVERY_BUILD,
+        ),
+        (
+            RunStage.PUBLISHING,
+            ErrorCode.DELIVERY_CLEANUP_FAILED,
+            ErrorModule.DELIVERY_BUILD,
+        ),
+    ],
+)
+def test_cleanup_failure_classification_follows_actual_delivery_staging(
     tmp_path,
+    interruption_stage,
+    cleanup_error_code,
+    cleanup_module,
 ):
     source = tmp_path / "course.mp4"
     source.write_bytes(b"deterministic source")
     workspace = tmp_path / "workspace"
     application = compose_deterministic_live_application(
-        interruption_stage=RunStage.PUBLISHING,
+        interruption_stage=interruption_stage,
         interruption_signal=InterruptionSignal.SIGINT,
         cleanup_failure=True,
     )
@@ -1385,8 +1473,9 @@ def test_cleanup_failure_does_not_replace_interruption_exit_code(
     assert len(outcome.associated_errors) == 1
     assert (
         outcome.associated_errors[0].error_code
-        is ErrorCode.WORKSPACE_CLEANUP_FAILED
+        is cleanup_error_code
     )
+    assert outcome.associated_errors[0].module is cleanup_module
     assert outcome.recovery_incomplete is True
 
 
@@ -2107,8 +2196,9 @@ def test_publication_rollback_failure_marks_recovery_incomplete(
     assert len(outcome.associated_errors) == 1
     assert (
         outcome.associated_errors[0].error_code
-        is ErrorCode.WORKSPACE_CLEANUP_FAILED
+        is ErrorCode.DELIVERY_CLEANUP_FAILED
     )
+    assert outcome.associated_errors[0].module is ErrorModule.DELIVERY_BUILD
     interrupted_temporary = (
         workspace / "work" / "tmp" / str(outcome.run_id)
     )

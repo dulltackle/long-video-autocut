@@ -237,10 +237,7 @@ class StdlibStepAudioTransport:
             issues.append(_tls_issue("tls.ca_store_unavailable"))
         else:
             try:
-                if (
-                    context.check_hostname is not True
-                    or context.verify_mode != ssl.CERT_REQUIRED
-                ):
+                if not _tls_verification_enabled(context):
                     issues.append(
                         _tls_issue("tls.verification_unavailable")
                     )
@@ -287,6 +284,10 @@ class StdlibStepAudioTransport:
 
         try:
             context = self._tls_context_factory()
+            if not _tls_verification_enabled(context):
+                raise StepAudioTransportFailure(
+                    StepAudioTransportFailureKind.TLS_FAILED
+                )
             proxy = self._resolve_proxy(endpoint)
             connection = self._new_connection(
                 endpoint,
@@ -506,6 +507,17 @@ def _system_tls_context() -> ssl.SSLContext:
     context.verify_mode = ssl.CERT_REQUIRED
     context.set_alpn_protocols(["http/1.1"])
     return context
+
+
+def _tls_verification_enabled(context: object) -> bool:
+    candidate: Any = context
+    try:
+        return (
+            candidate.check_hostname is True
+            and candidate.verify_mode == ssl.CERT_REQUIRED
+        )
+    except Exception:  # noqa: BLE001 - 注入的 TLS context 形态不可假定
+        return False
 
 
 def _parse_endpoint(value: str) -> _Endpoint | None:

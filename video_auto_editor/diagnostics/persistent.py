@@ -55,6 +55,10 @@ class _PersistentDiagnosticStore:
         return DiagnosticPackageSnapshot(events=events, manifest=manifest)
 
     def publish_manifest(self, payload: bytes) -> None:
+        self._directory.location("events.jsonl").use_binary(
+            "ab",
+            lambda _stream: None,
+        )
         self._directory.location("run.json").publish_bytes_atomically(
             payload
         )

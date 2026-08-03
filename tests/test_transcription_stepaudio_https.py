@@ -33,6 +33,24 @@ class _FakeTlsContext:
         return {"x509_ca": 1}
 
 
+class _HostnameVerificationDisabledTlsContext:
+    check_hostname = False
+    verify_mode = ssl.CERT_REQUIRED
+
+    @staticmethod
+    def cert_store_stats():
+        return {"x509_ca": 1}
+
+
+class _CertificateVerificationDisabledTlsContext:
+    check_hostname = True
+    verify_mode = ssl.CERT_NONE
+
+    @staticmethod
+    def cert_store_stats():
+        return {"x509_ca": 1}
+
+
 class _FakeSocket:
     def __init__(self, closed: Event) -> None:
         self.closed = closed
@@ -232,6 +250,51 @@ def test_readiness_uses_verified_system_tls_without_honoring_ssl_key_log(
     assert not key_log.exists()
 
 
+def test_readiness_reports_non_https_endpoint_without_disclosing_it():
+    endpoint = "http://endpoint-secret.example.test/v1/audio/asr/sse"
+    transport = StdlibStepAudioTransport(
+        endpoint,
+        _tls_context_factory=_FakeTlsContext,
+        _proxy_getter=dict,
+    )
+
+    issues = transport.check_readiness()
+
+    assert len(issues) == 1
+    assert issues[0].error_code is ErrorCode.CONFIG_HTTPS_REQUIRED
+    assert issues[0].diagnostics == {
+        "field": "transcription_provider_config.endpoint"
+    }
+    assert endpoint not in repr(issues)
+    assert endpoint not in repr(transport)
+
+
+@pytest.mark.parametrize(
+    "context_factory",
+    [
+        _HostnameVerificationDisabledTlsContext,
+        _CertificateVerificationDisabledTlsContext,
+    ],
+)
+def test_readiness_rejects_disabled_tls_verification(context_factory):
+    transport = StdlibStepAudioTransport(
+        _ENDPOINT,
+        _tls_context_factory=context_factory,
+        _proxy_getter=dict,
+        _proxy_bypass=lambda _host: True,
+    )
+
+    issues = transport.check_readiness()
+
+    assert len(issues) == 1
+    assert issues[0].error_code is ErrorCode.ENVIRONMENT_TLS_CA_UNAVAILABLE
+    assert issues[0].diagnostics == {
+        "component": "tls_ca",
+        "operation": "tls.load_ca",
+        "reason_code": "tls.verification_unavailable",
+    }
+
+
 def test_readiness_reports_invalid_https_proxy_without_disclosing_value():
     secret_proxy = "https://proxy-user:proxy-secret@proxy.example.test:8443"
     transport = StdlibStepAudioTransport(
@@ -251,6 +314,57 @@ def test_readiness_reports_invalid_https_proxy_without_disclosing_value():
     }
     assert secret_proxy not in repr(issues)
     assert "proxy-secret" not in repr(transport)
+
+
+@pytest.mark.parametrize(
+    "context_factory",
+    [
+        _HostnameVerificationDisabledTlsContext,
+        _CertificateVerificationDisabledTlsContext,
+    ],
+)
+def test_send_refuses_tls_context_without_hostname_or_certificate_verification(
+    context_factory,
+):
+    factory = _ConnectionFactory(_FakeResponse(b""))
+    transport = StdlibStepAudioTransport(
+        _ENDPOINT,
+        _connection_factory=factory,
+        _tls_context_factory=context_factory,
+        _proxy_getter=dict,
+        _proxy_bypass=lambda _host: True,
+    )
+
+    with pytest.raises(StepAudioTransportFailure) as captured:
+        transport.send(_request(), CancellationSource().token)
+
+    assert captured.value.kind is StepAudioTransportFailureKind.TLS_FAILED
+    assert factory.connections == []
+    assert "credential-canary" not in repr(captured.value)
+
+
+def test_send_refuses_non_https_endpoint_without_connecting():
+    endpoint = "http://endpoint-secret.example.test/v1/audio/asr/sse"
+    factory = _ConnectionFactory(_FakeResponse(b""))
+    transport = StdlibStepAudioTransport(
+        endpoint,
+        _connection_factory=factory,
+        _tls_context_factory=_FakeTlsContext,
+        _proxy_getter=dict,
+    )
+    request = StepAudioTransportRequest(
+        endpoint=endpoint,
+        credential="credential-canary",
+        body=b'{"audio":"body-canary"}',
+        timeout_seconds=3,
+    )
+
+    with pytest.raises(StepAudioTransportFailure) as captured:
+        transport.send(request, CancellationSource().token)
+
+    assert captured.value.kind is StepAudioTransportFailureKind.CONNECTION_FAILED
+    assert factory.connections == []
+    assert endpoint not in repr(captured.value)
 
 
 def test_send_uses_fixed_request_whitelist_and_returns_bounded_response():
@@ -512,6 +626,28 @@ def test_incomplete_and_oversized_responses_are_bounded_and_stable():
         is StepAudioTransportFailureKind.RESPONSE_TOO_LARGE
     )
     assert oversized.read_calls == 0
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Content-Encoding": "gzip"},
+        {"Transfer-Encoding": "gzip"},
+    ],
+)
+def test_encoded_responses_are_rejected_before_reading_body(headers):
+    response = _FakeResponse(b"encoded-body-canary", headers=headers)
+    transport = _transport(_ConnectionFactory(response))
+
+    with pytest.raises(StepAudioTransportFailure) as captured:
+        transport.send(_request(), CancellationSource().token)
+
+    assert (
+        captured.value.kind
+        is StepAudioTransportFailureKind.RESPONSE_PROTOCOL_INVALID
+    )
+    assert response.read_calls == 0
+    assert "encoded-body-canary" not in repr(captured.value)
 
 
 class _BlockingConnection(_FakeConnection):

@@ -1,0 +1,60 @@
+{
+  "schema_version": "keyless_gate_manifest.v1",
+  "layers": {
+    "unit_schema": [
+      "tests/test_clip_finalization.py",
+      "tests/test_delivery_capability.py",
+      "tests/test_delivery_manifest_reader.py",
+      "tests/test_diagnostics_cache_matrix.py",
+      "tests/test_diagnostics_delivery_notices.py",
+      "tests/test_diagnostics_lifecycle.py",
+      "tests/test_diagnostics_reader.py",
+      "tests/test_documentation_validation.py",
+      "tests/test_run_interpretation.py",
+      "tests/test_runtime_errors.py",
+      "tests/test_runtime_identity.py",
+      "tests/test_transcription_reconciliation.py",
+      "tests/test_workspace_tree_inspection.py"
+    ],
+    "module_interfaces": [
+      "tests/test_application_cache_maintenance.py",
+      "tests/test_clip_planning.py",
+      "tests/test_configuration.py",
+      "tests/test_delivery_build.py",
+      "tests/test_delivery_verification.py",
+      "tests/test_readiness.py",
+      "tests/test_source_analysis.py",
+      "tests/test_subtitle_optimization.py",
+      "tests/test_topic_review.py",
+      "tests/test_transcription.py",
+      "tests/test_workspace.py"
+    ],
+    "adapter_contracts": [
+      "tests/test_cache.py",
+      "tests/test_diagnostics.py",
+      "tests/test_text_model_contract.py",
+      "tests/test_text_model_stepfun.py",
+      "tests/test_text_model_stepfun_https.py",
+      "tests/test_transcription_contract.py",
+      "tests/test_transcription_stepaudio.py",
+      "tests/test_transcription_stepaudio_audio.py",
+      "tests/test_transcription_stepaudio_https.py"
+    ],
+    "fault_injection": [
+      "tests/test_application_live.py",
+      "tests/test_application_live_transcription.py",
+      "tests/test_diagnostics_failures.py",
+      "tests/test_keyless_fault_matrix.py",
+      "tests/test_publication.py",
+      "tests/test_runtime_cancellation.py"
+    ],
+    "installation_contract": [
+      "tests/test_cli.py",
+      "tests/test_composition.py",
+      "tests/test_keyless_gate.py",
+      "tests/test_package_structure.py",
+      "tests/test_production_installation.py",
+      "tests/test_release_surface.py"
+    ]
+  }
+}

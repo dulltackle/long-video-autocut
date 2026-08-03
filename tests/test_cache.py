@@ -2,6 +2,7 @@ import errno
 import hashlib
 import json
 import multiprocessing
+import os
 import signal
 import stat
 import subprocess
@@ -961,12 +962,18 @@ def test_filesystem_data_sync_failure_is_a_formal_cache_failure(
     source.write_bytes(b"source")
     workspace = Workspace.open(source, tmp_path / "workspace")
     entry = _text_entry()
+    existing = _text_entry("c" * 64)
     token = CancellationSource().token
 
     with workspace.acquire_run(RunId.new()) as run_workspace:
         repository = initialize_cache_repository(
             run_workspace.cache,
             application_version="4.7.0",
+        )
+        repository.resolve(
+            existing,
+            cancellation=token,
+            compute=lambda: "既有缓存",
         )
         repository.claim(
             entry.identity,
@@ -989,12 +996,154 @@ def test_filesystem_data_sync_failure_is_a_formal_cache_failure(
                 cancellation=token,
                 compute=lambda: "同步失败不得成功",
             )
+        existing_value = repository.lookup(
+            existing,
+            cancellation=token,
+        ).value
 
     _assert_formal_cache_failure(
         captured,
         operation="cache.publish",
-        reason_code="cache.write_failed",
+        reason_code="cache.file_sync_failed",
     )
+    assert existing_value == "既有缓存"
+
+
+def test_filesystem_atomic_replace_failure_is_a_formal_cache_failure(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    entry = _text_entry()
+    existing = _text_entry("c" * 64)
+    token = CancellationSource().token
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        repository = initialize_cache_repository(
+            run_workspace.cache,
+            application_version="4.7.0",
+        )
+        repository.resolve(
+            existing,
+            cancellation=token,
+            compute=lambda: "既有缓存",
+        )
+        repository.claim(
+            entry.identity,
+            cancellation=token,
+            effect=lambda claim: claim.lookup(entry),
+        )
+        original_rename = workspace_module._rename_no_replace
+
+        def fail_atomic_replace(
+            source_parent,
+            source_name,
+            target_parent,
+            target_name,
+        ):
+            if target_name.endswith(".json"):
+                raise OSError(errno.EIO, "injected")
+            return original_rename(
+                source_parent,
+                source_name,
+                target_parent,
+                target_name,
+            )
+
+        monkeypatch.setattr(
+            workspace_module,
+            "_rename_no_replace",
+            fail_atomic_replace,
+        )
+
+        with pytest.raises(CacheFailure) as captured:
+            repository.resolve(
+                entry,
+                cancellation=token,
+                compute=lambda: "原子替换失败不得成功",
+            )
+
+        observation = repository.lookup(
+            entry,
+            cancellation=token,
+        ).observation
+        existing_value = repository.lookup(
+            existing,
+            cancellation=token,
+        ).value
+
+    _assert_formal_cache_failure(
+        captured,
+        operation="cache.publish",
+        reason_code="cache.atomic_replace_failed",
+    )
+    assert observation.outcome is CacheOutcome.MISS
+    assert existing_value == "既有缓存"
+
+
+def test_filesystem_parent_sync_failure_is_a_formal_cache_failure(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    entry = _text_entry()
+    existing = _text_entry("c" * 64)
+    token = CancellationSource().token
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        repository = initialize_cache_repository(
+            run_workspace.cache,
+            application_version="4.7.0",
+        )
+        repository.resolve(
+            existing,
+            cancellation=token,
+            compute=lambda: "既有缓存",
+        )
+        repository.claim(
+            entry.identity,
+            cancellation=token,
+            effect=lambda claim: claim.lookup(entry),
+        )
+        entry_parent = (
+            workspace.root
+            / "work"
+            / "cache"
+            / entry.identity.namespace.value
+            / entry.identity.digest[:2]
+        )
+        original_fsync = os.fsync
+
+        def fail_parent_sync(descriptor):
+            if os.readlink(f"/proc/self/fd/{descriptor}") == str(
+                entry_parent
+            ):
+                raise OSError(errno.EIO, "injected")
+            return original_fsync(descriptor)
+
+        monkeypatch.setattr(os, "fsync", fail_parent_sync)
+
+        with pytest.raises(CacheFailure) as captured:
+            repository.resolve(
+                entry,
+                cancellation=token,
+                compute=lambda: "父目录同步失败不得报告成功",
+            )
+        existing_value = repository.lookup(
+            existing,
+            cancellation=token,
+        ).value
+
+    _assert_formal_cache_failure(
+        captured,
+        operation="cache.publish",
+        reason_code="cache.directory_sync_failed",
+    )
+    assert existing_value == "既有缓存"
 
 
 def test_filesystem_lock_failure_is_not_a_cache_miss(

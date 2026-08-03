@@ -1,11 +1,15 @@
+import hashlib
+import json
 import tempfile
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import video_auto_editor.application.readiness as readiness_module
 from video_auto_editor.application.readiness import (
     CommandResult,
+    InstallationObservation,
     ProviderBinding,
     ProviderPurpose,
     Readiness,
@@ -62,6 +66,11 @@ class _SystemProbe:
 
     def is_virtual_environment(self) -> bool:
         return True
+
+    def installation_observation(self) -> InstallationObservation:
+        return InstallationObservation.verified(
+            manifest_sha256="a" * 64,
+        )
 
     def which(self, command: str) -> str | None:
         return f"/usr/bin/{command}"
@@ -286,6 +295,575 @@ class _UnavailableSystemProbe(_SystemProbe):
 
     def tls_observation(self) -> TLSObservation:
         return TLSObservation(verification_enabled=False, ca_count=0)
+
+
+class _InvalidInstallationSystemProbe(_SystemProbe):
+    def installation_observation(self) -> InstallationObservation:
+        return InstallationObservation.invalid(
+            "manifest.digest_mismatch",
+        )
+
+
+def _production_installation_manifest(installation_prefix: Path) -> dict:
+    snapshot_packages = {
+        "ca-certificates": "20240203",
+        "ffmpeg": "7:6.1.1-3ubuntu5",
+        "fontconfig": "2.15.0-1.1ubuntu2",
+        "fonts-noto-cjk": "1:20230817+repack1-3",
+        "python3.12": "3.12.3-1ubuntu0.8",
+        "python3.12-venv": "3.12.3-1ubuntu0.8",
+    }
+    return {
+        "application": {
+            "name": "video-auto-editor",
+            "version": "4.7.0",
+            "wheel": {
+                "filename": "video_auto_editor-4.7.0-py3-none-any.whl",
+                "sha256": "1" * 64,
+            },
+        },
+        "apt_snapshot_id": "20260725T000000Z",
+        "environment": {
+            "ffmpeg_version": "6.1.1-3ubuntu5",
+            "ffprobe_version": "6.1.1-3ubuntu5",
+            "font_family": "Noto Sans CJK SC",
+            "font_file": "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        },
+        "installation_prefix": str(installation_prefix),
+        "platform": {
+            "architecture": "amd64",
+            "operating_system": "ubuntu",
+            "operating_system_version": "24.04",
+        },
+        "python": {
+            "implementation": "CPython",
+            "version": "3.12.3",
+        },
+        "runtime_lock": {
+            "filename": "requirements-runtime.lock",
+            "sha256": "2" * 64,
+        },
+        "schema_version": "production-installation-manifest.v1",
+        "snapshot_packages": snapshot_packages,
+        "system_packages": dict(snapshot_packages),
+        "wheelhouse": [],
+    }
+
+
+def _observe_local_installation(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    manifest: dict | None = None,
+    manifest_payload: bytes | None = None,
+    distribution_outside: bool = False,
+    version_container: str = "versions",
+    version_name: str = "4.7.0",
+    environment_name: str = "venv",
+    python_outside: bool = False,
+    cli_outside: bool = False,
+    shadow_import: bool = False,
+    direct_url_sha256: str = "1" * 64,
+    editable: bool = False,
+    swap_version_parent_on_manifest_open: bool = False,
+    installation_document_fault: str | None = None,
+    invoke_through_current: bool = False,
+) -> tuple[InstallationObservation, bytes]:
+    installation_prefix = tmp_path / "production"
+    version_directory = installation_prefix / version_container / version_name
+    environment_prefix = version_directory / environment_name
+    site_packages = environment_prefix / "lib" / "python3.12" / "site-packages"
+    distribution_module = (
+        site_packages / "video_auto_editor" / "application" / "readiness.py"
+    )
+    distribution_module.parent.mkdir(parents=True)
+    distribution_module.write_text("# installed module\n", encoding="utf-8")
+    imported_module = distribution_module
+    if shadow_import:
+        imported_module = (
+            environment_prefix
+            / "shadow"
+            / "video_auto_editor"
+            / "application"
+            / "readiness.py"
+        )
+        imported_module.parent.mkdir(parents=True)
+        imported_module.write_text("# shadow module\n", encoding="utf-8")
+    bin_directory = environment_prefix / "bin"
+    bin_directory.mkdir()
+    python_executable = bin_directory / "python"
+    cli_executable = bin_directory / "video-auto-editor"
+    python_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    cli_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    python_executable.chmod(0o755)
+    cli_executable.chmod(0o755)
+    invoked_cli = cli_executable
+    if invoke_through_current:
+        current = installation_prefix / "current"
+        current.symlink_to(Path("versions") / version_name, target_is_directory=True)
+        invoked_cli = current / environment_name / "bin" / "video-auto-editor"
+    outside_bin = tmp_path / "outside-bin"
+    outside_bin.mkdir()
+    outside_python = outside_bin / "python"
+    outside_cli = outside_bin / "video-auto-editor"
+    outside_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    outside_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    outside_python.chmod(0o755)
+    outside_cli.chmod(0o755)
+
+    document = (
+        _production_installation_manifest(installation_prefix)
+        if manifest is None
+        else manifest
+    )
+    manifest_bytes = (
+        (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
+        if manifest_payload is None
+        else manifest_payload
+    )
+    manifest_path = version_directory / "installation-manifest.json"
+    ready_path = version_directory / "READY"
+    manifest_path.write_bytes(manifest_bytes)
+    ready_path.write_text(
+        json.dumps(
+            {
+                "installation_manifest_sha256": hashlib.sha256(
+                    manifest_bytes
+                ).hexdigest(),
+                "schema_version": "production-installation-ready.v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    if installation_document_fault == "symlink":
+        external_manifest = tmp_path / "external-manifest.json"
+        external_manifest.write_bytes(manifest_bytes)
+        manifest_path.unlink()
+        manifest_path.symlink_to(external_manifest)
+    elif installation_document_fault == "nonregular":
+        ready_path.unlink()
+        ready_path.mkdir()
+    elif installation_document_fault == "oversized":
+        ready_path.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+
+    external_site_packages = tmp_path / "external-site-packages"
+    external_site_packages.mkdir()
+    distribution_root = (
+        external_site_packages if distribution_outside else site_packages
+    )
+    if distribution_outside:
+        external_module = (
+            distribution_root / "video_auto_editor" / "application" / "readiness.py"
+        )
+        external_module.parent.mkdir(parents=True)
+        external_module.write_text("# external module\n", encoding="utf-8")
+    direct_url_relative = Path("video_auto_editor-4.7.0.dist-info/direct_url.json")
+    direct_url_path = distribution_root / direct_url_relative
+    direct_url_path.parent.mkdir(parents=True, exist_ok=True)
+    direct_url = (
+        {
+            "dir_info": {"editable": True},
+            "url": (tmp_path / "checkout").as_uri(),
+        }
+        if editable
+        else {
+            "archive_info": {"hashes": {"sha256": direct_url_sha256}},
+            "url": (tmp_path / "video_auto_editor-4.7.0-py3-none-any.whl").as_uri(),
+        }
+    )
+    direct_url_path.write_text(json.dumps(direct_url), encoding="utf-8")
+
+    class _Distribution:
+        version = "4.7.0"
+        files = (
+            Path("video_auto_editor/application/readiness.py"),
+            direct_url_relative,
+        )
+
+        @staticmethod
+        def locate_file(relative_path):
+            if str(relative_path) in {"", "."}:
+                return distribution_root
+            return distribution_root / relative_path
+
+    monkeypatch.setattr(readiness_module.sys, "prefix", str(environment_prefix))
+    monkeypatch.setattr(
+        readiness_module.sys,
+        "executable",
+        str(outside_python if python_outside else python_executable),
+    )
+    monkeypatch.setattr(
+        readiness_module.sys,
+        "argv",
+        [str(outside_cli if cli_outside else invoked_cli)],
+    )
+    monkeypatch.setattr(readiness_module, "__file__", str(imported_module))
+    monkeypatch.setattr(
+        readiness_module.metadata,
+        "distribution",
+        lambda _name: _Distribution(),
+    )
+    if swap_version_parent_on_manifest_open:
+        original_open = readiness_module.os.open
+        replacement_performed = False
+
+        def _replace_parent_then_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal replacement_performed
+            if (
+                not replacement_performed
+                and Path(path).name == "installation-manifest.json"
+            ):
+                replacement_performed = True
+                moved = version_directory.with_name(f"{version_directory.name}.moved")
+                version_directory.rename(moved)
+                version_directory.symlink_to(moved, target_is_directory=True)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(readiness_module.os, "open", _replace_parent_then_open)
+    elif installation_document_fault == "replaced":
+        original_open = readiness_module.os.open
+        replacement_performed = False
+
+        def _replace_ready_then_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal replacement_performed
+            if not replacement_performed and Path(path).name == "READY":
+                replacement_performed = True
+                contents = ready_path.read_bytes()
+                ready_path.rename(ready_path.with_name("READY.old"))
+                ready_path.write_bytes(contents)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(readiness_module.os, "open", _replace_ready_then_open)
+    return (
+        readiness_module._LocalSystemProbe().installation_observation(),
+        manifest_bytes,
+    )
+
+
+def test_installation_manifest_identity_is_a_hard_local_readiness_requirement(
+    tmp_path,
+):
+    source = tmp_path / "course.mp4"
+    source.write_bytes(b"source")
+    workspace = Workspace.open(source, tmp_path / "workspace")
+    adapters = (
+        _TranscriptionAdapter(),
+        _TextCapability("a" * 64),
+        _TextCapability("a" * 64),
+    )
+
+    with workspace.acquire_run(RunId.new()) as run_workspace:
+        report = Readiness.check(
+            _request(run_workspace, adapters),
+            _system_probe=_InvalidInstallationSystemProbe(),
+        )
+
+    assert report.ready is False
+    assert tuple(issue.error_code for issue in report.issues) == (
+        ErrorCode.ENVIRONMENT_INSTALLATION_MANIFEST_INVALID,
+    )
+    assert report.issues[0].diagnostics == {
+        "component": "installation_manifest",
+        "operation": "manifest.verify",
+        "reason_code": "manifest.digest_mismatch",
+    }
+    assert report.environment_fact is not None
+    assert all(adapter.business_calls == 0 for adapter in adapters)
+
+
+@pytest.mark.parametrize("distribution_outside", [False, True])
+def test_local_installation_probe_binds_distribution_and_import_to_venv(
+    tmp_path,
+    monkeypatch,
+    distribution_outside,
+):
+    observation, manifest_bytes = _observe_local_installation(
+        tmp_path,
+        monkeypatch,
+        distribution_outside=distribution_outside,
+    )
+
+    if distribution_outside:
+        assert observation == InstallationObservation.invalid(
+            "manifest.prefix_mismatch"
+        )
+    else:
+        assert observation == InstallationObservation.verified(
+            manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest()
+        )
+
+
+def test_local_installation_probe_rejects_incomplete_manifest_schema(
+    tmp_path,
+    monkeypatch,
+):
+    installation_prefix = tmp_path / "production"
+    manifest = _production_installation_manifest(installation_prefix)
+    del manifest["application"]["wheel"]
+
+    observation, _ = _observe_local_installation(
+        tmp_path,
+        monkeypatch,
+        manifest=manifest,
+    )
+
+    assert observation == InstallationObservation.invalid("manifest.schema_invalid")
+
+
+def test_local_installation_probe_rejects_invalid_manifest_digest_field_type(
+    tmp_path,
+    monkeypatch,
+):
+    installation_prefix = tmp_path / "production"
+    manifest = _production_installation_manifest(installation_prefix)
+    manifest["application"]["wheel"]["sha256"] = 7
+
+    observation, _ = _observe_local_installation(
+        tmp_path,
+        monkeypatch,
+        manifest=manifest,
+    )
+
+    assert observation == InstallationObservation.invalid("manifest.schema_invalid")
+
+
+def test_local_installation_probe_rejects_duplicate_json_fields(
+    tmp_path,
+    monkeypatch,
+):
+    installation_prefix = tmp_path / "production"
+    manifest = _production_installation_manifest(installation_prefix)
+    canonical = json.dumps(manifest, sort_keys=True).encode("utf-8")
+    duplicate = (
+        b'{"schema_version":"production-installation-manifest.v1",'
+        + canonical[1:]
+        + b"\n"
+    )
+
+    observation, _ = _observe_local_installation(
+        tmp_path,
+        monkeypatch,
+        manifest_payload=duplicate,
+    )
+
+    assert observation == InstallationObservation.invalid("manifest.schema_invalid")
+
+
+def test_local_installation_probe_rejects_non_finite_json_numbers(
+    tmp_path,
+    monkeypatch,
+):
+    installation_prefix = tmp_path / "production"
+    manifest = _production_installation_manifest(installation_prefix)
+    manifest["environment"]["ffmpeg_version"] = float("nan")
+
+    observation, _ = _observe_local_installation(
+        tmp_path,
+        monkeypatch,
+        manifest=manifest,
+    )
+
+    assert observation == InstallationObservation.invalid("manifest.schema_invalid")
+
+
+def test_local_installation_probe_rejects_invalid_manifest_scalar_types(
+    tmp_path,
+    monkeypatch,
+):
+    installation_prefix = tmp_path / "production"
+    manifest = _production_installation_manifest(installation_prefix)
+    manifest["apt_snapshot_id"] = 20260725
+
+    observation, _ = _observe_local_installation(
+        tmp_path,
+        monkeypatch,
+        manifest=manifest,
+    )
+
+    assert observation == InstallationObservation.invalid("manifest.schema_invalid")
+
+
+@pytest.mark.parametrize(
+    "invalid_case",
+    [
+        "unknown_top_level",
+        "unknown_application_field",
+        "missing_environment_field",
+        "invalid_platform",
+        "unsupported_python",
+        "unsafe_runtime_lock_filename",
+        "relative_installation_prefix",
+        "relative_font_file",
+        "incomplete_snapshot_packages",
+        "mismatched_system_package",
+        "invalid_wheelhouse_entry",
+        "unsorted_wheelhouse",
+    ],
+)
+def test_local_installation_probe_strictly_validates_every_manifest_section(
+    tmp_path,
+    monkeypatch,
+    invalid_case,
+):
+    installation_prefix = tmp_path / "production"
+    manifest = _production_installation_manifest(installation_prefix)
+    if invalid_case == "unknown_top_level":
+        manifest["unknown"] = "value"
+    elif invalid_case == "unknown_application_field":
+        manifest["application"]["unknown"] = "value"
+    elif invalid_case == "missing_environment_field":
+        del manifest["environment"]["font_family"]
+    elif invalid_case == "invalid_platform":
+        manifest["platform"]["architecture"] = "x86_64"
+    elif invalid_case == "unsupported_python":
+        manifest["python"]["version"] = "3.13.0"
+    elif invalid_case == "unsafe_runtime_lock_filename":
+        manifest["runtime_lock"]["filename"] = "../requirements-runtime.lock"
+    elif invalid_case == "relative_installation_prefix":
+        manifest["installation_prefix"] = "production"
+    elif invalid_case == "relative_font_file":
+        manifest["environment"]["font_file"] = "NotoSansCJK-Regular.ttc"
+    elif invalid_case == "incomplete_snapshot_packages":
+        del manifest["snapshot_packages"]["ffmpeg"]
+    elif invalid_case == "mismatched_system_package":
+        manifest["system_packages"]["ffmpeg"] = "different"
+    elif invalid_case == "invalid_wheelhouse_entry":
+        manifest["wheelhouse"] = [
+            {"filename": "dependency.whl", "sha256": "3" * 64, "extra": True}
+        ]
+    elif invalid_case == "unsorted_wheelhouse":
+        manifest["wheelhouse"] = [
+            {"filename": "z.whl", "sha256": "3" * 64},
+            {"filename": "a.whl", "sha256": "4" * 64},
+        ]
+
+    observation, _ = _observe_local_installation(
+        tmp_path,
+        monkeypatch,
+        manifest=manifest,
+    )
+
+    assert observation == InstallationObservation.invalid("manifest.schema_invalid")
+
+
+@pytest.mark.parametrize(
+    ("version_container", "version_name", "environment_name"),
+    [
+        ("releases", "4.7.0", "venv"),
+        ("versions", "4.6.0", "venv"),
+        ("versions", "4.7.0", "environment"),
+    ],
+)
+def test_local_installation_probe_rejects_nonstandard_version_layout(
+    tmp_path,
+    monkeypatch,
+    version_container,
+    version_name,
+    environment_name,
+):
+    observation, _ = _observe_local_installation(
+        tmp_path,
+        monkeypatch,
+        version_container=version_container,
+        version_name=version_name,
+        environment_name=environment_name,
+    )
+
+    assert observation == InstallationObservation.invalid("manifest.prefix_mismatch")
+
+
+@pytest.mark.parametrize(
+    ("python_outside", "cli_outside"), [(True, False), (False, True)]
+)
+def test_local_installation_probe_binds_python_and_cli_to_version_environment(
+    tmp_path,
+    monkeypatch,
+    python_outside,
+    cli_outside,
+):
+    observation, _ = _observe_local_installation(
+        tmp_path,
+        monkeypatch,
+        python_outside=python_outside,
+        cli_outside=cli_outside,
+    )
+
+    assert observation == InstallationObservation.invalid("manifest.prefix_mismatch")
+
+
+def test_local_installation_probe_accepts_current_version_cli_symlink(
+    tmp_path,
+    monkeypatch,
+):
+    observation, manifest_bytes = _observe_local_installation(
+        tmp_path,
+        monkeypatch,
+        invoke_through_current=True,
+    )
+
+    assert observation == InstallationObservation.verified(
+        manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest()
+    )
+
+
+def test_local_installation_probe_rejects_in_prefix_shadow_import(
+    tmp_path,
+    monkeypatch,
+):
+    observation, _ = _observe_local_installation(
+        tmp_path,
+        monkeypatch,
+        shadow_import=True,
+    )
+
+    assert observation == InstallationObservation.invalid("manifest.prefix_mismatch")
+
+
+@pytest.mark.parametrize("editable", [False, True])
+def test_local_installation_probe_binds_distribution_to_manifest_wheel(
+    tmp_path,
+    monkeypatch,
+    editable,
+):
+    observation, _ = _observe_local_installation(
+        tmp_path,
+        monkeypatch,
+        direct_url_sha256="3" * 64,
+        editable=editable,
+    )
+
+    assert observation == InstallationObservation.invalid("manifest.digest_mismatch")
+
+
+def test_local_installation_probe_rejects_version_directory_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    observation, _ = _observe_local_installation(
+        tmp_path,
+        monkeypatch,
+        swap_version_parent_on_manifest_open=True,
+    )
+
+    assert observation == InstallationObservation.invalid("manifest.unreadable")
+
+
+@pytest.mark.parametrize(
+    "installation_document_fault",
+    ["symlink", "nonregular", "oversized", "replaced"],
+)
+def test_local_installation_probe_rejects_untrusted_installation_documents(
+    tmp_path,
+    monkeypatch,
+    installation_document_fault,
+):
+    observation, _ = _observe_local_installation(
+        tmp_path,
+        monkeypatch,
+        installation_document_fault=installation_document_fault,
+    )
+
+    assert observation == InstallationObservation.invalid("manifest.unreadable")
 
 
 def test_all_local_and_adapter_failures_are_collected_ordered_and_deduplicated(

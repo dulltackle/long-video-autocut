@@ -875,6 +875,7 @@ def _build_diagnostic_value_choices() -> Mapping[
             filesystem.marker_invalid filesystem.permission_denied
             filesystem.write_failed filesystem.file_sync_failed
             filesystem.directory_sync_failed filesystem.lock_failed
+            filesystem.atomic_replace_failed filesystem.cross_device
             workspace.ownership_changed workspace.symlink_encountered
             workspace.permission_denied workspace.io_failed
             """.split()

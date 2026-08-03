@@ -582,15 +582,20 @@ class _TerminalDiagnosticsFinalizer:
 
 
 class _ApplicationFailure(RuntimeError):
-    __slots__ = ("diagnostics", "error_code")
+    __slots__ = ("diagnostics", "error_code", "module")
 
     def __init__(
         self,
         error_code: ErrorCode,
         diagnostics: Mapping[str, object],
+        *,
+        module: ErrorModule = ErrorModule.APPLICATION,
     ) -> None:
+        if not isinstance(module, ErrorModule):
+            raise TypeError("应用稳定失败必须声明 ErrorModule")
         self.error_code = error_code
         self.diagnostics = MappingProxyType(dict(diagnostics))
+        self.module = module
         super().__init__("直播拆条运行发生稳定公共失败")
 
 
@@ -1387,7 +1392,10 @@ class LiveApplication:
             signal_number,
         )
         cleanup_started = self._monotonic_clock()
-        cleanup_failure = self._attempt_cleanup(run_workspace)
+        cleanup_failure = _classify_cleanup_failure(
+            _has_unpublished_delivery(run_workspace),
+            self._attempt_cleanup(run_workspace),
+        )
         associated_errors, recovery_incomplete = (
             self._record_cleanup_failure(
                 stage_diagnostics,
@@ -1591,9 +1599,13 @@ class LiveApplication:
         stage: StageDiagnostics,
         run_workspace: _AuditableRunWorkspace,
     ) -> tuple[tuple[RunError, ...], bool]:
+        cleanup_failure = _classify_cleanup_failure(
+            _has_unpublished_delivery(run_workspace),
+            self._attempt_cleanup(run_workspace),
+        )
         return self._record_cleanup_failure(
             stage,
-            self._attempt_cleanup(run_workspace),
+            cleanup_failure,
         )
 
     def _attempt_cleanup(
@@ -1633,6 +1645,37 @@ _STAGE_MODULES = {
     RunStage.DELIVERY_VERIFICATION: ErrorModule.DELIVERY_VERIFICATION,
     RunStage.PUBLISHING: ErrorModule.PUBLICATION,
 }
+
+def _classify_cleanup_failure(
+    has_unpublished_delivery: bool,
+    cleanup_failure: Exception | None,
+) -> Exception | None:
+    if (
+        cleanup_failure is None
+        or not has_unpublished_delivery
+        or getattr(cleanup_failure, "error_code", None)
+        is not ErrorCode.WORKSPACE_CLEANUP_FAILED
+    ):
+        return cleanup_failure
+    diagnostics = getattr(cleanup_failure, "diagnostics", {})
+    return _ApplicationFailure(
+        ErrorCode.DELIVERY_CLEANUP_FAILED,
+        diagnostics if isinstance(diagnostics, Mapping) else {},
+        module=ErrorModule.DELIVERY_BUILD,
+    )
+
+
+def _has_unpublished_delivery(
+    run_workspace: _AuditableRunWorkspace,
+) -> bool:
+    if not isinstance(run_workspace, RunWorkspace):
+        return False
+    try:
+        return bool(run_workspace.delivery_staging.inspect_tree())
+    except Exception:
+        # 分类探测不得妨碍后续受管清理；无法证明 staging 非空时保留
+        # workspace 清理分类。
+        return False
 
 
 def _failure_module(
