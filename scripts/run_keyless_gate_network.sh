@@ -85,8 +85,8 @@ if [ "${1:-}" = "$internal_root_marker" ]; then
             /usr/sbin/ip link set lo up
             attestation_fd=${RELEASE_GATE_NETWORK_ATTESTATION_FD:-}
             if [ -n "$attestation_fd" ]; then
-                if ! printf '%s\n' "$attestation_fd" \
-                    | LC_ALL=C /usr/bin/grep -qxE '[3-9]|[1-9][0-9]+'; then
+                if ! printf "%s\n" "$attestation_fd" \
+                    | LC_ALL=C /usr/bin/grep -qxE "[3-9]|[1-9][0-9]+"; then
                     echo "网络命名空间证明文件描述符不合法" >&2
                     exit 2
                 fi
