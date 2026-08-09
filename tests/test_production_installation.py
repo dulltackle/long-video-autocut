@@ -552,6 +552,58 @@ def test_locked_candidate_installs_and_becomes_current_only_after_readiness(
     )
 
 
+def test_default_acl_on_the_prefix_parent_cannot_relax_installed_records(
+    tmp_path,
+):
+    """父目录带默认 ACL 时 umask 失效，安装记录仍不得组或其他用户可写。"""
+    if shutil.which("setfacl") is None:
+        pytest.skip("当前环境没有 setfacl，无法构造默认 ACL")
+    anchor = tmp_path / "anchor"
+    anchor.mkdir()
+    default_acl = subprocess.run(
+        ("setfacl", "-d", "-m", "u::rwx,g::rwx,o::rwx", str(anchor)),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if default_acl.returncode != 0:
+        pytest.skip(f"当前文件系统不支持默认 ACL：{default_acl.stderr.strip()}")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    wheel = _write_candidate_wheel(artifacts)
+    wheelhouse = artifacts / "wheelhouse"
+    wheelhouse.mkdir()
+    runtime_lock = artifacts / "requirements-runtime.lock"
+    runtime_lock.write_text("# 无运行依赖。\n", encoding="utf-8")
+    prefix = anchor / "installation"
+    trace = tmp_path / "commands.trace"
+    fake_bin = _write_fake_system_commands(tmp_path, trace)
+    os_release = tmp_path / "os-release"
+    os_release.write_text(
+        'ID=ubuntu\nVERSION_ID="24.04"\n',
+        encoding="utf-8",
+    )
+
+    completed = _run_installer(
+        tmp_path=tmp_path,
+        wheel=wheel,
+        wheelhouse=wheelhouse,
+        runtime_lock=runtime_lock,
+        prefix=prefix,
+        fake_bin=fake_bin,
+        os_release=os_release,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    version_directory = prefix / "versions" / APPLICATION_VERSION
+    relaxed = sorted(
+        str(path.relative_to(version_directory))
+        for path in version_directory.rglob("*")
+        if not path.is_symlink() and path.lstat().st_mode & 0o022
+    )
+    assert relaxed == []
+
+
 def test_installed_system_package_must_equal_the_snapshot_candidate(tmp_path):
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()

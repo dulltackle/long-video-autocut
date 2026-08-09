@@ -221,6 +221,19 @@ PY
   transaction_active=1
 }
 
+harden_installed_tree() {
+  # 父目录带默认 ACL 时 umask 会被忽略，新建文件直接拿到 0666；
+  # 应用侧预检拒绝组或其他用户可写的安装记录，故必须显式收紧再校验。
+  local directory=$1
+  local offender
+  chmod -R go-w -- "${directory}" || fail "无法收紧版本目录权限"
+  offender=$(
+    find "${directory}" \( -type f -o -type d \) -perm /0022 -print -quit
+  ) || fail "无法校验版本目录权限"
+  [[ -z "${offender}" ]] \
+    || fail "版本目录仍存在组或其他用户可写路径：${offender}"
+}
+
 commit_install_transaction() {
   rm -rf -- "${transaction_directory}"
   fsync_directory "${installation_prefix}"
@@ -1327,6 +1340,9 @@ PY
   mv -- "${ready_temporary}" "${final_directory}/READY"
   fsync_directory "${final_directory}"
 fi
+
+harden_installed_tree "${final_directory}"
+fsync_directory "${final_directory}"
 
 commit_install_transaction
 switched_current=0
