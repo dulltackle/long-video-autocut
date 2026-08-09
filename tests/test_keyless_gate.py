@@ -776,6 +776,67 @@ def test_network_entrypoint_never_falls_back_when_namespace_is_required(tmp_path
     assert "网络命名空间" in completed.stderr
 
 
+def test_network_entrypoint_passes_namespace_program_as_one_shell_argument(tmp_path):
+    invocation = tmp_path / "unshare-invocation.json"
+    fake_unshare = tmp_path / "unshare"
+    fake_unshare.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"Path({str(invocation)!r}).write_text("
+        "json.dumps(sys.argv[1:]), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    fake_unshare.chmod(0o755)
+    fake_id = tmp_path / "id"
+    fake_id.write_text("#!/bin/sh\nprintf '0\\n'\n", encoding="utf-8")
+    fake_id.chmod(0o755)
+    entrypoint = tmp_path / "run_keyless_gate_network.sh"
+    entrypoint.write_text(
+        NETWORK_ENTRYPOINT.read_text(encoding="utf-8")
+        .replace("id_command=/usr/bin/id", f"id_command={fake_id}")
+        .replace(
+            "unshare_command=/usr/bin/unshare",
+            f"unshare_command={fake_unshare}",
+        ),
+        encoding="utf-8",
+    )
+    entrypoint.chmod(0o755)
+
+    completed = subprocess.run(
+        [
+            str(entrypoint),
+            "__keyless_gate_root__",
+            "1000",
+            "1000",
+            os.readlink("/proc/self/ns/net"),
+            "1",
+            sys.executable,
+            "-c",
+            "pass",
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    arguments = json.loads(invocation.read_text(encoding="utf-8"))
+    assert arguments[:4] == ["--net", "--", "/bin/sh", "-c"]
+    assert 'grep -qxE "[3-9]|[1-9][0-9]+"' in arguments[4]
+    assert arguments[5:] == [
+        "/bin/sh",
+        "1000",
+        "1000",
+        os.readlink("/proc/self/ns/net"),
+        sys.executable,
+        "-c",
+        "pass",
+    ]
+
+
 def test_network_entrypoint_scrubs_spoofed_context_in_forced_guard(tmp_path):
     observation = tmp_path / "environment.json"
     fake_command = tmp_path / "gate-command"
@@ -911,9 +972,8 @@ def test_network_entrypoint_rejects_noncanonical_attestation_fd(
 def test_network_entrypoint_drops_reacquirable_privileges():
     entrypoint = NETWORK_ENTRYPOINT.read_text(encoding="utf-8")
 
-    assert entrypoint.count(
-        "LC_ALL=C /usr/bin/grep -qxE '[3-9]|[1-9][0-9]+'"
-    ) == 2
+    assert entrypoint.count("LC_ALL=C /usr/bin/grep -qxE") == 2
+    assert entrypoint.count("[3-9]|[1-9][0-9]+") == 2
     assert "*[!0-9]*|0*|1|2)" not in entrypoint
     assert entrypoint.count("2>/dev/null || true)") == 2
     assert '/usr/bin/grep -qxE "net:\\[[0-9]+\\]"' in entrypoint
