@@ -140,6 +140,15 @@ jobs:
             | head -n 1)
           [[ "$matched_family" == "Noto Sans CJK SC" ]]
 
+      - name: 收紧 GitHub 托管镜像的 /opt
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo chown root:root /opt
+          sudo chmod 0755 /opt
+          actual_identity=$(stat -c '%u:%g:%a' /opt)
+          [[ "$actual_identity" == "0:0:755" ]]
+
       - name: 固化本次候选声明的门禁裁判
         shell: bash
         run: |

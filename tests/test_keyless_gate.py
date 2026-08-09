@@ -1070,6 +1070,19 @@ def test_workflow_temporarily_allows_user_namespaces_only_during_full_gate():
     assert '[[ $(/usr/sbin/sysctl -n "$restriction") == "1" ]]' in restore_step
 
 
+def test_workflow_hardens_opt_before_trusting_candidate_tools():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+
+    harden_at = workflow.index("- name: 收紧 GitHub 托管镜像的 /opt")
+    trust_at = workflow.index("- name: 固化本次候选声明的门禁裁判")
+    harden_step = workflow[harden_at:trust_at]
+
+    assert harden_at < trust_at
+    assert "sudo chown root:root /opt" in harden_step
+    assert "sudo chmod 0755 /opt" in harden_step
+    assert '[[ "$actual_identity" == "0:0:755" ]]' in harden_step
+
+
 def test_workflow_runs_every_required_event_and_builds_the_candidate_once():
     workflow = WORKFLOW.read_text(encoding="utf-8")
 
