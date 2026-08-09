@@ -228,6 +228,48 @@ def _verify_installation(
     }
 
 
+def _path_status_facts(path: Path) -> dict[str, object]:
+    try:
+        status = path.lstat()
+    except OSError as error:
+        return {"path": str(path), "lstat_error": error.strerror or str(error)}
+    return {
+        "path": str(path),
+        "mode": format(stat.S_IMODE(status.st_mode), "04o"),
+        "is_directory": stat.S_ISDIR(status.st_mode),
+        "is_regular": stat.S_ISREG(status.st_mode),
+        "is_symlink": stat.S_ISLNK(status.st_mode),
+        "nlink": status.st_nlink,
+        "uid": status.st_uid,
+        "gid": status.st_gid,
+        "dev": status.st_dev,
+        "size": status.st_size,
+    }
+
+
+def _record_installation_status(work_root: Path, version_directory: Path) -> None:
+    """记录安装记录链路的 stat 事实，用于定位应用侧严格校验失败的具体谓词。"""
+    chain = [
+        version_directory.parents[index]
+        for index in reversed(range(len(version_directory.parents)))
+    ]
+    chain.append(version_directory)
+    facts = {
+        "observer": {
+            "euid": os.geteuid(),
+            "egid": os.getegid(),
+            "groups": sorted(os.getgroups()),
+        },
+        "path_chain": [_path_status_facts(path) for path in chain],
+        "records": [
+            _path_status_facts(version_directory / name)
+            for name in ("installation-manifest.json", "READY")
+        ],
+        "schema_version": "installed_acceptance_installation_status.v1",
+    }
+    (work_root / "installation-status.json").write_bytes(_json_bytes(facts))
+
+
 def _empty_evidence(
     candidate: Mapping[str, str],
     network: Mapping[str, object],
@@ -1488,6 +1530,10 @@ def run_acceptance(
             raise AcceptanceFailure("workspace.invalid") from None
         installation = _verify_installation(installation_prefix, candidate)
         evidence["installation"] = installation
+        _record_installation_status(
+            work,
+            Path(str(installation["environment_prefix"])).parent,
+        )
         harness = _verify_harness(harness_root)
         console = Path(str(installation["console"])).resolve(strict=True)
         python = Path(str(installation["python"]))
