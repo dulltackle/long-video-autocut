@@ -187,6 +187,19 @@ jobs:
             "$trusted_root/candidate/requirements-runtime.lock"
           sudo chmod -R a-w "$trusted_root"
 
+      - name: 为安装契约开放受控用户命名空间
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 安装契约用嵌套 user/mount namespace 构造 root 所有权与只读挂载；
+          # Ubuntu 24.04 的 AppArmor 默认限制会阻止其取得 namespace capability。
+          restriction="kernel.apparmor_restrict_unprivileged_userns"
+          current=$(/usr/sbin/sysctl -n "$restriction")
+          [[ "$current" == "1" ]]
+          sudo /usr/sbin/sysctl -w "$restriction=0"
+          [[ $(/usr/sbin/sysctl -n "$restriction") == "0" ]]
+          /usr/bin/unshare --user --map-root-user -- /usr/bin/true
+
       - name: 只构建一次并在仅回环网络中执行完整门禁
         shell: bash
         env:
@@ -243,6 +256,15 @@ jobs:
             --harness-root "$trusted_root" \
             --source-root "$candidate_root" \
             --manifest "$candidate_root/tests/keyless_gate_manifest.json"
+
+      - name: 恢复 Ubuntu 用户命名空间限制
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          restriction="kernel.apparmor_restrict_unprivileged_userns"
+          sudo /usr/sbin/sysctl -w "$restriction=1"
+          [[ $(/usr/sbin/sysctl -n "$restriction") == "1" ]]
 
       - name: 从固定 snapshot 安装同一候选
         shell: bash

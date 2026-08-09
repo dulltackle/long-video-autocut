@@ -1043,6 +1043,33 @@ def test_gate_runner_can_start_isolated_from_a_hostile_candidate_directory(tmp_p
     assert not canary.exists()
 
 
+def test_workflow_temporarily_allows_user_namespaces_only_during_full_gate():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+
+    enable_at = workflow.index("- name: 为安装契约开放受控用户命名空间")
+    gate_at = workflow.index("- name: 只构建一次并在仅回环网络中执行完整门禁")
+    restore_at = workflow.index("- name: 恢复 Ubuntu 用户命名空间限制")
+    install_at = workflow.index("- name: 从固定 snapshot 安装同一候选")
+    enable_step = workflow[enable_at:gate_at]
+    restore_step = workflow[restore_at:install_at]
+
+    assert enable_at < gate_at < restore_at < install_at
+    assert (
+        'restriction="kernel.apparmor_restrict_unprivileged_userns"'
+        in enable_step
+    )
+    assert '[[ "$current" == "1" ]]' in enable_step
+    assert 'sudo /usr/sbin/sysctl -w "$restriction=0"' in enable_step
+    assert '[[ $(/usr/sbin/sysctl -n "$restriction") == "0" ]]' in enable_step
+    assert (
+        "/usr/bin/unshare --user --map-root-user -- /usr/bin/true"
+        in enable_step
+    )
+    assert "if: always()" in restore_step
+    assert 'sudo /usr/sbin/sysctl -w "$restriction=1"' in restore_step
+    assert '[[ $(/usr/sbin/sysctl -n "$restriction") == "1" ]]' in restore_step
+
+
 def test_workflow_runs_every_required_event_and_builds_the_candidate_once():
     workflow = WORKFLOW.read_text(encoding="utf-8")
 
