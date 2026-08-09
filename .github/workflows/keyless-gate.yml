@@ -498,6 +498,9 @@ jobs:
             ${{ runner.temp }}/keyless-candidate/*.whl
             ${{ runner.temp }}/keyless-gate-evidence.json
             ${{ runner.temp }}/installed-acceptance-evidence.json
+            ${{ runner.temp }}/installed-acceptance-work/**/*.json
+            ${{ runner.temp }}/installed-acceptance-work/**/*.log
+            ${{ runner.temp }}/installed-acceptance-work/**/*.jsonl
             /opt/keyless-gate/evidence/installation-manifest.json
             /opt/keyless-gate/evidence/READY
           if-no-files-found: warn

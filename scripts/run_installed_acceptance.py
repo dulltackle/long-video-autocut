@@ -610,6 +610,18 @@ def _verify_process_audit(
     )
 
 
+def _record_console_output(
+    *,
+    case_root: Path,
+    audit_name: str,
+    stdout: bytes,
+    stderr: bytes,
+) -> None:
+    """落盘候选控制台输出，供门禁失败后回溯具体断言。"""
+    (case_root / f"{audit_name}-stdout.log").write_bytes(stdout)
+    (case_root / f"{audit_name}-stderr.log").write_bytes(stderr)
+
+
 def _run_live(
     *,
     console: Path,
@@ -647,6 +659,12 @@ def _run_live(
         capture_output=True,
         check=False,
         timeout=timeout,
+    )
+    _record_console_output(
+        case_root=case_root,
+        audit_name=audit_name,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
     )
     _verify_process_audit(
         case_root=case_root,
@@ -748,6 +766,12 @@ def _run_signalled_live(
             process.kill()
         process.communicate()
         raise
+    _record_console_output(
+        case_root=case_root,
+        audit_name=audit_name,
+        stdout=stdout,
+        stderr=stderr,
+    )
     _verify_process_audit(
         case_root=case_root,
         audit_name=audit_name,
@@ -870,6 +894,12 @@ def _validate_delivery(
         capture_output=True,
         check=False,
         timeout=60,
+    )
+    _record_console_output(
+        case_root=case_root,
+        audit_name=f"{label}-validator",
+        stdout=completed.stdout,
+        stderr=completed.stderr,
     )
     _require(completed.returncode == 0, "case.delivery_validation_failed")
     result = _read_case_json(result_path, "case.delivery_validation_failed")
