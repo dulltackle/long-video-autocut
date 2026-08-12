@@ -31,6 +31,11 @@ dist/
 build/
 pip-wheel-metadata/
 
+# 独立阶段控制台本地依赖与构建物
+tools/live_progress/web/node_modules/
+tools/live_progress/web/dist/
+tools/live_progress/web/.live-progress-build.json
+
 # 系统
 .DS_Store
 Thumbs.db

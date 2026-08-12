@@ -1,0 +1,118 @@
+:root {
+  color: #26313d;
+  background: #ffffff;
+  font-family: "Noto Sans CJK SC", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { min-height: 100%; margin: 0; }
+
+body { min-width: 320px; overflow-x: hidden; }
+
+.app-shell {
+  min-height: 100dvh;
+  display: grid;
+  grid-template-rows: 100px auto 1fr auto;
+  background: #fff;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 0 36px;
+  color: #fff;
+  background: #071524;
+  box-shadow: 0 1px 0 rgb(255 255 255 / 8%);
+}
+
+.topbar h1, .topbar p { margin: 0; }
+.topbar h1 { font-size: 36px; line-height: 1; letter-spacing: .02em; font-weight: 730; }
+.topbar p { font-size: 23px; line-height: 1; letter-spacing: .08em; font-weight: 560; color: #dce5ed; }
+.title-rule { width: 1px; height: 42px; background: #83909d; }
+
+.stage-viewport {
+  overflow-x: auto;
+  overflow-y: hidden;
+  border-bottom: 1px solid #cbd3db;
+  scrollbar-width: thin;
+  scrollbar-color: #9aa8b5 transparent;
+}
+
+.stage-track {
+  --track-gutter: 38px;
+  position: relative;
+  min-width: 1120px;
+  max-width: 1536px;
+  height: 216px;
+  margin: 0 auto;
+  padding: 49px var(--track-gutter) 24px;
+  display: grid;
+  grid-template-columns: repeat(9, minmax(104px, 1fr));
+  list-style: none;
+}
+
+.stage-track::before {
+  content: "";
+  position: absolute;
+  top: 65px;
+  left: calc(var(--track-gutter) + 6.1%);
+  right: calc(var(--track-gutter) + 6.1%);
+  height: 1px;
+  background: #aab5c0;
+}
+
+.stage { position: relative; display: grid; justify-items: center; align-content: start; gap: 17px; color: #4e5965; }
+.stage-node { z-index: 1; width: 34px; height: 34px; border: 1.5px solid #58636e; border-radius: 50%; background: #fff; }
+.stage-icon { width: 43px; height: 43px; }
+.stage-icon svg, footer svg, .empty-icon { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.stage-label { font-size: 18px; line-height: 1.3; font-weight: 520; white-space: nowrap; }
+
+.main-content { min-height: 360px; display: grid; place-items: center; padding: 48px 24px 88px; }
+.empty-state, .state-message { width: min(720px, 100%); text-align: center; }
+.empty-icon { display: none; width: 76px; height: 76px; margin: 0 auto 28px; color: #53606c; }
+.empty-state h2, .state-message h2 { margin: 0; color: #26313d; font-size: clamp(30px, 3vw, 44px); line-height: 1.2; letter-spacing: -.025em; font-weight: 690; }
+.empty-state p, .state-message p { margin: 18px auto 0; max-width: 680px; color: #53606c; font-size: 20px; line-height: 1.8; }
+.state-error h2 { font-size: 32px; }
+
+footer {
+  min-height: 134px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 22px 40px;
+  border-top: 1px solid #cbd3db;
+  color: #52606d;
+}
+
+footer svg { width: 23px; height: 23px; flex: 0 0 auto; }
+footer p { margin: 0; font-size: 18px; line-height: 1.6; }
+
+@media (max-width: 680px) {
+  .app-shell { grid-template-rows: 72px auto 1fr auto; }
+  .topbar { gap: 12px; padding: 0 20px; }
+  .topbar h1 { font-size: 21px; }
+  .topbar p { font-size: 13px; letter-spacing: .04em; }
+  .title-rule { height: 24px; }
+  .stage-track { min-width: 930px; height: 143px; padding: 26px 18px 18px; grid-template-columns: repeat(9, 96px); column-gap: 6px; }
+  .stage-track::before { top: 52px; left: 45px; right: 45px; }
+  .stage { gap: 11px; }
+  .stage-node { display: none; }
+  .stage-icon { z-index: 1; display: grid; place-items: center; width: 52px; height: 52px; padding: 10px; border: 1.5px solid #58636e; border-radius: 50%; background: #fff; }
+  .stage-label { font-size: 14px; }
+  .main-content { min-height: 400px; padding: 56px 24px 72px; align-items: start; }
+  .empty-state { padding-top: clamp(24px, 8vh, 72px); }
+  .empty-icon { display: block; }
+  .empty-state h2, .state-message h2 { font-size: 28px; }
+  .empty-state p, .state-message p { margin-top: 16px; max-width: 330px; font-size: 16px; line-height: 1.75; }
+  footer { min-height: 92px; padding: 20px 24px; align-items: flex-start; }
+  footer p { font-size: 13px; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .empty-state { animation: settle-in 260ms ease-out both; }
+  @keyframes settle-in { from { opacity: 0; transform: translateY(5px); } }
+}
