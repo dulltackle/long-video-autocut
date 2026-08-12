@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>直播拆条运行 · 阶段控制台</title>
+  <style>
+    /* design-systems/bento/tokens.css
+     * Structured token bindings for Bento.
+     * modular bento interface with friendly tiles, soft borders, and balanced product density.
+     */
+
+    :root {
+      --bg: #f5f8ff;
+      --surface: #ffffff;
+      --surface-warm: #eaf1ff;
+      --fg: #101828;
+      --fg-2: #344054;
+      --muted: #667085;
+      --meta: #2563eb;
+      --border: #d7e0ef;
+      --border-soft: #edf2f8;
+      --accent: #2563eb;
+      --accent-on: #ffffff;
+      --accent-hover: color-mix(in oklab, var(--accent), black 8%);
+      --accent-active: color-mix(in oklab, var(--accent), black 14%);
+      --success: #16a34a;
+      --warn: #f59e0b;
+      --danger: #ef4444;
+      --font-display: Inter, system-ui, sans-serif;
+      --font-body: Inter, system-ui, sans-serif;
+      --font-mono: "SF Mono", ui-monospace, Menlo, monospace;
+      --text-xs: 12px;
+      --text-sm: 14px;
+      --text-base: 16px;
+      --text-lg: 18px;
+      --text-xl: 24px;
+      --text-2xl: 36px;
+      --text-3xl: 54px;
+      --text-4xl: 76px;
+      --leading-body: 1.52;
+      --leading-tight: 1.06;
+      --tracking-display: -0.025em;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-5: 20px;
+      --space-6: 24px;
+      --space-8: 32px;
+      --space-12: 48px;
+      --section-y-desktop: 96px;
+      --section-y-tablet: 68px;
+      --section-y-phone: 48px;
+      --radius-sm: 10px;
+      --radius-md: 16px;
+      --radius-lg: 24px;
+      --radius-pill: 9999px;
+      --elev-flat: none;
+      --elev-ring: 0 0 0 1px var(--border);
+      --elev-raised: 0 20px 52px rgba(16, 24, 40, 0.11);
+      --focus-ring: 0 0 0 4px rgba(37, 99, 235, 0.22);
+      --motion-fast: 150ms;
+      --motion-base: 240ms;
+      --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+      --container-max: 1180px;
+      --container-gutter-desktop: 36px;
+      --container-gutter-tablet: 24px;
+      --container-gutter-phone: 16px;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    html { min-width: 320px; background: var(--bg); color-scheme: light; }
+    body { margin: 0; min-width: 320px; min-height: 100vh; overflow-x: hidden; background: var(--bg); color: var(--fg); font-family: var(--font-body); line-height: var(--leading-body); -webkit-font-smoothing: antialiased; }
+    button { color: inherit; font: inherit; }
+    button, [role="button"] { -webkit-tap-highlight-color: transparent; }
+    button:focus-visible, summary:focus-visible, a:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+    button:disabled { cursor: not-allowed; opacity: .48; }
+    h1, h2, h3, p { margin: 0; }
+    h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; }
+    p { text-wrap: pretty; }
+    code, time, .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    .skip-link { position: fixed; z-index: 100; top: var(--space-3); left: var(--space-3); padding: var(--space-3) var(--space-4); color: var(--accent-on); background: var(--accent); border-radius: var(--radius-sm); font-size: var(--text-sm); font-weight: 700; transform: translateY(calc(-100% - var(--space-6))); transition: transform var(--motion-fast) var(--ease-standard); }
+    .skip-link:focus { transform: translateY(0); }
+
+    .app { min-height: 100vh; }
+    .topbar { position: sticky; top: 0; z-index: 30; min-height: 72px; background: color-mix(in oklch, var(--surface) 96%, transparent); border-bottom: 1px solid var(--border-soft); backdrop-filter: blur(16px); }
+    .topbar-inner { width: min(100% - clamp(24px, 4vw, 64px), 1480px); min-height: 72px; display: flex; align-items: center; gap: clamp(var(--space-4), 2vw, var(--space-8)); margin-inline: auto; }
+    .brand { min-width: 0; display: flex; align-items: center; gap: var(--space-3); }
+    .brand-mark { flex: 0 0 auto; width: 36px; height: 36px; display: grid; place-items: center; color: var(--surface); background: var(--fg); border-radius: 8px; }
+    .brand-copy { min-width: 0; display: grid; gap: 1px; }
+    .brand-copy strong { font-size: var(--text-sm); letter-spacing: -.02em; }
+    .brand-copy span { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+    .top-facts { flex: 0 0 auto; display: flex; align-items: center; gap: var(--space-4); }
+    .top-fact { min-width: 0; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+    .top-fact + .top-fact { position: relative; padding-left: var(--space-4); }
+    .top-fact + .top-fact::before { content: ""; position: absolute; left: 0; width: 1px; height: 18px; background: var(--border); }
+    .top-fact small { color: var(--muted); font-size: 10px; }
+    .top-fact strong { overflow: hidden; color: var(--fg-2); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+    #top-integrity.status--success { color: color-mix(in oklch, var(--success) 48%, var(--fg)); }
+    #top-integrity.status--warn { color: color-mix(in oklch, var(--warn) 45%, var(--fg)); }
+    #top-integrity.status--danger { color: color-mix(in oklch, var(--danger) 60%, var(--fg)); }
+
+    .shell { width: min(100% - clamp(24px, 4vw, 64px), 1480px); margin-inline: auto; padding-block: var(--space-6) var(--space-12); }
+    .console { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: 0 12px 34px color-mix(in oklch, var(--fg) 7%, transparent); overflow: clip; }
+    .track-wrap { position: relative; border-bottom: 1px solid var(--border); }
+    .track { display: grid; grid-template-columns: repeat(9, minmax(120px, 1fr)); overflow-x: auto; overscroll-behavior-inline: contain; scrollbar-width: thin; }
+    .stage-tab { min-width: 120px; min-height: 98px; display: grid; justify-items: start; align-content: center; gap: 6px; padding: var(--space-3) var(--space-4); text-align: left; background: var(--surface); border: 0; border-right: 1px solid var(--border-soft); cursor: pointer; transition: background var(--motion-fast) var(--ease-standard), box-shadow var(--motion-fast) var(--ease-standard); }
+    .stage-tab:last-child { border-right: 0; }
+    .stage-tab:hover { background: var(--surface-warm); }
+    .stage-tab[aria-selected="true"] { position: relative; z-index: 1; background: var(--surface-warm); box-shadow: inset 0 -3px 0 var(--accent); }
+    .stage-tab:focus-visible { outline: 3px solid color-mix(in oklch, var(--accent) 38%, transparent); outline-offset: -4px; box-shadow: inset 0 -3px 0 var(--accent); }
+    .stage-index { color: var(--muted); font: 600 10px var(--font-mono); letter-spacing: .08em; }
+    .stage-name { font-size: var(--text-sm); font-weight: 700; letter-spacing: -.01em; white-space: nowrap; }
+    .status { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+    .status svg { width: 14px; height: 14px; }
+    .status--success { color: color-mix(in oklch, var(--success) 48%, var(--fg)); }
+    .status--active { color: var(--fg-2); }
+    .status--pending { color: var(--muted); }
+    .status--danger { color: color-mix(in oklch, var(--danger) 60%, var(--fg)); }
+    .status--warn { color: color-mix(in oklch, var(--warn) 45%, var(--fg)); }
+
+    .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 320px; min-height: 560px; }
+    .main-panel { min-width: 0; padding: clamp(var(--space-6), 3.5vw, var(--space-12)); border-right: 1px solid var(--border); }
+    .run-picker { position: relative; height: 0; margin: 0; }
+    .run-trigger { width: 100%; min-height: 68px; display: grid; grid-template-columns: minmax(150px, 1.1fr) minmax(220px, 1.4fr) auto; align-items: center; gap: var(--space-5); padding: var(--space-3) var(--space-4); text-align: left; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-md); cursor: pointer; transition: background var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard); }
+    .run-trigger:hover { background: var(--surface); border-color: var(--fg-2); }
+    .run-trigger > span { min-width: 0; display: grid; gap: 2px; }
+    .run-trigger small, .run-list small { color: var(--muted); font-size: 11px; }
+    .run-trigger strong, .run-trigger code { overflow: hidden; font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
+    .topbar [data-od-id="run-picker-trigger"] { flex: 1 1 440px; width: auto; max-width: 540px; min-width: 320px; min-height: 46px; grid-template-columns: minmax(150px, 1fr) minmax(100px, auto) auto; gap: var(--space-4); padding: 5px 7px 5px var(--space-4); background: var(--bg); border-color: var(--border-soft); border-radius: var(--radius-sm); }
+    .topbar [data-od-id="run-picker-trigger"]:hover { background: var(--surface-warm); border-color: var(--border); }
+    .topbar [data-od-id="run-picker-trigger"] small { color: var(--muted); font-size: 10px; }
+    .topbar [data-od-id="run-picker-trigger"] code { color: var(--fg); font-size: 11px; font-weight: 600; }
+    .topbar [data-od-id="run-picker-trigger"] .run-action { min-height: 34px; padding-inline: var(--space-3); color: var(--surface); background: var(--fg); border: 1px solid var(--fg); border-radius: 7px; font-size: 11px; }
+    .topbar [data-od-id="run-picker-trigger"]:hover .run-action { background: var(--fg-2); border-color: var(--fg-2); }
+    .run-action { display: inline-flex !important; grid-auto-flow: column; align-items: center; gap: var(--space-2) !important; font-weight: 700; white-space: nowrap; }
+    .icon-button { width: 44px; height: 44px; display: grid; place-items: center; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; transition: background var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard); }
+    .icon-button:hover { background: var(--surface-warm); border-color: var(--fg-2); }
+    .run-popover { position: fixed; z-index: 50; top: 84px; left: 50%; width: min(760px, calc(100vw - 48px)); transform: translateX(-50%); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: var(--elev-raised); overflow: hidden; }
+    .run-popover[hidden] { display: none; }
+    .popover-head { min-height: 64px; display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--border); }
+    .popover-head > div { display: grid; gap: 2px; }
+    .popover-head h2 { font-size: var(--text-base); }
+    .popover-head p { color: var(--muted); font-size: var(--text-xs); }
+    .run-list { display: grid; max-height: min(54vh, 420px); overflow-y: auto; }
+    .run-option { min-height: 74px; display: grid; grid-template-columns: minmax(135px, 1.2fr) minmax(130px, 1fr) minmax(100px, .8fr) auto; align-items: center; gap: var(--space-4); padding: var(--space-3) var(--space-4); text-align: left; background: var(--surface); border: 0; border-bottom: 1px solid var(--border-soft); cursor: pointer; }
+    .run-option:last-child { border-bottom: 0; }
+    .run-option:hover { background: var(--surface-warm); }
+    .run-option[aria-current="true"] { background: var(--surface-warm); box-shadow: inset 3px 0 0 var(--fg); }
+    .run-option > span { min-width: 0; display: grid; gap: 2px; }
+    .run-option strong, .run-option code { overflow: hidden; font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
+
+    .notice { width: 100%; min-height: 56px; display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); margin: 0 0 var(--space-6); padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4); color: var(--fg-2); background: var(--surface-warm); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+    .notice[hidden] { display: none; }
+    .notice span { display: inline-flex; align-items: center; gap: var(--space-2); font-size: var(--text-xs); font-weight: 700; line-height: 1.45; }
+    .text-button { min-height: 44px; padding: 0 var(--space-3); color: var(--fg); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: var(--text-xs); font-weight: 700; cursor: pointer; transition: color var(--motion-fast) var(--ease-standard), background var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard); }
+    .text-button:hover { background: var(--fg); color: var(--surface); border-color: var(--fg); }
+
+    .stage-head { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--space-6); padding-bottom: var(--space-6); border-bottom: 1px solid var(--border); }
+    .stage-head-copy { display: grid; gap: var(--space-2); }
+    .eyebrow { color: var(--muted); font: 600 11px var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
+    .stage-head h1 { font-size: clamp(30px, 3.3vw, 42px); line-height: var(--leading-tight); letter-spacing: var(--tracking-display); }
+    .stage-frame { flex: 0 0 auto; min-width: 190px; display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-5); padding: 0; background: transparent; border: 0; }
+    .stage-frame div { display: grid; gap: 3px; }
+    .stage-frame small { color: var(--muted); font-size: 10px; }
+    .stage-frame strong { font-size: var(--text-sm); }
+    .conclusion { display: grid; grid-template-columns: 44px minmax(0, 1fr); align-items: center; gap: var(--space-4); margin-top: var(--space-8); padding: var(--space-6); color: var(--surface); background: var(--fg); border: 0; border-radius: var(--radius-md); }
+    .conclusion-mark { width: 44px; height: 44px; display: grid; place-items: center; color: var(--surface); background: color-mix(in oklch, var(--surface) 9%, transparent); border: 1px solid color-mix(in oklch, var(--surface) 20%, transparent); border-radius: 8px; }
+    .conclusion-copy { display: grid; gap: var(--space-1); }
+    .conclusion-copy small { color: color-mix(in oklch, var(--surface) 65%, transparent); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+    .conclusion-copy strong { font-size: clamp(var(--text-base), 2vw, var(--text-xl)); line-height: 1.35; }
+    .facts-section { padding-block: var(--space-8); }
+    .facts-section h2 { margin-bottom: var(--space-4); color: var(--muted); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+    .fact-list { margin: 0; padding: 0; list-style: none; counter-reset: fact; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-5); }
+    .fact-list li { counter-increment: fact; position: relative; min-height: 72px; padding: var(--space-3) 0 0 28px; color: var(--fg-2); border-top: 1px solid var(--border); font-size: var(--text-sm); }
+    .fact-list li::before { content: "0" counter(fact); position: absolute; top: var(--space-3); left: 0; color: var(--muted); font: 600 10px var(--font-mono); }
+    .fact-list:has(.empty-fact) { grid-template-columns: 1fr; }
+    .empty-fact { min-height: 0 !important; padding-left: 0 !important; color: var(--muted); border-top-style: dashed !important; font-size: var(--text-sm); }
+    .empty-fact::before { content: none !important; }
+    .details { border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+    .details summary { min-height: 48px; display: flex; align-items: center; gap: var(--space-2); color: var(--muted); font-size: var(--text-xs); font-weight: 700; cursor: pointer; list-style: none; }
+    .details summary::-webkit-details-marker { display: none; }
+    .details summary svg { transition: transform var(--motion-fast) var(--ease-standard); }
+    .details[open] summary svg { transform: rotate(90deg); }
+    .details-body { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-4); background: var(--fg); color: var(--surface); border-radius: var(--radius-sm); }
+    .details-body code { overflow-wrap: anywhere; font-size: var(--text-xs); }
+    .details-body button { min-height: 44px; flex: 0 0 auto; padding-inline: var(--space-3); color: var(--surface); background: transparent; border: 1px solid color-mix(in oklch, var(--surface) 46%, transparent); border-radius: var(--radius-sm); cursor: pointer; transition: color var(--motion-fast) var(--ease-standard), background var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard); }
+    .details-body button:hover { background: var(--surface); color: var(--fg); border-color: var(--surface); }
+    .main-foot { display: flex; justify-content: space-between; gap: var(--space-4); margin-top: var(--space-6); color: var(--muted); font-size: 11px; }
+
+    .fact-rail { min-width: 0; display: flex; flex-direction: column; background: color-mix(in oklch, var(--bg) 42%, var(--surface)); }
+    .rail-head { padding: var(--space-6); border-bottom: 1px solid var(--border); }
+    .rail-head h2 { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-sm); }
+    .rail-head p { margin-top: var(--space-1); color: var(--muted); font-size: 11px; }
+    .rail-facts { margin: 0; }
+    .rail-fact { min-height: 88px; display: grid; align-content: center; gap: 6px; padding: var(--space-4) var(--space-6); border-bottom: 1px solid var(--border-soft); }
+    .rail-fact dt { color: var(--muted); font: 600 10px var(--font-mono); letter-spacing: .04em; }
+    .rail-fact dd { margin: 0; color: var(--fg); font-size: var(--text-xs); line-height: 1.55; }
+    .rail-note { margin-top: auto; padding: var(--space-6); color: var(--muted); border-top: 1px solid var(--border); font-size: 11px; line-height: 1.65; }
+
+    .compatibility { display: grid; place-items: center; min-height: 390px; padding: var(--space-8); text-align: center; }
+    .compatibility > div { max-width: 520px; display: grid; justify-items: center; gap: var(--space-3); }
+    .compatibility-mark { width: 56px; height: 56px; display: grid; place-items: center; color: var(--danger); background: color-mix(in oklch, var(--danger) 8%, var(--surface)); border: 1px solid color-mix(in oklch, var(--danger) 35%, var(--border)); border-radius: 50%; }
+    .compatibility h1 { font-size: var(--text-xl); }
+    .compatibility p { color: var(--muted); font-size: var(--text-sm); }
+    .compatibility .text-button { margin-top: var(--space-2); }
+    .loading-state { display: grid; place-items: center; min-height: 390px; padding: var(--space-8); text-align: center; }
+    .loading-state[hidden] { display: none; }
+    .loading-state > div { max-width: 420px; display: grid; justify-items: center; gap: var(--space-3); }
+    .loading-state h1 { font-size: var(--text-xl); }
+    .loading-state p { color: var(--muted); font-size: var(--text-sm); }
+    .loading-indicator { width: 36px; height: 36px; border: 3px solid var(--border); border-top-color: var(--fg-2); border-radius: 50%; animation: loading-spin .8s linear infinite; }
+    @keyframes loading-spin { to { transform: rotate(360deg); } }
+
+    .scrim { position: fixed; inset: 0; z-index: 40; background: color-mix(in oklch, var(--fg) 32%, transparent); }
+    .scrim[hidden] { display: none; }
+
+    @media (max-width: 1024px) {
+      .brand-copy span, .top-fact small { display: none; }
+      .top-facts { gap: var(--space-3); }
+      .top-fact + .top-fact { padding-left: var(--space-3); }
+      .topbar [data-od-id="run-picker-trigger"] { min-width: 350px; }
+      .workspace { grid-template-columns: minmax(0, 1fr) 290px; }
+      .run-trigger { grid-template-columns: minmax(130px, 1fr) minmax(180px, 1.2fr) auto; }
+    }
+
+    @media (max-width: 820px) {
+      .topbar { min-height: 68px; }
+      .topbar-inner { width: calc(100% - 32px); min-height: 68px; gap: var(--space-3); }
+      .brand-mark { width: 36px; height: 36px; }
+      .top-facts { display: none; }
+      .shell { width: 100%; padding-block: 0; }
+      .console { border-inline: 0; border-radius: 0; }
+      .track { grid-template-columns: repeat(9, 112px); scroll-snap-type: x proximity; }
+      .stage-tab { min-width: 112px; min-height: 104px; scroll-snap-align: start; }
+      .workspace { display: block; min-height: 0; }
+      .main-panel { min-height: calc(100vh - 169px); padding: var(--space-4); border-right: 0; }
+      .fact-rail { border-top: 1px solid var(--border); }
+      .run-trigger { grid-template-columns: 1fr auto; min-height: 64px; }
+      .run-trigger > span:nth-child(2) { display: none; }
+      .topbar [data-od-id="run-picker-trigger"] { min-width: 0; min-height: 48px; grid-template-columns: minmax(0, 1fr) auto; }
+      .topbar [data-od-id="run-picker-trigger"] .run-action { width: 34px; padding: 0; justify-content: center; color: var(--fg-2); background: transparent; border-color: transparent; font-size: 0; }
+      .topbar [data-od-id="run-picker-trigger"]:hover .run-action { background: transparent; border-color: transparent; }
+      .run-popover { position: fixed; inset: 0; z-index: 60; width: 100%; height: 100dvh; transform: none; border: 0; border-radius: 0; }
+      .popover-head { min-height: 68px; }
+      .run-list { max-height: calc(100dvh - 68px); }
+      .run-option { grid-template-columns: minmax(120px, 1fr) minmax(110px, .9fr) auto; min-height: 80px; }
+      .run-option > span:nth-child(3) { display: none; }
+      .notice { align-items: flex-start; }
+      .stage-head { display: grid; }
+      .stage-frame { width: 100%; grid-template-columns: 1fr 1fr; }
+      .conclusion { grid-template-columns: 44px minmax(0, 1fr); padding: var(--space-4); }
+      .conclusion-mark { width: 44px; height: 44px; }
+      .fact-list { grid-template-columns: 1fr; gap: var(--space-3); }
+      .fact-list li { min-height: 52px; }
+      .main-foot { display: grid; }
+      .details-body { align-items: stretch; flex-direction: column; }
+      .details-body button { min-height: 44px; }
+    }
+
+    @media (max-width: 390px) {
+      .topbar-inner { gap: var(--space-2); }
+      .brand-copy { display: none; }
+      .topbar [data-od-id="run-picker-trigger"] > span:first-child small { display: none; }
+      .run-option { grid-template-columns: minmax(112px, 1fr) minmax(104px, .85fr); }
+      .run-option > .status { display: none; }
+      .notice { display: grid; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#stage-content">跳到阶段详情</a>
+  <div class="app" data-od-id="live-progress-app">
+    <header class="topbar" data-od-id="topbar">
+      <div class="topbar-inner">
+        <div class="brand" data-od-id="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M8 4v16M8 9h13M8 15h13"/></svg>
+          </span>
+          <span class="brand-copy"><strong>直播拆条运行</strong><span>阶段控制台 · 只读观测</span></span>
+        </div>
+        <button class="run-trigger" id="run-trigger" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="run-popover" data-od-id="run-picker-trigger">
+          <span><small>当前运行</small><code id="summary-run">run_7d41af50…0582ce</code></span>
+          <span><small id="summary-start">今天 11:42</small><strong id="summary-status">候选规划</strong></span>
+          <span class="run-action">切换运行 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg></span>
+        </button>
+        <div class="top-facts" aria-label="当前运行观测摘要" data-od-id="top-facts">
+          <span class="top-fact"><small>观测状态</small><strong id="top-status" class="status status--active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg>状态未闭合</strong></span>
+          <span class="top-fact"><small>诊断完整性</small><strong id="top-integrity" class="status status--success" data-od-id="path-0-0-0-2-1-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 12 4 4L19 6"/></svg>完整</strong></span>
+          <span class="top-fact"><small>最后事件</small><strong id="top-event">12 秒前</strong></span>
+        </div>
+      </div>
+    </header>
+
+    <main class="shell" data-od-id="stage-console-shell">
+      <section class="console" aria-label="直播拆条运行详情" data-od-id="stage-console">
+        <div class="track-wrap" data-od-id="nine-stage-track">
+          <div class="track" role="tablist" aria-label="九阶段轨道" id="stage-track"></div>
+        </div>
+
+        <div class="workspace" id="workspace">
+          <section class="main-panel" data-od-id="stage-detail-panel">
+            <div class="run-picker" data-od-id="run-picker">
+              <div class="run-popover" id="run-popover" role="dialog" aria-modal="true" aria-labelledby="run-popover-title" hidden data-od-id="run-list-overlay">
+                <header class="popover-head">
+                  <div><h2 id="run-popover-title">选择直播拆条运行</h2><p>新发现的运行不会抢占当前详情。</p></div>
+                  <button class="icon-button" id="run-close" type="button" aria-label="关闭运行列表">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                  </button>
+                </header>
+                <div class="run-list" id="run-list"></div>
+              </div>
+            </div>
+
+            <div class="notice" id="stage-notice" role="status" aria-live="polite" aria-atomic="true" data-od-id="new-stage-notice">
+              <span><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M5 21h14"/></svg>新阶段“候选规划”已经开始，当前阅读位置保持不变。</span>
+              <button class="text-button" type="button" id="view-current" data-od-id="view-current-stage">查看当前阶段</button>
+            </div>
+
+            <div id="stage-content" role="tabpanel" tabindex="0" aria-labelledby="stage-tab-3">
+              <div id="normal-stage-content">
+              <header class="stage-head" data-od-id="selected-stage-heading">
+                <div class="stage-head-copy"><span class="eyebrow" id="stage-eyebrow">阶段 4 / 9</span><h1 id="stage-title">语音识别</h1></div>
+                <div class="stage-frame" aria-label="所选阶段状态与耗时">
+                  <div><small>阶段状态</small><strong id="stage-state" class="status status--success"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 12 4 4L19 6"/></svg>已完成</strong></div>
+                  <div><small>阶段耗时</small><strong class="mono" id="stage-duration">23 分 41 秒</strong></div>
+                </div>
+              </header>
+
+              <section class="conclusion" aria-labelledby="conclusion-label" data-od-id="stage-conclusion">
+                <span class="conclusion-mark" aria-hidden="true">
+                  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 12h2m2-4v8m4-11v14m4-11v8m4-4h0"/></svg>
+                </span>
+                <span class="conclusion-copy"><small id="conclusion-label">阶段主结论</small><strong id="stage-conclusion">整场转写文本已形成</strong></span>
+              </section>
+
+              <section class="facts-section" aria-labelledby="facts-title" data-od-id="stage-facts">
+                <h2 id="facts-title">辅助事实</h2>
+                <ul class="fact-list" id="fact-list"></ul>
+              </section>
+
+              <details class="details" data-od-id="technical-details">
+                <summary><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>技术详情</summary>
+                <div class="details-body"><code id="technical-value">transcription.completed · sequence 142</code><button type="button" id="copy-diagnostic" data-od-id="copy-diagnostic">复制诊断摘要</button></div>
+              </details>
+
+              <footer class="main-foot"><span>选择阶段只改变详情，不折叠阶段轨道。</span><span>只显示已形成事实，不推断进程存活。</span></footer>
+              </div>
+              <section class="loading-state" id="loading-state" data-od-id="loading-state" role="status" aria-live="polite" hidden><div><span class="loading-indicator" aria-hidden="true"></span><h1>正在载入运行</h1><p>正在读取阶段轨道与可信观测事实。</p></div></section>
+              <section class="compatibility" id="compatibility-state" data-od-id="incompatible-state" hidden><div><span class="compatibility-mark"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><path d="m9 9 6 6m0-6-6 6"/></svg></span><h1>界面版本不兼容</h1><p>此运行返回了当前界面无法解释的版本或判别值。为避免猜测，页面已停止解释该运行的阶段与事实。</p><button class="text-button" type="button" id="choose-compatible-run" data-od-id="choose-compatible-run">切换其他运行</button></div></section>
+            </div>
+          </section>
+
+          <aside class="fact-rail" aria-labelledby="rail-title" data-od-id="semantic-fact-rail">
+            <header class="rail-head"><h2 id="rail-title"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h3l2-6 4 12 2-6h7"/></svg>阶段语义事实</h2><p id="rail-updated">最近事件 12 秒前</p></header>
+            <dl class="rail-facts" id="rail-facts" aria-live="polite"></dl>
+            <p class="rail-note">这里不显示原始日志、百分比或预计剩余时间。完整事实会原位更新，不改变键盘焦点。</p>
+          </aside>
+        </div>
+      </section>
+    </main>
+    <div class="scrim" id="scrim" hidden></div>
+    <div class="sr-only" id="announcer" aria-live="polite"></div>
+  </div>
+
+  <script>
+    const icons = {
+      success: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 12 4 4L19 6"/></svg>',
+      active: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg>',
+      pending: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/></svg>',
+      danger: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><path d="m9 9 6 6m0-6-6 6"/></svg>',
+      warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4 3 20h18L12 4Z"/><path d="M12 9v5m0 3h.01"/></svg>'
+    };
+
+    const baseStages = [
+      { key: 'initialized', name: '初始化', conclusion: '直播拆条运行已初始化', facts: ['CLI 底座 0.8.0'], duration: '检查点', technical: 'run.initialized · sequence 1', rail: [['应用版本', 'CLI 底座 0.8.0'], ['观测性质', '只含可信观测时间的初始化检查点']] },
+      { key: 'preflight', name: '预检', conclusion: '预检通过', facts: ['认证平台 Ubuntu 24.04 · Python 3.12', 'FFmpeg、FFprobe 与字体均可用', '语音识别、主题评审与字幕优化能力已选择'], duration: '1.8 秒', technical: 'preflight.completed · sequence 8', rail: [['运行环境', 'Ubuntu 24.04 · Python 3.12'], ['媒体工具', 'FFmpeg、FFprobe 与字体可用'], ['供应商能力', '三项能力选择已形成']] },
+      { key: 'source', name: '素材分析', conclusion: '素材分析完成', facts: ['素材时长 02:16:48', '文件大小 7.4 GiB', '已提供课程上下文'], duration: '18 秒', technical: 'source_analysis.completed · sequence 13', rail: [['素材时长', '02:16:48'], ['文件大小', '7.4 GiB'], ['课程上下文', '已提供']] },
+      { key: 'transcription', name: '语音识别', conclusion: '整场转写文本已形成', facts: ['已形成 1,284 个句级文本块', '语音覆盖补转 2 次', '整场转写处理缓存未命中'], duration: '23 分 41 秒', technical: 'transcription.completed · sequence 142', rail: [['供应商请求', '完成 9 次 · 当前在飞 0 次'], ['重试与退避', '重试 2 次 · 已记录等待 18 秒'], ['处理缓存', '整场转写缓存未命中']] },
+      { key: 'planning', name: '候选规划', conclusion: '正在形成候选片段', facts: ['候选规划开始事件已记录', '沿用已验证的整场转写'], duration: '约 9 秒', technical: 'candidate_planning.started · sequence 143', rail: [['阶段推进', '候选规划开始事件已记录'], ['输入事实', '沿用已验证的整场转写'], ['结果事实', '候选片段数尚未形成']] },
+      { key: 'review', name: '主题评审', conclusion: '尚未观察到开始事件', facts: [], duration: '—', technical: 'not_observed', rail: [] },
+      { key: 'build', name: '交付构建', conclusion: '尚未观察到开始事件', facts: [], duration: '—', technical: 'not_observed', rail: [] },
+      { key: 'verify', name: '交付验证', conclusion: '尚未观察到开始事件', facts: [], duration: '—', technical: 'not_observed', rail: [] },
+      { key: 'publish', name: '发布', conclusion: '尚未观察到开始事件', facts: [], duration: '—', technical: 'not_observed', rail: [] }
+    ];
+
+    const runs = [
+      { id: 'run_7d41af50…0582ce', fullId: 'run_7d41af50-926d-4ca1-a14f-ea4d705582ce', start: '今天 11:42', status: '状态未闭合', integrity: '完整', current: 4, last: '12 秒前', mode: 'live' },
+      { id: 'run_6a10cb24…65d771', fullId: 'run_6a10cb24-482f-4c92-9fd7-55432b65d771', start: '昨天 16:08', status: '已成功', integrity: '完整', current: 8, last: '昨天 16:46', mode: 'success' },
+      { id: 'run_934fb0de…9f1a20', fullId: 'run_934fb0de-75cd-4828-beb5-0fb9209f1a20', start: '8 月 8 日 09:17', status: '记录损坏', integrity: '损坏', current: 5, last: '8 月 8 日 09:38', mode: 'corrupt' },
+      { id: 'run_2bd01477…47c442', fullId: 'run_2bd01477-0981-4d4c-a3f5-8d2ac247c442', start: '8 月 7 日 20:04', status: '界面版本不兼容', integrity: '停止解释', current: 0, last: '—', mode: 'incompatible' }
+    ];
+
+    const state = { runIndex: 0, stageIndex: 3, lastFocus: null, scrollY: 0, loadTimer: null };
+    const el = (id) => document.getElementById(id);
+    const run = () => runs[state.runIndex];
+
+    function runTone(item) {
+      if (item.mode === 'corrupt') return 'warn';
+      if (item.mode === 'incompatible') return 'danger';
+      if (item.mode === 'success') return 'success';
+      return 'active';
+    }
+
+    function stageLifecycle(index) {
+      const current = run().current;
+      if (run().mode === 'corrupt' && index === current) return { tone: 'warn', label: '可信前缀' };
+      if (index < current || run().mode === 'success') return { tone: 'success', label: '已完成' };
+      if (index === current) return { tone: 'active', label: run().mode === 'success' ? '已完成' : '进行中事实' };
+      return { tone: 'pending', label: '未开始' };
+    }
+
+    function stageForRun(index) {
+      const original = baseStages[index];
+      if (run().mode === 'success') return { ...original, conclusion: index === 8 ? '标准交付物发布成功' : original.conclusion === '尚未观察到开始事件' ? `${original.name}已完成` : original.conclusion, facts: original.facts.length ? original.facts : index === 8 ? ['发布提交事实已确认', '运行成功终态已经形成'] : ['阶段成功事实已形成'], duration: original.duration === '—' ? '已记录' : original.duration, rail: original.rail.length ? original.rail : [['阶段结果', '可信成功事实已形成']] };
+      if (run().mode === 'corrupt' && index === run().current) return { ...original, conclusion: '只保留损坏点前的可信事实', facts: ['在 sequence 143 停止解释', '损坏点之后的对象未参与推导'], duration: '—', technical: 'event.schema_invalid · sequence 143', rail: [['可信事件前缀', '在 sequence 143 停止解释'], ['诊断完整性', '损坏点之后未参与推导']] };
+      return original;
+    }
+
+    function renderTrack() {
+      const track = el('stage-track');
+      track.innerHTML = baseStages.map((stage, index) => {
+        const life = stageLifecycle(index);
+        return `<button class="stage-tab" type="button" role="tab" id="stage-tab-${index}" tabindex="${state.stageIndex === index ? '0' : '-1'}" aria-selected="${state.stageIndex === index}" aria-controls="stage-content" data-stage="${index}" data-od-id="stage-${stage.key}"><span class="stage-index">${String(index + 1).padStart(2, '0')}</span><span class="stage-name">${stage.name}</span><span class="status status--${life.tone}">${icons[life.tone]}${life.label}</span></button>`;
+      }).join('');
+      track.querySelectorAll('[data-stage]').forEach(button => button.addEventListener('click', () => selectStage(Number(button.dataset.stage), true)));
+    }
+
+    function renderRuns() {
+      el('run-list').innerHTML = runs.map((item, index) => {
+        const tone = runTone(item);
+        return `<button class="run-option" type="button" data-run="${index}" aria-current="${index === state.runIndex}" data-od-id="run-option-${index + 1}"><span><small>直播拆条运行标识</small><code>${item.id}</code></span><span><small>${item.start}</small><strong>${item.status}</strong></span><span><small>最后事件</small><strong>${item.last}</strong></span><span class="status status--${tone}">${icons[tone]}${item.integrity}</span></button>`;
+      }).join('');
+      el('run-list').querySelectorAll('[data-run]').forEach(button => button.addEventListener('click', () => selectRun(Number(button.dataset.run))));
+    }
+
+    function renderSummary() {
+      const item = run();
+      el('summary-run').textContent = item.id;
+      el('summary-run').title = item.fullId;
+      el('summary-start').textContent = item.start;
+      el('summary-status').textContent = baseStages[item.current].name;
+      const observationTone = runTone(item);
+      el('top-status').className = `status status--${observationTone}`;
+      el('top-status').innerHTML = `${icons[observationTone]}${item.status}`;
+      const integrityTone = item.integrity === '完整' ? 'success' : item.mode === 'corrupt' ? 'warn' : 'danger';
+      el('top-integrity').className = `status status--${integrityTone}`;
+      el('top-integrity').innerHTML = `${icons[integrityTone]}${item.integrity}`;
+      el('top-event').textContent = item.last;
+      el('rail-updated').textContent = item.last === '—' ? '未解释不兼容对象' : `最近事件 ${item.last}`;
+    }
+
+    function renderStage() {
+      const item = run();
+      el('loading-state').hidden = true;
+      el('stage-content').setAttribute('aria-busy', 'false');
+      el('stage-content').setAttribute('aria-labelledby', `stage-tab-${state.stageIndex}`);
+      if (item.mode === 'incompatible') {
+        el('stage-notice').hidden = true;
+        el('normal-stage-content').hidden = true;
+        el('compatibility-state').hidden = false;
+        el('rail-facts').innerHTML = '';
+        renderTrack();
+        return;
+      }
+      el('normal-stage-content').hidden = false;
+      el('compatibility-state').hidden = true;
+      const stage = stageForRun(state.stageIndex);
+      const life = stageLifecycle(state.stageIndex);
+      el('stage-notice').hidden = !(item.mode === 'live' && state.stageIndex !== item.current);
+      el('stage-eyebrow').textContent = `阶段 ${state.stageIndex + 1} / 9`;
+      el('stage-title').textContent = stage.name;
+      el('stage-state').className = `status status--${life.tone}`;
+      el('stage-state').innerHTML = `${icons[life.tone]}${life.label}`;
+      el('stage-duration').textContent = stage.duration;
+      el('stage-conclusion').textContent = stage.conclusion;
+      el('technical-value').textContent = stage.technical;
+      el('fact-list').innerHTML = stage.facts.length ? stage.facts.slice(0, 3).map(fact => `<li>${fact}</li>`).join('') : '<li class="empty-fact">当前没有额外阶段事实。</li>';
+      el('rail-facts').innerHTML = stage.rail.length ? stage.rail.slice(0, 3).map(([label, value]) => `<div class="rail-fact"><dt>${label}</dt><dd>${value}</dd></div>`).join('') : '<div class="rail-fact"><dt>阶段事实</dt><dd>尚未观察到可展示的事实。</dd></div>';
+      renderTrack();
+    }
+
+    function showLoadingState() {
+      window.clearTimeout(state.loadTimer);
+      el('stage-notice').hidden = true;
+      el('normal-stage-content').hidden = true;
+      el('compatibility-state').hidden = true;
+      el('loading-state').hidden = false;
+      el('stage-content').setAttribute('aria-busy', 'true');
+      el('rail-facts').innerHTML = '<div class="rail-fact"><dt>阶段事实</dt><dd>正在载入可信观测事实。</dd></div>';
+    }
+
+    function selectStage(index, announce = false) {
+      state.stageIndex = index;
+      renderStage();
+      if (announce) {
+        el(`stage-tab-${index}`).focus({ preventScroll: true });
+        el('announcer').textContent = `已选择${baseStages[index].name}阶段。`;
+      }
+    }
+
+    function selectRun(index) {
+      state.runIndex = index;
+      state.stageIndex = runs[index].mode === 'incompatible' ? 0 : Math.min(3, runs[index].current);
+      const url = new URL(window.location.href);
+      url.searchParams.set('run', runs[index].fullId);
+      history.replaceState({}, '', url);
+      renderRuns();
+      renderSummary();
+      renderTrack();
+      closeRuns(false);
+      showLoadingState();
+      el('run-trigger').focus({ preventScroll: true });
+      el('announcer').textContent = `正在载入${runs[index].id}。`;
+      state.loadTimer = window.setTimeout(() => {
+        renderStage();
+        el('announcer').textContent = `已选择${runs[index].id}，${runs[index].status}。`;
+      }, 240);
+    }
+
+    function openRuns() {
+      state.lastFocus = document.activeElement;
+      state.scrollY = window.scrollY;
+      el('run-popover').hidden = false;
+      el('scrim').hidden = false;
+      el('run-trigger').setAttribute('aria-expanded', 'true');
+      document.body.style.overflow = 'hidden';
+      el('run-close').focus({ preventScroll: true });
+    }
+
+    function closeRuns(restoreFocus = true) {
+      if (el('run-popover').hidden) return;
+      el('run-popover').hidden = true;
+      el('scrim').hidden = true;
+      el('run-trigger').setAttribute('aria-expanded', 'false');
+      document.body.style.overflow = '';
+      window.scrollTo({ top: state.scrollY, behavior: 'instant' });
+      if (restoreFocus) (state.lastFocus || el('run-trigger')).focus({ preventScroll: true });
+    }
+
+    el('run-trigger').addEventListener('click', openRuns);
+    el('run-close').addEventListener('click', closeRuns);
+    el('scrim').addEventListener('click', closeRuns);
+    el('view-current').addEventListener('click', () => selectStage(run().current, true));
+    el('choose-compatible-run').addEventListener('click', openRuns);
+    el('stage-track').addEventListener('keydown', event => {
+      if (!event.target.matches('[data-stage]')) return;
+      const current = Number(event.target.dataset.stage);
+      let next = current;
+      if (event.key === 'ArrowRight') next = Math.min(baseStages.length - 1, current + 1);
+      else if (event.key === 'ArrowLeft') next = Math.max(0, current - 1);
+      else if (event.key === 'Home') next = 0;
+      else if (event.key === 'End') next = baseStages.length - 1;
+      else return;
+      event.preventDefault();
+      selectStage(next, true);
+    });
+    el('copy-diagnostic').addEventListener('click', async () => {
+      const summary = `观测状态：${run().status}\n诊断完整性：${run().integrity}\n阶段：${baseStages[state.stageIndex].name}`;
+      try { await navigator.clipboard.writeText(summary); el('copy-diagnostic').textContent = '已复制'; el('announcer').textContent = '诊断摘要已复制。'; }
+      catch { el('copy-diagnostic').textContent = '请手动复制'; el('announcer').textContent = '无法自动复制，请手动复制诊断摘要。'; }
+      window.setTimeout(() => { if (el('copy-diagnostic')) el('copy-diagnostic').textContent = '复制诊断摘要'; }, 1600);
+    });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape') closeRuns();
+      if (!el('run-popover').hidden && event.key === 'Tab') {
+        const focusable = [...el('run-popover').querySelectorAll('button:not(:disabled)')];
+        const first = focusable[0], last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      }
+    });
+
+    const requestedRun = new URLSearchParams(window.location.search).get('run');
+    const requestedIndex = runs.findIndex(item => item.fullId === requestedRun);
+    if (requestedIndex >= 0) state.runIndex = requestedIndex;
+    renderRuns();
+    renderSummary();
+    renderTrack();
+    renderStage();
+  </script>
+</body>
+</html>

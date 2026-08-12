@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "kind": "html",
+  "title": "live-progress-stage-console.html",
+  "entry": "live-progress-stage-console.html",
+  "renderer": "html",
+  "status": "complete",
+  "exports": [
+    "html",
+    "pdf",
+    "zip"
+  ],
+  "createdAt": "2026-08-12T07:30:44.982Z",
+  "updatedAt": "2026-08-12T07:30:44.982Z",
+  "metadata": {
+    "inferred": true,
+    "reconciled": true
+  }
+}
