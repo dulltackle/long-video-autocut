@@ -66,10 +66,32 @@ body { min-width: 320px; overflow-x: hidden; }
 }
 
 .stage { position: relative; display: grid; justify-items: center; align-content: start; gap: 17px; color: #4e5965; }
+.stage > button {
+  width: 100%;
+  margin: 0;
+  padding: 0 5px 10px;
+  display: grid;
+  justify-items: center;
+  gap: 13px;
+  border: 2px solid transparent;
+  border-radius: 10px;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+.stage > button:hover { background: #f4f7f9; }
+.stage > button:focus-visible { outline: 3px solid #28789f; outline-offset: 2px; }
+.stage-selected > button { border-color: #173f56; background: #f4f8fa; }
 .stage-node { z-index: 1; width: 34px; height: 34px; border: 1.5px solid #58636e; border-radius: 50%; background: #fff; }
 .stage-icon { width: 43px; height: 43px; }
 .stage-icon svg, footer svg, .empty-icon { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .stage-label { font-size: 18px; line-height: 1.3; font-weight: 520; white-space: nowrap; }
+.stage-status { margin-top: -8px; font-size: 13px; color: #697783; }
+.stage-succeeded .stage-node { border-color: #2d7653; box-shadow: inset 0 0 0 8px #e4f2eb; }
+.stage-in-progress .stage-node { border-color: #28789f; box-shadow: inset 0 0 0 8px #e2f1f7; }
+.stage-failed .stage-node { border-color: #a13b37; box-shadow: inset 0 0 0 8px #f8e8e6; }
+.stage-interrupted .stage-node { border-color: #7b6650; box-shadow: inset 0 0 0 8px #f3eee7; }
 
 .main-content { min-height: 360px; display: grid; place-items: center; padding: 48px 24px 88px; }
 .empty-state, .state-message { width: min(720px, 100%); text-align: center; }
@@ -77,6 +99,53 @@ body { min-width: 320px; overflow-x: hidden; }
 .empty-state h2, .state-message h2 { margin: 0; color: #26313d; font-size: clamp(30px, 3vw, 44px); line-height: 1.2; letter-spacing: -.025em; font-weight: 690; }
 .empty-state p, .state-message p { margin: 18px auto 0; max-width: 680px; color: #53606c; font-size: 20px; line-height: 1.8; }
 .state-error h2 { font-size: 32px; }
+
+.run-console {
+  width: min(1180px, 100%);
+  display: grid;
+  grid-template-columns: 270px minmax(0, 1fr);
+  gap: 28px;
+  align-items: start;
+}
+
+.run-index, .run-detail, .fact-card {
+  border: 1px solid #cbd3db;
+  background: #fff;
+}
+
+.run-index { padding: 22px; display: grid; gap: 10px; }
+.eyebrow { margin: 0; color: #687681; font-size: 12px; font-weight: 720; letter-spacing: .12em; text-transform: uppercase; }
+.run-index button {
+  padding: 13px 14px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid #d3dbe2;
+  color: #26313d;
+  background: #fff;
+  font: inherit;
+  text-align: left;
+}
+.run-index .run-selected { border-color: #173f56; box-shadow: inset 3px 0 #173f56; background: #f4f8fa; }
+.run-index span { font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 13px; }
+.run-index strong { font-size: 12px; white-space: nowrap; }
+
+.run-detail { min-width: 0; }
+.run-detail > header { padding: 24px 28px; display: flex; justify-content: space-between; align-items: center; gap: 20px; border-bottom: 1px solid #d4dce3; }
+.run-detail > header h2 { margin: 7px 0 0; font-size: 29px; }
+.state-pill { margin: 0; padding: 7px 11px; border: 1px solid #8996a1; border-radius: 99px; font-size: 13px; font-weight: 680; }
+.state-unclosed { border-color: #4680a0; color: #245f80; }
+.state-succeeded { border-color: #4f8069; color: #255a42; }
+.state-failed, .state-record_corrupt { border-color: #b06a66; color: #87332f; }
+.state-interrupted { border-color: #8c7a66; color: #65513d; }
+
+.fact-card { margin: 28px; padding: 28px; background: #f9fbfc; }
+.fact-card h2 { margin: 0; font-size: 23px; }
+.fact-lead { margin: 10px 0 24px; color: #53606c; font-size: 17px; }
+.fact-card dl { margin: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: #d5dde4; }
+.fact-card dl > div { min-width: 0; padding: 17px; background: #fff; }
+.fact-card dt { margin-bottom: 8px; color: #6a7782; font-size: 12px; font-weight: 720; letter-spacing: .06em; }
+.fact-card dd { margin: 0; overflow-wrap: anywhere; font-size: 15px; line-height: 1.55; }
 
 footer {
   min-height: 134px;
@@ -100,14 +169,22 @@ footer p { margin: 0; font-size: 18px; line-height: 1.6; }
   .stage-track { min-width: 930px; height: 143px; padding: 26px 18px 18px; grid-template-columns: repeat(9, 96px); column-gap: 6px; }
   .stage-track::before { top: 52px; left: 45px; right: 45px; }
   .stage { gap: 11px; }
+  .stage > button { gap: 8px; }
   .stage-node { display: none; }
   .stage-icon { z-index: 1; display: grid; place-items: center; width: 52px; height: 52px; padding: 10px; border: 1.5px solid #58636e; border-radius: 50%; background: #fff; }
   .stage-label { font-size: 14px; }
+  .stage-status { font-size: 11px; }
   .main-content { min-height: 400px; padding: 56px 24px 72px; align-items: start; }
   .empty-state { padding-top: clamp(24px, 8vh, 72px); }
   .empty-icon { display: block; }
   .empty-state h2, .state-message h2 { font-size: 28px; }
   .empty-state p, .state-message p { margin-top: 16px; max-width: 330px; font-size: 16px; line-height: 1.75; }
+  .run-console { grid-template-columns: 1fr; gap: 18px; }
+  .run-index { padding: 16px; }
+  .run-detail > header { padding: 20px; }
+  .run-detail > header h2 { font-size: 24px; }
+  .fact-card { margin: 18px; padding: 20px; }
+  .fact-card dl { grid-template-columns: 1fr; }
   footer { min-height: 92px; padding: 20px 24px; align-items: flex-start; }
   footer p { font-size: 13px; }
 }

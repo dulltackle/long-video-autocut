@@ -13,10 +13,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from ..startup import validate_workspace
-
-
-_SCHEMA_VERSION = "live_progress.v1"
-_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+from .observation import RUN_ID_PATTERN, SCHEMA_VERSION, discover_runs, project_run
 
 
 def _json_bytes(value: object) -> bytes:
@@ -57,33 +54,6 @@ def _safe_static_file(static_root: Path, request_path: str) -> Path | None:
 def _workspace_identity(workspace_root: Path) -> tuple[int, int]:
     status = workspace_root.lstat()
     return status.st_dev, status.st_ino
-
-
-def _workspace_has_runs(
-    workspace_root: Path, expected_identity: tuple[int, int]
-) -> bool:
-    descriptors: list[int] = []
-    try:
-        root_descriptor = os.open(workspace_root, _DIRECTORY_FLAGS)
-        descriptors.append(root_descriptor)
-        root_status = os.fstat(root_descriptor)
-        if (
-            (root_status.st_dev, root_status.st_ino) != expected_identity
-            or root_status.st_uid != os.getuid()
-        ):
-            raise OSError("workspace identity changed")
-        parent = root_descriptor
-        for part in ("work", "runs"):
-            child = os.open(part, _DIRECTORY_FLAGS, dir_fd=parent)
-            descriptors.append(child)
-            child_status = os.fstat(child)
-            if child_status.st_uid != os.getuid():
-                raise OSError("workspace ownership changed")
-            parent = child
-        return bool(os.listdir(parent))
-    finally:
-        for descriptor in reversed(descriptors):
-            os.close(descriptor)
 
 
 def create_http_server(
@@ -145,10 +115,20 @@ def create_http_server(
             self._write_json(
                 status,
                 {
-                    "schema_version": _SCHEMA_VERSION,
+                    "schema_version": SCHEMA_VERSION,
                     "error": {"code": code, "message": message},
                 },
             )
+
+        def _snapshots(self) -> dict[str, tuple[dict[str, object], bytes, str]]:
+            if _workspace_identity(workspace_root) != expected_workspace_identity:
+                raise OSError("workspace identity changed")
+            snapshots: dict[str, tuple[dict[str, object], bytes, str]] = {}
+            for run_id in discover_runs(workspace_root):
+                payload = project_run(workspace_root, run_id)
+                body = _json_bytes(payload)
+                snapshots[run_id] = (payload, body, _etag(body))
+            return snapshots
 
         def do_GET(self) -> None:
             if not self._client_allowed():
@@ -156,26 +136,82 @@ def create_http_server(
             path = urlsplit(self.path).path
             if path == "/api/v1/runs":
                 try:
-                    has_runs = _workspace_has_runs(
-                        workspace_root, expected_workspace_identity
-                    )
-                except OSError:
+                    snapshots = self._snapshots()
+                except Exception:
                     self._error(
                         HTTPStatus.INTERNAL_SERVER_ERROR,
                         "internal_error",
                         "工作区安全状态已变化，无法继续读取",
                     )
                     return
-                if has_runs:
+                items = []
+                for run_id, (snapshot, _body, snapshot_etag) in snapshots.items():
+                    observation = snapshot["observation"]
+                    items.append(
+                        {
+                            "run_id": run_id,
+                            "observation_state": observation["state"],
+                            "started_at": observation["started_at"],
+                            "stage": observation["stage"],
+                            "duration_ms": observation["duration_ms"],
+                            "last_event_at": observation["last_event_at"],
+                            "diagnostics": snapshot["diagnostics"],
+                            "snapshot_etag": snapshot_etag,
+                        }
+                    )
+                items.sort(
+                    key=lambda item: (
+                        item["started_at"]["status"] != "available",
+                        item["run_id"],
+                    )
+                )
+                available = [
+                    item for item in items if item["started_at"]["status"] == "available"
+                ]
+                unavailable = [
+                    item for item in items if item["started_at"]["status"] != "available"
+                ]
+                available.sort(key=lambda item: item["run_id"])
+                available.sort(
+                    key=lambda item: item["started_at"]["value"], reverse=True
+                )
+                self._write_json(
+                    HTTPStatus.OK,
+                    {"schema_version": SCHEMA_VERSION, "runs": [*available, *unavailable]},
+                    allow_not_modified=True,
+                )
+                return
+            run_prefix = "/api/v1/runs/"
+            if path.startswith(run_prefix):
+                run_id = unquote(path.removeprefix(run_prefix))
+                if "/" in run_id or RUN_ID_PATTERN.fullmatch(run_id) is None:
+                    self._error(
+                        HTTPStatus.BAD_REQUEST,
+                        "invalid_request",
+                        "直播拆条运行标识格式无效",
+                    )
+                    return
+                try:
+                    snapshots = self._snapshots()
+                except Exception:
                     self._error(
                         HTTPStatus.INTERNAL_SERVER_ERROR,
                         "internal_error",
-                        "当前版本尚不能解释工作区中的直播拆条运行",
+                        "工作区安全状态已变化，无法继续读取",
                     )
                     return
+                selected = snapshots.get(run_id)
+                if selected is None:
+                    self._error(
+                        HTTPStatus.NOT_FOUND,
+                        "run_not_found",
+                        "未找到指定的直播拆条运行。",
+                    )
+                    return
+                payload, _body, _selected_etag = selected
                 self._write_json(
                     HTTPStatus.OK,
-                    {"schema_version": _SCHEMA_VERSION, "runs": []},
+                    payload,
                     allow_not_modified=True,
                 )
                 return
